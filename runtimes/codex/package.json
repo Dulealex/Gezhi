@@ -1,0 +1,9 @@
+{
+  "name": "gezhi-codex-runtime",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Project-pinned Codex CLI runtime for Gezhi",
+  "dependencies": {
+    "@openai/codex": "0.146.0"
+  }
+}

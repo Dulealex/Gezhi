@@ -1,0 +1,28 @@
+[project]
+name = "gezhi"
+version = "0.1.0"
+description = "Windows-native literature and governed-knowledge workflow"
+requires-python = "==3.11.*"
+dependencies = [
+    "feedparser",
+    "httpx",
+    "pydantic",
+    "pydantic-settings",
+    "pypdf",
+    "rapidfuzz",
+    "rich",
+    "tenacity",
+    "typer",
+]
+
+[dependency-groups]
+dev = [
+    "mypy",
+    "pytest",
+    "pytest-cov",
+    "pytest-timeout",
+    "ruff",
+]
+
+[tool.uv]
+package = false
