@@ -71,7 +71,7 @@ ingest → ocr → canonicalize → read → review → handoff → knowledge_im
 - `succeeded` 只能由完整有效的已提交 manifest/assets 与匹配 current pointer 证明；SQLite row、日志、stdout、mtime、目录名或 staging 都不够。
 - `blocked` 是当前输入下可由环境、用户或后续显式 `resume` 改变的前置条件；它不是部分成功。
 - `failed` 是确定性本地、合同、完整性或 commit failure；它不能更新 success current。
-- `interrupted` 只在用户取消先胜出、全部 child/handle/write 安全停止且 terminal record 可完整提交时形成；否则只留 staging，不伪造 handled receipt。
+- `interrupted` 只用于后续 owner 在重新取得 ownership、确认 prior owner 已不存在并安全收尾遗留 `running` attempt 后写入的不可变阶段审计；它不是本次 CLI outer outcome。T04 不批准用户取消来源或 handled interruption receipt。
 
 Blocked、failed 与 interrupted run 可以作为不可变审计资产提交，但绝不替换 success current。相同完整 input fingerprint 的有效 success 必须复用；旧 success 与当前上游指纹不符时保留历史，但不满足当前阶段。
 
@@ -135,7 +135,7 @@ Source bundle 在同卷 staging 完整写入、关闭、hash/manifest readback�
 }
 ```
 
-`disposition` 只允许 `created_work|added_source|reused_source`。三个值都可能 `active_source_changed=true`；只有 already-active reused Source 为 false。Add 的 blocked/failed/interrupted 固定 `result=null`；较早提交点可能已存在，但 null 不表示回滚或成功 receipt。
+`disposition` 只允许 `created_work|added_source|reused_source`。三个值都可能 `active_source_changed=true`；只有 already-active reused Source 为 false。Add 的 blocked/failed 固定 `result=null`；较早提交点可能已存在，但 null 不表示回滚或成功 receipt。
 
 ## 5. `literature resume`
 
@@ -147,7 +147,7 @@ Source bundle 在同卷 staging 完整写入、关闭、hash/manifest readback�
 2. 对 directory commit已存在但 current缺失/陈旧的完整 success，验证 fingerprint/hash/namespace后只补 pointer，不重跑。
 3. 对 prior owner不存在的遗留 running/staging分类；只有完整有效 terminal success且只差已批准 rename/pointer的 orphan可补交，partial/unsafe/invalid原地 quarantine，不修补成 success。
 4. 跳过全部匹配当前上游 fingerprint的 success，从最早未满足 obligation开始。
-5. 串行推进自动阶段，直到 complete、首个 blocked/failed/interrupted、uncertain commit，或只剩没有显式 Review Decision的 Candidate。
+5. 串行推进自动阶段，直到 complete、首个本次 blocked/failed、uncertain commit，或只剩没有显式 Review Decision的 Candidate。历史 `interrupted` run 是关闭的审计事实，不单独阻止新 invocation 从权威资产重算 Continuation Point。
 
 一次 resume 可以连续完成多个自动阶段，但每阶段有独立 run/manifest/commit point；后阶段只能读前阶段 committed success。过去 blocked/failed/interrupted run 不永久禁止显式 resume；修复前置条件后可创建新 run，但不得修改旧 run、复用失败 partial或换 provider。相同 success禁止重算，V1无 `--force`。
 
@@ -178,7 +178,7 @@ Work、Active Source 与 root trust完整验证后，command可以形成以下 c
 
 `start_stage`/`stop_stage` 各为七阶段值或 `complete`，分别是 invocation初始/呈现前的 Continuation Point。`advanced_stages` 是本 invocation明确发布 success或只修复 success pointer/receipt的阶段，无重复且按阶段顺序；既有 skip不列入。`pending_candidate_ids` 最多12项，按 Candidate Knowledge v1顺序，只列无 decision 的当前 Candidate；deferred不列入。
 
-`pipeline_complete=true` iff `stop_stage=complete`、pending为空且七阶段当前 obligations全可验证；already-complete调用使用 start/stop=`complete`、advanced=[]。受控 stage blocked/failed/interrupted若仍能证明 snapshot可保留 non-null result；root/Work/Active Source identity无法证明、snapshot不唯一或 commit outcome uncertain时不得构造近似 result。
+`pipeline_complete=true` iff `stop_stage=complete`、pending为空且七阶段当前 obligations全可验证；already-complete调用使用 start/stop=`complete`、advanced=[]。本次受控 stage blocked/failed若仍能证明 snapshot可保留 non-null result；历史 `interrupted` 只作为 snapshot 内的阶段审计事实，不能产生 outer `interrupted`。root/Work/Active Source identity无法证明、snapshot不唯一或 commit outcome uncertain时不得构造近似 result。
 
 ## 6. `literature review`
 
@@ -202,7 +202,7 @@ Decision明确提交后不因 Handoff、Knowledge root、Registry或 presentatio
 | `rejected` | 是 | 最小 `withdraw` tombstone | `withdrawn` |
 | `deferred` | 是 | 最小 `withdraw` tombstone | `withdrawn` |
 
-同 action复用同一 identity。只有至少一个先前 accept 已有成功 Knowledge import receipt 时，accepted→non-accepted…51 tokens truncated…无该 Candidate。Non-accepted→accepted发布新 accept；已 withdrawn后的更高 non-accepted revision仍发布更高 withdraw，保存最新 review revision。Pending从不产生 Handoff。
+同 action复用同一 identity。只有至少一个先前 accept 已有成功 Knowledge import receipt 时，accepted→non-accepted 才发布 withdraw。若旧 accepted Decision/Handoff 尚无成功 import receipt 就被更高 rejected/deferred revision supersede，旧 accept 不得再补导入，新 revision 也不得发布空 withdraw，Registry 继续没有该 Candidate。Non-accepted→accepted发布新 accept；已 withdrawn后的更高 non-accepted revision仍发布更高 withdraw，保存最新 review revision。Pending从不产生 Handoff。
 
 每个 public review revision最多一个 single-record Reviewed Handoff；`candidates.jsonl`恰好一条 accept/withdraw。Handoff ID是以下 CanonicalJsonV1 bytes SHA-256前24位加 `hnd_`：
 
@@ -245,11 +245,11 @@ Decision明确提交或 unchanged完整验证后，result恰好为：
 
 Action=none必须配 handoff_id=null、handoff/import=not_required、intake=null。Accept/withdraw必须配 deterministic Handoff ID；Handoff未提交时 handoff/import=pending、intake=null；Handoff committed但 import未完成时 committed/pending/null；import applied时 accept→active、withdraw→withdrawn。
 
-Decision前 blocked/failed/interrupted固定 result=null。Decision后的 Handoff/Import blocked、failed或安全 interruption保留 non-null partial receipt，只陈述已完成提交点；完整成功要求 required continuation applied或 no-action成立。
+Decision前 blocked/failed固定 result=null。Decision后的 Handoff/Import blocked或failed保留 non-null partial receipt，只陈述已完成提交点；完整成功要求 required continuation applied或 no-action成立。
 
 ## 7. Primary diagnostics、outcome 与 exit
 
-T04 V1不定义 supplemental Literature diagnostic。成功 `diagnostics=[]`；blocked/failed/interrupted恰好一个 primary。除表中 context外均为 `{}`，全部服从 CLI Diagnostics v1。
+T04 V1不定义 supplemental Literature diagnostic。成功 `diagnostics=[]`；blocked/failed恰好一个 primary。除表中 context外均为 `{}`，全部服从 CLI Diagnostics v1。
 
 ### 7.1 Add union
 
@@ -268,7 +268,7 @@ T04 V1不定义 supplemental Literature diagnostic。成功 `diagnostics=[]`；b
 | `literature.add.content_identity_collision.v1` | failed | `{}` |
 | `literature.add.commit_failed.v1` | failed | `{}` |
 | `literature.add.catalog_projection_failed.v1` | failed | `{}` |
-| `literature.add.user_interrupted.v1` | interrupted | `{}` |
+
 
 ### 7.2 Resume union
 
@@ -284,7 +284,7 @@ T04 V1不定义 supplemental Literature diagnostic。成功 `diagnostics=[]`；b
 | `literature.resume.data_root_integrity_lost.v1` | failed | `{}` |
 | `literature.resume.stage_failed.v1` | failed | `{"reason":"<closed>","stage":"<stage>"}` |
 | `literature.resume.recovery_failed.v1` | failed | `{}` |
-| `literature.resume.user_interrupted.v1` | interrupted | `{"stage":"<stage>"}` |
+
 
 `stage_blocked` closed matrix：
 
@@ -328,11 +328,13 @@ Stage/reason必须来自表中 ASCII enum，不能拼内部 error/provider/excep
 | `literature.review.review_commit_failed.v1` | failed | `{}` | null |
 | `literature.review.handoff_failed.v1` | failed | `{}` | non-null |
 | `literature.review.import_failed.v1` | failed | `{}` | non-null |
-| `literature.review.user_interrupted.v1` | interrupted | `{"stage":"review|handoff|knowledge_import"}` | decision前null；之后non-null |
+
 
 ### 7.4 Normal exit
 
-完整 Human或JSON presentation后的 normal exit：succeeded→`0`、blocked→`2`、failed→`1`、interrupted→`130`。这些数字只属于完整 handled receipt；raw argv/bootstrap/grammar/unexpected exception/external termination/uncertain commit/presentation failure不能因数字相同被重分类。
+完整 Human或JSON presentation后的 normal exit：succeeded→`0`、blocked→`2`、failed→`1`。这些数字只属于完整 handled receipt；raw argv/bootstrap/grammar/unexpected exception/external termination/uncertain commit/presentation failure不能因数字相同被重分类。
+
+T04 不为三个 Literature 命令冻结用户取消 source、latch、checkpoint、child stop/drain 或 release profile，因此不允许 `user_interrupted` primary、outer `interrupted` 或 normal exit `130`。Console control、external termination、`KeyboardInterrupt` 或取消期间无法安全形成完整 envelope 都保持在本合同正常矩阵外；实现不得捕获 `KeyboardInterrupt` 临时合成 handled outcome。未来只有在完整采用或取代既有 Windows cancellation bridge 合同并冻结全部 ownership/teardown 边界后，才能版本化增加该分支。
 
 ## 8. JSON 与 Human presentation
 
@@ -342,14 +344,100 @@ Human renderer消费同一 sealed outcome/result/diagnostic，不重读资产。
 
 | command/outcome | first line |
 |---|---|
-| add succeeded / blocked / failed / interrupted | `Literature add：完成` / `Literature add：已阻塞` / `Literature add：失败` / `Literature add：已中断` |
-| resume succeeded / blocked / failed / interrupted | `Literature resume：完成` / `Literature resume：已阻塞` / `Literature resume：失败` / `Literature resume：已中断` |
-| review succeeded / blocked / failed / interrupted | `Literature review：完成` / `Literature review：已阻塞` / `Literature review：失败` / `Literature review：已中断` |
+| add succeeded / blocked / failed | `Literature add：完成` / `Literature add：已阻塞` / `Literature add：失败` |
+| resume succeeded / blocked / failed | `Literature resume：完成` / `Literature resume：已阻塞` / `Literature resume：失败` |
+| review succeeded / blocked / failed | `Literature review：完成` / `Literature review：已阻塞` / `Literature review：失败` |
 
 存在 result时显示稳定 ID、disposition/阶段或 Review→Handoff→Import状态；不得显示 PDF path、citation、文档内容、异常/provider文本。Resume pending Candidate逐个显示完整 ID，并给出显式 `gezhi literature review <candidate_id> --accept|--reject|--defer` 下一步；不能 prompt、默认、倒计时接受或把回车当批准。Primary code/context映射为固定中文原因/下一步。颜色/box drawing/terminal width不冻结；redirected non-color subprocess必须保留首行、稳定字段顺序、单末尾 LF、同 exit且无 ANSI。
 
 
-完整 Human body 顺序固定为：首行；若 result非 null则按该 result Schema 的 canonical key顺序逐行显示 `字段：值`（array逐项缩进）；primary的 `原因：...`；最后是 `下一步：...`。下表正文不含句末句号，renderer不得改写、拼异常或回显输入：
+完整 Human body 的语义行顺序固定为：首行；若 `result` 非 `null`，按下列映射表自上而下输出全部字段；若有 primary，输出 `原因：<catalog 原因正文>`；最后输出 `下一步：<正文>`。成功没有 `原因` 行；blocked/failed 的原因与下一步必须逐字来自第 8.1–8.3 节，并只把 closed context enum 替换进字面 `<...>`。Renderer 不得改写、拼异常或回显输入。
+
+| command | result key | exact Human label |
+|---|---|---|
+| add | `active_source_changed` | `Active Source 已切换` |
+| add | `disposition` | `处理结果` |
+| add | `schema_version` | `Schema` |
+| add | `source_id` | `Source ID` |
+| add | `source_sha256` | `Source SHA-256` |
+| add | `work_id` | `Work ID` |
+| resume | `active_source_id` | `Active Source ID` |
+| resume | `advanced_stages` | `本次推进阶段` |
+| resume | `pending_candidate_ids` | `待审核 Candidate` |
+| resume | `pipeline_complete` | `管线已完成` |
+| resume | `schema_version` | `Schema` |
+| resume | `start_stage` | `开始阶段` |
+| resume | `stop_stage` | `停止阶段` |
+| resume | `work_id` | `Work ID` |
+| review | `candidate_id` | `Candidate ID` |
+| review | `decision_disposition` | `Decision 处理结果` |
+| review | `handoff_action` | `Handoff 动作` |
+| review | `handoff_id` | `Handoff ID` |
+| review | `handoff_status` | `Handoff 状态` |
+| review | `import_status` | `Import 状态` |
+| review | `intake_status` | `Intake 状态` |
+| review | `payload_sha256` | `Payload SHA-256` |
+| review | `review_revision` | `Review revision` |
+| review | `review_status` | `Review 状态` |
+| review | `schema_version` | `Schema` |
+| review | `work_id` | `Work ID` |
+
+String/enum/ID/hash/schema value 逐字输出且不加引号；boolean 只输出 `是` / `否`；`null` 只输出 `无`；integer 使用无正号、无前导零的 ASCII 十进制。空 array 恰好一行 `标签：[]`。非空 array 先输出 `标签：`，随后每项一行、恰好两个 ASCII space 加 `- ` 再加逐字 item；不得逗号连接、编号、截断或省略。所有语义行使用上述全角 `：`，无行尾空白，以单个 LF 分隔并恰好一个末尾 LF。Interactive Rich 最多增加 ANSI/box decoration，不得改变语义行文本或顺序；redirected subprocess 必须输出下列无 ANSI UTF-8 bytes。
+
+成功的 `下一步` 唯一为：add 与 review 使用 `运行 gezhi literature resume <work_id>`，其中 ID 取 sealed result；resume succeeded 必须 `pipeline_complete=true`，并使用 `无需操作`。若 resume 尚未 complete，则必须由 closed blocked/failed primary 呈现，不能用 succeeded 配其他下一步。
+
+Add succeeded 完整 stdout witness（stderr empty，最后一行后还有一个 LF）：
+
+```text
+Literature add：完成
+Active Source 已切换：是
+处理结果：created_work
+Schema：gezhi.literature_add_result.v1
+Source ID：src_0123456789abcdef01234567
+Source SHA-256：0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+Work ID：wrk_123e4567-e89b-42d3-a456-426614174000
+下一步：运行 gezhi literature resume wrk_123e4567-e89b-42d3-a456-426614174000
+```
+
+Resume succeeded 完整 stdout witness：
+
+```text
+Literature resume：完成
+Active Source ID：src_0123456789abcdef01234567
+本次推进阶段：
+  - ocr
+  - canonicalize
+  - read
+  - review
+  - handoff
+  - knowledge_import
+待审核 Candidate：[]
+管线已完成：是
+Schema：gezhi.literature_resume_result.v1
+开始阶段：ocr
+停止阶段：complete
+Work ID：wrk_123e4567-e89b-42d3-a456-426614174000
+下一步：无需操作
+```
+
+Review succeeded 完整 stdout witness：
+
+```text
+Literature review：完成
+Candidate ID：cand_aaaaaaaaaaaaaaaaaaaaaaaa
+Decision 处理结果：created
+Handoff 动作：accept
+Handoff ID：hnd_bbbbbbbbbbbbbbbbbbbbbbbb
+Handoff 状态：committed
+Import 状态：applied
+Intake 状态：active
+Payload SHA-256：aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Review revision：1
+Review 状态：accepted
+Schema：gezhi.literature_review_result.v1
+Work ID：wrk_123e4567-e89b-42d3-a456-426614174000
+下一步：运行 gezhi literature resume wrk_123e4567-e89b-42d3-a456-426614174000
+```
 
 ### 8.1 Add Human primary catalog
 
@@ -368,7 +456,7 @@ Human renderer消费同一 sealed outcome/result/diagnostic，不重读资产。
 | `literature.add.content_identity_collision.v1` | Source 内容身份发生冲突 | 保留现有资产并报告冲突，不要覆盖 |
 | `literature.add.commit_failed.v1` | Source 或 Active Source 提交失败 | 保持相同输入重新运行 add 以恢复 |
 | `literature.add.catalog_projection_failed.v1` | Literature 索引投影未完成 | 保持相同输入重新运行 add 以重建投影 |
-| `literature.add.user_interrupted.v1` | 用户中断了 add | 确认现有资产状态后按需要重试 |
+
 
 ### 8.2 Resume Human primary catalog
 
@@ -384,7 +472,7 @@ Human renderer消费同一 sealed outcome/result/diagnostic，不重读资产。
 | `literature.resume.data_root_integrity_lost.v1` | Literature 数据目录身份在执行中失去可信性 | 停止写入并运行 gezhi doctor |
 | `literature.resume.stage_failed.v1` | `<stage>` 阶段失败（`<reason>`） | 保留现有资产，修复该阶段后重新运行 resume |
 | `literature.resume.recovery_failed.v1` | Literature 恢复检查失败 | 保留 staging 与历史资产并运行 gezhi doctor |
-| `literature.resume.user_interrupted.v1` | 用户在 `<stage>` 阶段中断了 resume | 确认现有资产状态后重新运行 resume |
+
 
 ### 8.3 Review Human primary catalog
 
@@ -402,7 +490,7 @@ Human renderer消费同一 sealed outcome/result/diagnostic，不重读资产。
 | `literature.review.review_commit_failed.v1` | Review Decision 提交失败 | 保持相同 Candidate 与 action 重试 |
 | `literature.review.handoff_failed.v1` | Review Decision 已保存，但 Handoff 失败 | 保留 Decision 并用相同 action 重试 |
 | `literature.review.import_failed.v1` | Review Decision 与 Handoff 已保存，但 Knowledge import 失败 | 保留前置事实并修复 Registry 冲突 |
-| `literature.review.user_interrupted.v1` | 用户在 `<stage>` 阶段中断了 review | 用相同 Candidate 与 action 重试以继续未完成步骤 |
+
 
 
 ## 9. Crash、重入与持久断言
@@ -430,7 +518,7 @@ Human renderer消费同一 sealed outcome/result/diagnostic，不重读资产。
 
 - 七阶段每个 valid success跳过；directory committed/pointer missing只补 pointer；从 ingest自动推进到 pending review并返回 IDs，不写 Decision。
 - Zero Candidate完成 no-op；全部有 decision时补 Handoff/Import；有已授权 backlog和其他 pending时先补 backlog再 awaiting_review。
-- 每阶段 blocked/failed/interrupted、遗留 running、partial/invalid orphan、target conflict、uncertain均无 partial success/overwrite。
+- 每阶段 blocked/failed、历史 interrupted、遗留 running、partial/invalid orphan、target conflict、uncertain均无 partial success/overwrite。
 - OCR缺失只在 ocr阻塞；Codex缺失只在 read；Knowledge root只在 import；已完成阶段仍可读。
 
 ### Review
@@ -442,13 +530,13 @@ Human renderer消费同一 sealed outcome/result/diagnostic，不重读资产。
 
 ### Presentation
 
-- 每 command/outcome覆盖 Human/JSON；完整 canonical bytes、32 KiB inclusive cap、单 LF、channel/exit匹配。
+- 每 command 的 succeeded/blocked/failed覆盖 Human/JSON；完整 canonical bytes、32 KiB inclusive cap、单 LF、channel/exit匹配。
 - Result presence符合第4.4、5.3、6.3、7.3节；earlier commit不自动使 outer succeeded。
 - Redirected Human无 ANSI，首行/稳定字段/next action可断言；Human/JSON来自同一 outcome。
 
 ## 11. 非目标与演进
 
-本合同不增加 command/option、batch/interactive review、Identity Review专用命令、自动搜索/下载、网络 acquisition、多 Source评分、force rerun、维护命令、GUI/daemon、动态插件、Promotion Gate、Promoted Knowledge、Research Interest或 Relevance Candidate。它不冻结 OCR/Canonical/Reader内部 schema、Registry表、Human样式或 child transport实现；这些由各实施 ticket/既有合同拥有。
+本合同不增加 command/option、batch/interactive review、Identity Review专用命令、自动搜索/下载、网络 acquisition、多 Source评分、force rerun、维护命令、GUI/daemon、动态插件、Promotion Gate、Promoted Knowledge、Research Interest或 Relevance Candidate。它不冻结 OCR/Canonical/Reader内部 schema、Registry表、可选 interactive Rich decoration或 child transport实现；第 8 节的 Human 语义行与 redirected bytes 已冻结。
 
 未来 Context先定义业务语言、状态所有权与 versioned handoff，再由 static composition加入；不得复用 human-review capability、直接写 Literature assets或把七阶段扩成通用 DAG。
 
