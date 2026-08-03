@@ -149,7 +149,7 @@ ADR 0027 stage items retain exactly `pending`, `running`, `succeeded`, `blocked`
 - SQLite is authoritative only where the Context ADR says it is. A Literature SQLite projection cannot override immutable assets, and a file-system copy cannot override the Knowledge Candidate Registry. Current pointers and indexes are observations, not independent success authority.
 - Overall and Work scope use the same Context projection and aggregation rules. Work scope is a filter over stable Work/source/Candidate attribution, not a second implementation.
 
-An Answer is related to a Work only when a valid committed Answer's Retrieval View contains at least one Candidate whose validated source snapshot names that exact `work_id`. A quarantined, uncommitted, invalid, or unattributable Answer is counted only in recovery/integrity, not as a related Answer.
+An Answer is related to a Work only when a valid committed Answer's Retrieval View contains at least one Candidate whose validated source snapshot names that exact `work_id`. Any safely observed and attributable direct entry at literal `answers/.staging/<answer_id>/` contributes only to `RecoverySummaryV1.staging_count`: because this read-only command does not hold writer ownership, it leaves the entry unclassified and must not use a manifest, timestamp or age, PID or mutex observation, apparent file stability, target presence/conflict, or content validity to increment `orphaned_count` or `quarantined_count`. An invalid or unattributable formal target may contribute only to the recovery/integrity fact that the owning Knowledge projection can prove under Answer Terminal v1; it is never a related Answer.
 
 ## 7. Status result schema
 
@@ -200,7 +200,7 @@ An availability-only Context summary is exactly `{"availability":"unavailable"}`
 }
 ~~~
 
-The populated Literature object has exactly `availability`, `work_count`, `work_status_counts`, `pending_review_count`, and `pending_handoff_count`. The populated Knowledge object has exactly `availability`, `active_candidate_count`, `withdrawn_candidate_count`, and `answer_status_counts`. Answer counts use only terminal operational values `succeeded`, `blocked`, `failed`, and `interrupted`, in that order when nonzero; Answer semantic `answered`/`insufficient_evidence` is deliberately absent.
+The populated Literature object has exactly `availability`, `work_count`, `work_status_counts`, `pending_review_count`, and `pending_handoff_count`. Starting from zero and following the listed order, checked addition of every `work_status_counts[*].count` must complete without exceeding `9223372036854775807` and must equal `work_count` exactly; therefore `work_count=0` iff `work_status_counts=[]`, and every counted Work contributes to exactly one status item. Overflow or any unequal sum makes the report invalid and selects `operations.status.observation_failed.v1` with outer `outcome=failed` and `result=null`; the implementation must not truncate, omit, saturate, or normalize counts to obtain equality. The populated Knowledge object has exactly `availability`, `active_candidate_count`, `withdrawn_candidate_count`, and `answer_status_counts`. Answer counts use only terminal operational values `succeeded`, `blocked`, `failed`, and `interrupted`, in that order when nonzero; Answer semantic `answered`/`insufficient_evidence` is deliberately absent.
 
 ### 7.3 Work report
 
@@ -429,6 +429,8 @@ Stderr is empty and normal exit is `2`.
 | historical pending/running/blocked/failed/interrupted | report carries that operational value while outer remains succeeded, exit `0` |
 | one Context unavailable/unsafe | coherent other projection produces `partial`, matching supplemental plus projection-incomplete, exit `0` |
 | staging/orphan/quarantine/inconsistency | never `succeeded`; recovery count plus integrity supplemental, exit `0` if bounded |
+| Answer staging seen by `status` | only `staging_count` increments; manifest, age, stability, target presence/conflict, and content validity never upgrade it to orphaned/quarantined |
+| Work count mismatch/overflow | result null, observation-failed primary, exit `1`; no truncation, omission, saturation, or normalization |
 | invalid Work ID | result null, blocked primary, exit `2`; raw invalid value absent from output |
 | Work absent | result null, work-not-found primary with validated ID, exit `2` |
 | invalid configuration or no minimum projection | result null, blocked primary, exit `2` |
@@ -482,6 +484,8 @@ Public acceptance additionally proves:
 - configuration invalidity does not stop independent doctor capability checks, but prevents root probing;
 - a non-consumed/unavailable Context only narrows the status report allowed by Section 6;
 - staging, partial, orphaned, quarantined, and inconsistent fixtures never produce `status=succeeded` or a Human completion heading;
+- Answer staging fixtures that differ only by manifest, age, apparent stability, target presence/conflict, or content validity produce the same staging-only recovery classification without writer ownership;
+- `work_status_counts` covers zero/equal totals, unequal totals, and checked-add overflow; only the exact representable equality produces a report;
 - a historical Answer `failed`/`blocked` state does not make the read invocation fail;
 - JSON exact bytes, Human exact lines, stderr isolation, exit mapping, two-launcher parity, and 65,536/65,537 presentation boundaries hold;
 - complete stdout is the only Operations receipt. Empty/partial stdout, even with a familiar exit value, is not interpreted as a handled report.
