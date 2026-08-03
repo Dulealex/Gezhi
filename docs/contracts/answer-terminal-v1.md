@@ -17,13 +17,16 @@ V1 威胁边界仍是服从同一 writer mutex 的协作进程与 crash / power-
 
 ## Module、Interface 与状态词
 
-`AnswerTerminalV1` 是 Knowledge Context 内的 deep module。它隐藏 safe-open、路径闭合、预算、hash、Schema/media identity、跨资产验证与 recovery checkpoint；调用方只能通过以下三个行为 seam 使用它：
+`AnswerTerminalV1` 是 Knowledge Context 内的 deep module。它隐藏 safe-open、路径闭合、预算、hash、Schema/media identity、跨资产验证与 recovery checkpoint；调用方只能通过以下四个行为 seam 使用它：
 
 1. `read_committed(answer_id)`：只读并整体接受或拒绝字面 `answers/<answer_id>/`。
 2. `inspect_orphan(staging_entry)`：只允许在当前线程持有该 Knowledge 数据根 writer ownership 时检查 `.staging/` 的一个直接子项。
 3. `complete_orphan(inspected_orphan)`：只消费同一次完整检查得到的不可变证据，最多执行一次 non-replacing same-volume directory rename。
+4. `publish_current(owned_terminal_candidate)`：只消费本次 invocation 为当前 writer 建立、不可伪造且单次使用的 terminal candidate 能力，并独占新 Answer 从唯一 canonical manifest buffer 到明确 commit / no-commit / uncertain observation 的完整发布生命周期；详见后文专节。
 
-这三个名称描述行为合同，不冻结 Python module path、class、exception 或返回对象。CLI adapter、Human renderer、diagnostic constructor 与未来 Context 不得绕过该 module 直接解释 Answer 文件。
+这四个名称描述概念行为合同，不冻结 Python module path、class、函数签名、exception 或返回对象。CLI adapter、Human renderer、diagnostic constructor、Knowledge Answer writer 与未来 Context 都不得绕过该 module 直接解释、验证或发布 Answer 文件。`owned_terminal_candidate` 不是 path、`answer_id`、boolean、普通 object/dict 或可由 caller 重建的字段集合；它必须把当前 invocation、depth-one writer ownership、frozen Knowledge root physical identity、expected `answer_id`、当前 active staging identity、已锁存 terminal cause 与已经形成、验证并关闭的最终非 manifest 资产绑定为一个 invocation-local opaque capability。
+
+当前 writer 的 active staging 绝不能传给 `inspect_orphan` 或 `complete_orphan`，这两个 seam 只处理后续持锁 invocation 已重新证明 prior owner 不存在的历史 staging。若当前 invocation 在 `publish_current` 明确成功前 crash 或异常终止，它的能力与全部进程内证据同时失效；下一 invocation 只能重新取得 writer ownership、从当前实际 namespace 与 bytes 开始调用 `inspect_orphan`，通过后才可调用 `complete_orphan`，不得复用旧 candidate、旧 validator 结果或旧 rename observation。
 
 以下四个词是 invocation-local 的检查分类，不写入 manifest、CLI result、diagnostics、sidecar、marker 或 current pointer：
 
@@ -74,11 +77,11 @@ ANSWER_TERMINAL_MAX_BYTES = 56_623_104  # 54 MiB
 
 Aggregate cap 是独立的 reader envelope，不是各文件可互借的 quota。即使每项分别不超限，合计第 `56_623_105` byte 仍使整个 candidate 无效；某项未用额度不能扩大另一项。
 
-Writer 必须在全部 terminal assets 已形成并关闭后，按 ADR 0082–0084 恰好序列化一次，形成唯一 immutable canonical manifest buffer；先验证该 buffer 的实际 raw length 不超过 `65_536`，再以该实际长度为初值，对全部最终 asset 的实际 raw byte length 执行 checked non-negative integer addition，并要求总和不超过 `ANSWER_TERMINAL_MAX_BYTES`。Aggregate overflow 必须在对字面 `manifest.json` 执行 direct exclusive-create / write 以及目录 rename / publish 前拒绝；不得以预留 `65_536` bytes 代替 manifest 实际长度而误拒合法组合，不得为重算 aggregate 二次序列化，也不能先发布再截断或清理。该 writer-side failure 已处于 terminal manifest formation 开始后的既有 no-commit `knowledge.ask.answer_manifest_failed.v1` 边界，不新增或改排诊断。
+`publish_current` 必须在全部 terminal assets 已形成并关闭后，按 ADR 0082–0084 恰好序列化一次，形成唯一 immutable canonical manifest buffer；先验证该 buffer 的实际 raw length 不超过 `65_536`，再以该实际长度为初值，对全部最终 asset 的实际 raw byte length 执行 checked non-negative integer addition，并要求总和不超过 `ANSWER_TERMINAL_MAX_BYTES`。Aggregate overflow 必须在对字面 `manifest.json` 执行 direct exclusive-create / write 以及目录 rename / publish 前拒绝；不得以预留 `65_536` bytes 代替 manifest 实际长度而误拒合法组合，不得为重算 aggregate 二次序列化，也不能先发布再截断或清理。该 writer-side failure 已处于 terminal manifest formation 开始后的既有 no-commit `knowledge.ask.answer_manifest_failed.v1` 边界，不新增或改排诊断。
 
 ## 有界 reader 的固定顺序与 EOF 证据
 
-`read_committed`、writer readback 与 `inspect_orphan` 必须复用同一个 terminal validator，并按以下顺序 fail closed：
+`read_committed`、`publish_current` 内部的 writer readback 与 `inspect_orphan` 必须复用同一个 terminal validator，并按以下顺序 fail closed：
 
 1. 从 frozen canonical Knowledge root 派生 exact candidate，safe-open 根目录；拒绝 reparse、ADS、unsafe alias 与 expected `answer_id` / basename 不一致。
 2. Safe-open 字面 lowercase `manifest.json`，先以 `65_536 + 1` witness 读 raw bytes；只有明确读到 EOF 且实际长度不超过 cap 才进入 framing、strict UTF-8、structural preflight、strict parse、当前 Schema 与 canonical byte round-trip。
@@ -111,13 +114,34 @@ answer.md
 
 Manifest metadata、`GetFileSizeEx`、目录项 size、一次短 read 或已知 producer buffer 都不能代替 EOF witness。Reader 不按 manifest 长度预分配，不为 hash 读到 path cap 之后，也不因 JSON 看似已结束而跳过尾随 bytes。
 
+## `publish_current` 的唯一高层发布行为
+
+`publish_current` 是当前 writer 发布本次新 Answer 的唯一 seam。Caller 只能移交上述 `owned_terminal_candidate`，不能要求“只验证”“只写 manifest”“跳过 readback”“直接 rename”或把内部 checkpoint 拆成可单独调用的浅 interface。Module 取得该单次能力后独占并串行完成：
+
+1. 确认能力仍属于本 invocation、当前线程仍 depth-one 持有与 frozen root identity 绑定的 writer ownership，expected target 与 active staging identity 未漂移，全部最终非 manifest 资产已经形成、验证、关闭且私有 entry 已撤销。
+2. 恰好一次形成 immutable canonical manifest buffer，先执行 manifest 实际 raw length cap，再从该实际长度开始对全部最终 asset 实际 raw byte length checked-add 并执行 aggregate cap；失败不得形成 manifest leaf。
+3. 对字面 `manifest.json` 恰好一次 direct exclusive-create，把同一 buffer 完整 write / completion / close；随后由共享 terminal validator 对最终 leaf、整个 staging 与同一 buffer identity 完成 writer readback。不得二次序列化、另建 manifest、重开写入、修补或跳过 readback。
+4. 关闭 root anchor 以外的 operation-specific handles，紧邻 publish 重新证明 root identity / canonical path、staging 与 target 两条父链 no-reparse、same-volume、expected target absent 以及 current staging identity。
+5. 对当前 staging 到 expected target 恰好尝试一次 non-replacing same-volume directory rename。只有明确成功 observation 才消费能力并返回本 invocation 可用的等价 committed proof；该 proof 绑定前述完整 staging validation、紧邻 checkpoint 与本次明确成功 rename，不能被保存给后续 invocation，也不要求当前 invocation 立即从 target 再做一次全量读取。
+
+失败与不确定结果继续由既有边界拥有，`publish_current` 不增加 Schema、diagnostic、outcome、receipt 字段或公开异常文本：
+
+| observation / failure point | 唯一行为 |
+|---|---|
+| canonical buffer、manifest cap、aggregate、exclusive-create/write/completion/close、writer readback、目录闭合或跨资产复验失败，且 root trust 仍成立 | 选择既有 no-commit `knowledge.ask.answer_manifest_failed.v1`、`result=null`；staging 原地保留，不重试或修补。 |
+| 最终 checkpoint 不能继续证明 root identity / canonical path / 父链安全 | 选择既有 no-commit `knowledge.ask.data_root_integrity_lost.v1`、`result=null`；不得尝试 rename。 |
+| checkpoint 已见 expected target，或 rename 明确返回 target-exists | 选择既有 no-commit `knowledge.ask.answer_target_conflict.v1`、`result=null`；不覆盖、不换 ID 重试，当前 staging 原地隔离。 |
+| rename 明确为其他 failure，且能证明 staging 未提交、target 不是本次 commit、全部 operation 已安全停止 | 选择既有 no-commit `knowledge.ask.answer_commit_failed.v1`、`result=null`；完整 staging 原地保留供后续 recovery 从零复验，同一 invocation 不重试。 |
+| rename completion / commit outcome 无法确定 | 立即 stop-new-work；不得重试、回滚、删除、补 pointer、生成 receipt、选择 normal no-commit outcome或调用 orphan seam。只有后续独立 invocation 可重新取得 ownership并从当前 namespace 开始恢复。 |
+| rename 明确成功 | 返回 invocation-local equivalent committed proof；本次新 Answer 的既有 receipt projection 才可据此继续，后续独立 invocation 仍必须用 `read_committed` 重新证明 target。 |
+
 ## Terminal authority、CLI receipt 与 current pointer
 
 持久 authority 只有完整有效的 `answers/<answer_id>/manifest.json` 及其闭合资产目录。`KnowledgeAskResultV1` 是产生本次新 Answer 的 process-level、非持久 commit receipt；它不是 manifest 副本，也不成为第二个 authority。两者的一致性固定为：
 
 | 情形 | 持久状态 | 本次 `knowledge.ask result` | current pointer |
 |---|---|---|---|
-| 本次新 Answer 的 staging 已由共享 terminal validator 完整验证、紧邻 checkpoint 通过，且 non-replacing rename 明确成功 | 本 invocation 以等价 committed proof 接受为 `committed`；不要求立即从 target 重读 | 按既有矩阵为非 `null`；若随后 crash / presentation failure，stdout 仍可能没有完整 receipt | 必须缺席 |
+| 本次新 Answer 已由 `publish_current` 消费不可伪造的 current-writer capability，共享 terminal validator 完整验证 staging，紧邻 checkpoint 通过，且 non-replacing rename 明确成功 | 本 invocation 以 `publish_current` 返回的等价 committed proof 接受为 `committed`；不要求立即从 target 重读 | 按既有矩阵为非 `null`；若随后 crash / presentation failure，stdout 仍可能没有完整 receipt | 必须缺席 |
 | 启动时补交旧 `orphaned` Answer 明确成功 | 本 invocation 以同一等价证明接受该历史 Answer 为 `committed`；之后的 invocation 必须 `read_committed` | 不能成为本次 result；新 Ask 是否另有 result 只看自己的新 commit | 必须缺席 |
 | 只读历史 target | 验证通过才是 `committed` | 不构造 `knowledge.ask` receipt | 必须缺席 |
 | 历史 staged/orphaned/quarantined 项自身，且本次新 Answer 最终确定 no-commit | 没有本次 committed target | `result=null`，并服从既有 no-commit outcome/diagnostic 合同 | 必须缺席 |
@@ -129,14 +153,14 @@ Answer V1 明确不存在 `answers/current.json`、`runs/current.json`、latest/
 
 ## 普通命令、recovery 与 maintenance 边界
 
-V1 已批准的持久 mutation 只有两类：当前 writer 自己的 staging 生命周期，以及满足本合同全部前置条件的 `complete_orphan` 单次目录 rename。
+V1 已批准的持久 mutation 只有两类：`publish_current` 独占的当前 writer staging / terminal publish 生命周期，以及满足本合同全部前置条件的 `complete_orphan` 单次历史 orphan 目录 rename。
 
 | consumer / operation | 可读 target | 可检查 staging | 可提交 orphan | 可移动、删除、修补或标记 quarantined entry |
 |---|---:|---:|---:|---:|
 | explicit-ID Answer reader / 历史展示 | 是，只整体读取 target | 否 | 否 | 否 |
 | `status` / 普通只读检查 | 是，只读 | 若其自身合同以后批准报告，最多使用未分类 presence；不能声称 ownerless | 否 | 否 |
 | `knowledge ask` 持锁 pre-ID recovery | 是 | 是 | 是，每候选最多一次 non-replacing rename | 否 |
-| writer 处理自己的 active staging | 否，不以 target 代替 staging | 是，只限自己拥有的目录 | 只提交自己的 terminal Answer | 否 |
+| writer 处理自己的 active staging | 否，不以 target 代替 staging | 是，只限 `owned_terminal_candidate` 绑定的目录 | 只经 `publish_current` 提交自己的 terminal Answer；不得调用 orphan seam | 否 |
 | explicit maintenance seam | 不适用；seam 未开放 | 必须以后单独冻结 | V1 无额外 action | V1 mutating action set 为空 |
 
 “V1 mutating action set 为空”是封闭决定，不是允许实现自行补命令：当前不提供 archive、purge、repair、force-promote、terminalize、quarantine marker 或 `resume Answer`。若以后需要显式维护，必须另行冻结入口、授权/确认、exact target、并发 ownership、保留路径、幂等键、失败与不确定结果；在此之前，`ask`、`status`、`doctor`、历史 reader 或后台任务都不能代行。
@@ -210,7 +234,7 @@ Target 的存在性判断使用字面 expected path 与安全 namespace 规则�
 ### Capacity 与 EOF
 
 - 对 manifest、表中每个 path cap 以及 aggregate cap，覆盖 `cap - 1`、`cap`、`cap + 1`；前两者只表示容量门禁通过，仍需其他语义有效，`cap + 1` 必须在解析/返回内容前拒绝。
-- Writer 覆盖“单次 canonical serialization → manifest 实际长度门禁 → 以该实际长度和全部最终 asset 实际长度 checked-add”的顺序；aggregate overflow 必须在 manifest exclusive-create 前得到既有 `answer_manifest_failed` no-commit，另覆盖“预留 `65_536` 会超限但按实际 manifest length 合计合法”的组合，并断言不二次序列化。
+- 通过 `publish_current` 覆盖“单次 canonical serialization → manifest 实际长度门禁 → 以该实际长度和全部最终 asset 实际长度 checked-add”的顺序；aggregate overflow 必须在 manifest exclusive-create 前得到既有 `answer_manifest_failed` no-commit，另覆盖“预留 `65_536` 会超限但按实际 manifest length 合计合法”的组合，并断言不二次序列化。
 - 覆盖 manifest declared length 超限、declared aggregate 超限、实际文件短于声明、实际文件长于声明、实际第 `path cap + 1` byte、实际第 `aggregate cap + 1` byte、short-read 后继续到 EOF，以及 size metadata 与实际 stream 不一致。
 - 任一路径或 aggregate boundary 若无法用完整领域 payload 独立达到，使用窄 raw-reader fixture；不得放宽正式 Schema 只为造测试。
 
@@ -218,6 +242,8 @@ Target 的存在性判断使用字面 expected path 与安全 namespace 规则�
 
 - 双件矩阵每个 cell 至少一个测试；无 ownership 时 staging 只能 staged，持锁后才可 orphan/quarantine。
 - 有效 orphan 的 rename 明确成功、target-exists、其他确定失败与 uncertain completion 四分支全部覆盖。
+- `publish_current` 必须从不可伪造且单次使用的 current-writer capability 覆盖完整 manifest/readback/checkpoint/rename 生命周期，并分别验证明确成功、target conflict、其他可证明 no-commit failure 与 uncertain completion；caller 不能逐步调用、跳过门禁或从返回字段伪造 committed proof。
+- 当前 active staging 传入 `inspect_orphan` / `complete_orphan` 必须拒绝；当前 invocation 在明确 commit 前 crash 后，下一 invocation 必须丢弃全部旧能力与证据，从重新取得 ownership、`inspect_orphan` 全量复验开始。
 - 验证明确定 rename 的同一持锁 invocation 可复用紧邻 rename 的完整 staging evidence 作为等价 committed proof，无需立即重复全量读取；后续独立 invocation 不得复用旧证据，必须 `read_committed`。
 - 验证 failure、cap overflow、坏 target 与 target conflict 不得被解释为 succeeded，不得返回 partial Answer 或 non-null Ask receipt。
 - Crash checkpoints 表逐行覆盖；尤其是“rename 成功、receipt 前 crash”必须接受 target 但不能追造 receipt/current pointer。
@@ -236,4 +262,4 @@ Target 的存在性判断使用字面 expected path 与安全 namespace 规则�
 - 不冻结 orphan/capture/maintenance supplemental diagnostic code/context、Human 文案或 `status` payload；实现不得使用通用 fallback、异常文本或任意 dict 填补。
 - 不提供 physical quarantine、archive、purge、repair 或 current/latest selection。未来增加任一持久路径、marker、pointer 或 mutation action，都必须显式演进相应合同；不能静默扩展 Answer V1。
 
-该设计把复杂 filesystem 与恢复规则压入一个深 module，以一个整体 reader 和一个单次 rename seam 服务 writer readback、历史读取与 crash recovery；代价是异常现场会原地积累，但正常命令接口保持小、局部、可验证，且不会把损坏现场升级为正式 Answer。
+该设计把复杂 filesystem 与恢复规则压入一个 deep module，以一个整体 reader、一个 current-writer 高层 publish seam 与一个历史 orphan 单次 rename seam 服务 writer readback、正式发布、历史读取与 crash recovery；代价是异常现场会原地积累，但正常命令 interface 保持小、局部、可验证，且不会把损坏现场升级为正式 Answer。
