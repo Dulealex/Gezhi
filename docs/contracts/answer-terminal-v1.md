@@ -29,7 +29,7 @@ V1 威胁边界仍是服从同一 writer mutex 的协作进程与 crash / power-
 
 | classification | 精确定义 |
 |---|---|
-| `committed` | 字面 `answers/<answer_id>/` 存在，并由 `read_committed` 对当前实际 bytes 完整验证通过。路径存在、manifest 存在或旧 CLI 成功都不够。 |
+| `committed` | 字面 `answers/<answer_id>/` 存在，并满足以下任一完整证据：`read_committed` 对 target 当前实际 bytes 验证通过；或仅在同一持有 writer ownership 的 invocation 内，staging 当前 bytes 已由共享 terminal validator 完整验证、紧邻 rename checkpoint 通过，且 non-replacing same-volume directory rename 明确成功。后一组证据是本 invocation 的等价 committed proof，不要求立即从 target 重复全量读取；后续独立 invocation 只能由 `read_committed` 重新证明。仅有路径、manifest、旧 CLI 成功或旧 invocation 证据都不够。 |
 | `staged` | `.staging/` 项仍由当前活跃 writer 拥有，或检查方尚未通过同一 mutex 证明 prior owner 已不存在；正式 consumer 必须忽略。 |
 | `orphaned` | 检查方已取得 writer ownership，候选是安全直接子目录，完整 terminal validation 通过，expected target 当前缺失，因此只差原定目录 rename。 |
 | `quarantined` | target 或 ownerless staging 无法成为可接受的 committed Answer：无效、不完整、不安全、超限、target conflict，或本轮发生确定的 candidate-local recovery failure。隔离是原路径上的逻辑拒绝；V1 不移动、修补、标记或删除它。 |
@@ -72,7 +72,9 @@ ANSWER_TERMINAL_MAX_BYTES = 56_623_104  # 54 MiB
 
 计量值精确等于当前实际 `manifest.json` raw byte length，加上 manifest 列出的全部 asset 未命名主数据流实际 raw byte length。它不包含目录项、NTFS allocation、ADS、writer-private spool、相邻 Answer、相邻 orphan 或整个数据根；ADS 本身仍直接非法。
 
-Aggregate cap 是独立的 reader envelope，不是各文件可互借的 quota。即使每项分别不超限，合计第 `56_623_105` byte 仍使整个 candidate 无效；某项未用额度不能扩大另一项。Writer 必须在 terminal manifest formation 前用相同路径表与 checked integer addition 证明合计可容纳；不能先发布再截断或清理。
+Aggregate cap 是独立的 reader envelope，不是各文件可互借的 quota。即使每项分别不超限，合计第 `56_623_105` byte 仍使整个 candidate 无效；某项未用额度不能扩大另一项。
+
+Writer 必须在全部 terminal assets 已形成并关闭后，按 ADR 0082–0084 恰好序列化一次，形成唯一 immutable canonical manifest buffer；先验证该 buffer 的实际 raw length 不超过 `65_536`，再以该实际长度为初值，对全部最终 asset 的实际 raw byte length 执行 checked non-negative integer addition，并要求总和不超过 `ANSWER_TERMINAL_MAX_BYTES`。Aggregate overflow 必须在对字面 `manifest.json` 执行 direct exclusive-create / write 以及目录 rename / publish 前拒绝；不得以预留 `65_536` bytes 代替 manifest 实际长度而误拒合法组合，不得为重算 aggregate 二次序列化，也不能先发布再截断或清理。该 writer-side failure 已处于 terminal manifest formation 开始后的既有 no-commit `knowledge.ask.answer_manifest_failed.v1` 边界，不新增或改排诊断。
 
 ## 有界 reader 的固定顺序与 EOF 证据
 
@@ -115,8 +117,8 @@ Manifest metadata、`GetFileSizeEx`、目录项 size、一次短 read 或已知 
 
 | 情形 | 持久状态 | 本次 `knowledge.ask result` | current pointer |
 |---|---|---|---|
-| 本次新 Answer 的 non-replacing rename 明确成功，且 receipt 候选从该 committed target 重读形成 | `committed` | 按既有矩阵为非 `null`；若随后 crash / presentation failure，stdout 仍可能没有完整 receipt | 必须缺席 |
-| 启动时补交旧 `orphaned` Answer 明确成功 | 历史 Answer 变为 `committed` | 不能成为本次 result；新 Ask 是否另有 result 只看自己的新 commit | 必须缺席 |
+| 本次新 Answer 的 staging 已由共享 terminal validator 完整验证、紧邻 checkpoint 通过，且 non-replacing rename 明确成功 | 本 invocation 以等价 committed proof 接受为 `committed`；不要求立即从 target 重读 | 按既有矩阵为非 `null`；若随后 crash / presentation failure，stdout 仍可能没有完整 receipt | 必须缺席 |
+| 启动时补交旧 `orphaned` Answer 明确成功 | 本 invocation 以同一等价证明接受该历史 Answer 为 `committed`；之后的 invocation 必须 `read_committed` | 不能成为本次 result；新 Ask 是否另有 result 只看自己的新 commit | 必须缺席 |
 | 只读历史 target | 验证通过才是 `committed` | 不构造 `knowledge.ask` receipt | 必须缺席 |
 | 历史 staged/orphaned/quarantined 项自身，且本次新 Answer 最终确定 no-commit | 没有本次 committed target | `result=null`，并服从既有 no-commit outcome/diagnostic 合同 | 必须缺席 |
 | rename completion 无法确定 | 同一 invocation 不猜测 committed/no-commit | 不得发布正常 receipt；走后文 uncertain boundary | 必须缺席 |
@@ -168,7 +170,7 @@ Target 的存在性判断使用字面 expected path 与安全 namespace 规则�
 
 | rename observation | 当前 invocation 的行为 |
 |---|---|
-| 明确成功 | 该历史 Answer 成为 `committed`；不重跑阶段、不改 manifest、不生成本次 Ask receipt。随后可从 formal target 全量重读，但成功 rename 已是 process-level commit point。 |
+| 明确成功 | 本 invocation 以“共享 validator 对 staging 当前 bytes 的完整证据 + 紧邻 rename checkpoint + 明确成功的 non-replacing same-volume rename”作为等价 committed proof；该历史 Answer 成为 `committed`，不要求立即从 formal target 重复全量读取，也不重跑阶段、不改 manifest、不生成本次 Ask receipt。Rename 明确成功仍是 process-level commit point；后续独立 invocation 只能通过 `read_committed` 接受 target。 |
 | 明确 target-exists | 不覆盖；按双件矩阵完整检查 target，staging 作为 target-conflict `quarantined`。 |
 | 明确为其他 candidate-local failure，且 root trust 与“target 未由本操作提交”均可证明 | 本轮把 staging 归为 `quarantined`，原地保留，只形成待冻结的 supplemental fact，并继续下一个候选。不得在同一 invocation 重试。 |
 | completion / commit outcome 无法确定 | 立即 stop-new-work；不得重试、回滚、删除、补 pointer、生成 receipt、选择 normal no-commit outcome或继续扫描。只有后续独立 invocation 重新取得 ownership、重新 safe-open 当前 namespace 并从零应用双件矩阵。 |
@@ -183,7 +185,7 @@ Target 的存在性判断使用字面 expected path 与安全 namespace 规则�
 | staging 已建，但只有私有/partial/non-terminal 资产 | 取得 ownership 后 `quarantined`；不补 manifest、不伪造成 interrupted。 |
 | terminal assets 已形成，但 `manifest.json` 缺失、空、partial、超限或无效 | `quarantined`；不寻找 temp/backup/sidecar，不 canonicalize。 |
 | `manifest.json` 与全部资产完整有效，rename 尚未发生 | `orphaned`；只允许 `complete_orphan`。 |
-| rename 已发生，CLI receipt 尚未完整写出 | target 经全量复验后为 `committed`；receipt 缺失不回滚，也不补 current pointer。 |
+| rename 已明确成功，CLI receipt 尚未完整写出 | 成功的原 invocation 已在 rename 返回时以等价 proof 达到 process-level `committed`；若随后 crash，后续 invocation 只能在 `read_committed` 对 target 当前 bytes 全量复验通过后接受。Receipt 缺失不回滚，也不补 current pointer。 |
 | power loss 后 target/staging 并存、任一 partial 或两侧缺失 | 只按当前 bytes 应用双件矩阵；不从旧 success、日志、时间戳或 rename 猜测。 |
 
 重复 `read_committed` 与 `inspect_orphan` 不写磁盘。`complete_orphan` 成功后重复运行会先看到 target，因而不再 rename；target conflict 永不覆盖。确定失败在同一 invocation 不重试；下一 invocation 若重新获得完整证据，可以再次按 closed matrix 作一次新尝试。不确定 outcome 在当前 invocation 没有幂等重试资格。
@@ -208,6 +210,7 @@ Target 的存在性判断使用字面 expected path 与安全 namespace 规则�
 ### Capacity 与 EOF
 
 - 对 manifest、表中每个 path cap 以及 aggregate cap，覆盖 `cap - 1`、`cap`、`cap + 1`；前两者只表示容量门禁通过，仍需其他语义有效，`cap + 1` 必须在解析/返回内容前拒绝。
+- Writer 覆盖“单次 canonical serialization → manifest 实际长度门禁 → 以该实际长度和全部最终 asset 实际长度 checked-add”的顺序；aggregate overflow 必须在 manifest exclusive-create 前得到既有 `answer_manifest_failed` no-commit，另覆盖“预留 `65_536` 会超限但按实际 manifest length 合计合法”的组合，并断言不二次序列化。
 - 覆盖 manifest declared length 超限、declared aggregate 超限、实际文件短于声明、实际文件长于声明、实际第 `path cap + 1` byte、实际第 `aggregate cap + 1` byte、short-read 后继续到 EOF，以及 size metadata 与实际 stream 不一致。
 - 任一路径或 aggregate boundary 若无法用完整领域 payload 独立达到，使用窄 raw-reader fixture；不得放宽正式 Schema 只为造测试。
 
@@ -215,6 +218,7 @@ Target 的存在性判断使用字面 expected path 与安全 namespace 规则�
 
 - 双件矩阵每个 cell 至少一个测试；无 ownership 时 staging 只能 staged，持锁后才可 orphan/quarantine。
 - 有效 orphan 的 rename 明确成功、target-exists、其他确定失败与 uncertain completion 四分支全部覆盖。
+- 验证明确定 rename 的同一持锁 invocation 可复用紧邻 rename 的完整 staging evidence 作为等价 committed proof，无需立即重复全量读取；后续独立 invocation 不得复用旧证据，必须 `read_committed`。
 - 验证 failure、cap overflow、坏 target 与 target conflict 不得被解释为 succeeded，不得返回 partial Answer 或 non-null Ask receipt。
 - Crash checkpoints 表逐行覆盖；尤其是“rename 成功、receipt 前 crash”必须接受 target 但不能追造 receipt/current pointer。
 - 任意 normal/recovery 路径都断言不创建或修改 `current.json`、quarantine marker、backup、sidecar，不 overwrite/delete/merge target。
