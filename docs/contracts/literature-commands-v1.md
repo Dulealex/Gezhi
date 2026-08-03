@@ -40,7 +40,7 @@
 
 `add` 只消费 Literature Data Root，不探测 Knowledge、OCR 或 Codex。`resume` 只有到达 OCR、read 或 knowledge_import 才分别探测 OCR、Codex 或 Knowledge Data Root/Registry。`review` 保存决定和 Handoff 时只消费 Literature Data Root，只有实际需要 import 时才探测 Knowledge Data Root/Registry；它永不探测 OCR 或 Codex。Configuration resolver 仍验证两个 root raw strings 的共享 lexical invariant；“不消费”只表示不对另一个 Context root 做 physical open/probe。
 
-每个实际消费的 Context Data Root 在初始 physical gate 使用闭合分类：相对、UNC/WSL UNC、remote mapping、device/Volume GUID/ADS、reparse/8.3/SUBST/volume mount 或其他已证明的 hidden alias/physical overlap 是 `data_root_unsafe`；目录缺失、不可访问、不是目录，或在没有正面 unsafe 证据时无法完成 identity proof 是 `data_root_unavailable`。初始 gate 通过后，同一 frozen physical identity 在执行中漂移或失去可信性只能是 `data_root_integrity_lost`，不得降格为 unsafe/unavailable。`add` 只可能为 Literature root 产生这些分类；`resume` 对初始 Literature root 与到达 import 后实际消费的 Knowledge root 使用同一 code 且 context 固定 `{}`，任一 root fault 都使 result seal 不能完成并返回 null；`review` 则用第 7.3 节的 exact context object 区分两个 root 及 Decision 前后 result presence。
+每个实际消费的 Context Data Root 在初始 physical gate 使用闭合分类：相对、UNC/WSL UNC、remote mapping、device/Volume GUID/ADS、reparse/8.3/SUBST/volume mount 或其他已证明的 hidden alias/physical overlap 是 `data_root_unsafe`；目录缺失、不可访问、不是目录，或在没有正面 unsafe 证据时无法完成 identity proof 是 `data_root_unavailable`。初始 gate 通过后，同一 frozen physical identity 在执行中漂移或失去可信性只能是 `data_root_integrity_lost`，不得降格为 unsafe/unavailable。`add` 只可能为 Literature root 产生这些分类；`resume` 的三个 root code 都使用第 7.2 节 exact context object：`literature` variant 属于初始 Literature authority gate或其后 identity proof并阻止 result seal，`knowledge` variant 只在到达 `knowledge_import` 后实际消费 Knowledge root时出现且不要求 Literature root 同时失去可信性；`review` 用第 7.3 节 exact context object 区分两个 root 及 Decision 前后 result presence。
 
 ### 2.2 稳定 ID
 
@@ -182,13 +182,17 @@ Source bundle 在同卷 staging 完整写入、关闭、hash/manifest readback�
 
 `pipeline_complete=true` iff `stop_stage=complete`、pending为空且七阶段当前 obligations全可验证；already-complete调用使用 start/stop=`complete`、advanced=[]。每个合法 `stage_blocked` 或 `stage_failed` stage/reason pair 只能在 `resume result seal` 完成后选择，因此其 result 一律 non-null，`stop_stage` 等于 primary context 的 stage。`commit_failed` 只表示当前 stage 没有达到 success commit point：该 stage 不得进入 `advanced_stages`，已经明确提交的较早阶段仍保留。
 
-Active Source gate 位于 seal 前：缺失、当前不可稳定读取或没有正面 invalid 证据而无法完成 identity proof 选择 blocked `active_source_unavailable`；Source asset 存在但 manifest、ID、hash 或 bytes 确定矛盾选择 failed `active_source_invalid`。两者都固定 `result=null`，不得伪装成 `ingest` stage pair。`configuration_invalid`、`data_root_unsafe`、`data_root_unavailable`、`work_invalid`、`work_not_found`、`work_busy`、`active_source_unavailable`、`active_source_invalid`、`data_root_integrity_lost` 与 `recovery_failed` 共十个 primary 一律 `result=null`。历史 `interrupted` 只作为 snapshot 内的阶段审计事实，不能产生 outer `interrupted`。Snapshot 不唯一、seal 后 authority 漂移或 commit outcome uncertain 时不得构造近似 result；uncertain commit 仍位于正常 handled 矩阵外。
+Active Source gate 位于 seal 前：缺失、当前不可稳定读取或没有正面 invalid 证据而无法完成 identity proof 选择 blocked `active_source_unavailable`；Source asset 存在但 manifest、ID、hash 或 bytes 确定矛盾选择 failed `active_source_invalid`。两者都固定 `result=null`，不得伪装成 `ingest` stage pair。
+
+`configuration_invalid`、`work_invalid`、`work_not_found`、`work_busy`、`active_source_unavailable`、`active_source_invalid` 与 `recovery_failed` 七个 code 在所有 context 下固定 `result=null`。三个 Resume root code 按 context variant 决定 presence：`{"data_root":"literature"}` 的 unsafe、unavailable、integrity-lost 三个 variant 都阻止 seal并为 null，因此总计仍有十个 null variants；`{"data_root":"knowledge"}` 的三个 variant 只在到达 `knowledge_import` 后选择，全部为 non-null。Knowledge variant 必须先 settle Knowledge-owned child/handle/write，再仅从仍可信的 Literature authority 重建并 seal snapshot；`pipeline_complete=false`、`stop_stage=knowledge_import`，`advanced_stages`、`pending_candidate_ids` 与其他字段保留本 invocation 已明确提交的进度，未成功的 `knowledge_import` 不得进入 `advanced_stages`。Knowledge root故障不暗示或要求 Literature root失信，三个 root code也不得折叠为 `stage_blocked`/`stage_failed` pair。
+
+历史 `interrupted` 只作为 snapshot 内的阶段审计事实，不能产生 outer `interrupted`。Snapshot 不唯一、Literature authority 漂移或 commit outcome uncertain 时不得构造近似 result；uncertain commit 仍位于正常 handled 矩阵外。
 
 ## 6. `literature review`
 
 ### 6.1 Candidate、action 与 decision
 
-Candidate ID必须解析到完整有效、Literature-owned Candidate Knowledge，并复验 ID/hash/canonical bytes/provenance/Evidence Pointer。Candidate可来自当前或历史有效 semantic run，以便显式撤回历史已导入 Candidate；staging、collision、坏资产或仅有 SQLite row不可审核。
+Raw Candidate selector 先按第 2.2 节 grammar 原样校验；格式、大小写或规范性无效只选择 blocked `candidate_invalid`，格式有效但没有对应 Candidate只选择 blocked `candidate_not_found`，两者都为 `result=null`。一旦 canonical ID 已解析到现存 Literature-owned Candidate，就复验 ID/hash/canonical bytes/provenance/Evidence Pointer、payload identity、collision 与 asset完整性；任一确定失败只能选择 failed `candidate_integrity_lost` 且 `result=null`，不得退回 `candidate_invalid`。Candidate可来自当前或历史有效 semantic run，以便显式撤回历史已导入 Candidate；staging、collision、坏资产或仅有 SQLite row不可审核。
 
 Action映射唯一为 `--accept→accepted`、`--reject→rejected`、`--defer→deferred`。`pending`表示无 decision，不能由 action写入。V1 note恒 absent。Reviewer固定为 repository-owned actor kind `local_human_cli`；不读取/保存 Windows account、SID、email、Codex identity或自由 reviewer string。
 
@@ -224,7 +228,7 @@ No-action不生成 Handoff ID；Literature用绑定 candidate/payload/revision/s
 
 Knowledge apply只处理当前 Review Decision仍授权的 Handoff，以及为撤回一个已有成功 import receipt所必需的后续 withdraw；已经被更高 decision supersede且从未导入的旧 accept不得补导入。待应用 Handoff按同一 Candidate review revision升序；revision严格递增但不要求连续，因为 no-action decision会形成合法 gap。Handoff已提交、Registry失败时不删除或回滚；review/resume用同一 bytes/ID重试。相同 revision/bytes幂等；同 revision不同 bytes、倒序、hash/payload冲突 failed，不能 last-write-wins。Accepted/active仍是 Candidate Knowledge；不写 Promotion Gate或 Promoted Knowledge。
 
-[ADR 0121](../adr/0121-classify-continuation-failures-by-recoverability-and-certainty.md) 部分取代 ADR 0026 的笼统 blocked 映射：Decision 后，只有已知缺失且可由环境修复或后续显式重试满足的 Handoff/Import 前置条件是 blocked；continuation 已开始后的确定性本地完整性、协议、revision、commit 或 Registry conflict 是 failed；commit outcome uncertain 位于正常 handled 矩阵外。任何此前已明确提交的 Decision、Handoff 或 Registry fact 都不回滚，后续 invocation 复用相同 Candidate、payload、revision 与 Handoff identity。
+[ADR 0121](../adr/0121-classify-continuation-failures-by-recoverability-and-certainty.md) 部分取代 ADR 0026 的笼统 blocked 映射：实际消费 root 的 physical gate先选择 context-specific Data Root code；Resume 的 Registry unavailable/busy、revision/Registry conflict、asset integrity与 commit failure再优先选择互斥的 specific stage reason。只有 Handoff 或 `KnowledgeIntake` interface 返回的其余已批准 typed recoverable prerequisite 才使用 generic blocked，其余已批准 deterministic typed interface failure 才使用 generic failed；unknown、untyped 与 commit-uncertain 均在正常 handled 矩阵外。任何此前已明确提交的 Decision、Handoff 或 Registry fact 都不回滚，后续 invocation 复用相同 Candidate、payload、revision 与 Handoff identity。
 
 ### 6.3 Review result
 
@@ -251,7 +255,7 @@ Decision明确提交或 unchanged完整验证后，result恰好为：
 
 Action=none必须配 handoff_id=null、handoff/import=not_required、intake=null。Accept/withdraw必须配 deterministic Handoff ID；Handoff未提交时 handoff/import=pending、intake=null；Handoff committed但 import未完成时 committed/pending/null；import applied时 accept→active、withdraw→withdrawn。
 
-Decision前 blocked/failed固定 result=null。Decision后，已知缺失且可恢复的 Handoff/Import prerequisite 使用 blocked，确定性的本地完整性、协议、revision、commit 或 Registry conflict 使用 failed；两者都保留 non-null partial receipt且只陈述已完成提交点。Commit outcome uncertain 不形成 handled receipt；完整成功要求 required continuation applied或 no-action成立。
+Decision前 blocked/failed固定 result=null。Decision后先应用 ADR 0121 的 specific-before-generic 互斥映射；generic blocked/failed 只接受 Handoff 或 `KnowledgeIntake` interface 的其余已批准 typed verdict，两者都保留 non-null partial receipt且只陈述已完成提交点。Unknown、untyped 或 commit-uncertain 不形成 handled receipt；完整成功要求 required continuation applied或 no-action成立。
 
 ## 7. Primary diagnostics、outcome 与 exit
 
@@ -284,17 +288,19 @@ T04 V1不定义 supplemental Literature diagnostic。成功 `diagnostics=[]`；b
 | code | outcome | context | result |
 |---|---|---|---|
 | `literature.resume.configuration_invalid.v1` | blocked | `{}` | null |
-| `literature.resume.data_root_unsafe.v1` | blocked | `{}` | null |
-| `literature.resume.data_root_unavailable.v1` | blocked | `{}` | null |
+| `literature.resume.data_root_unsafe.v1` | blocked | 第 7.2 节下方的 closed Data Root object | Literature variant 为 null；Knowledge variant 为 non-null |
+| `literature.resume.data_root_unavailable.v1` | blocked | 第 7.2 节下方的 closed Data Root object | Literature variant 为 null；Knowledge variant 为 non-null |
 | `literature.resume.work_invalid.v1` | blocked | `{}` | null |
 | `literature.resume.work_not_found.v1` | blocked | `{}` | null |
 | `literature.resume.work_busy.v1` | blocked | `{}` | null |
 | `literature.resume.active_source_unavailable.v1` | blocked | `{}` | null |
 | `literature.resume.stage_blocked.v1` | blocked | `{"reason":"<closed>","stage":"<stage>"}` | non-null |
-| `literature.resume.data_root_integrity_lost.v1` | failed | `{}` | null |
+| `literature.resume.data_root_integrity_lost.v1` | failed | 第 7.2 节下方的 closed Data Root object | Literature variant 为 null；Knowledge variant 为 non-null |
 | `literature.resume.active_source_invalid.v1` | failed | `{}` | null |
 | `literature.resume.stage_failed.v1` | failed | `{"reason":"<closed>","stage":"<stage>"}` | non-null |
 | `literature.resume.recovery_failed.v1` | failed | `{}` | null |
+
+三个 Resume Data Root primary 的 context 都是且只能是 `{"data_root":"literature"}` 或 `{"data_root":"knowledge"}` 两个 exact object 的 closed one-of；不得出现合并字符串、其他 value、其他 key 或 additional property。三个 `literature` variant 均阻止 result seal 并返回 null；三个 `knowledge` variant 只在到达 `knowledge_import` 后出现，均返回第 5.3 节冻结的 non-null sealed result，`stop_stage=knowledge_import`，且不属于下方 42 个 stage/reason pair。Knowledge root fault 不暗示 Literature root 同时失去可信性。
 
 `stage_blocked` closed matrix：
 
@@ -322,7 +328,7 @@ T04 V1不定义 supplemental Literature diagnostic。成功 `diagnostics=[]`；b
 
 Stage/reason 必须来自表中 ASCII enum，不能拼内部 error/provider/exception。两张表精确展开为 17 个 blocked pair 与 25 个 failed pair，共 42 个 retained pair；没有隐含组合。每个 retained pair 都必须有独立可达见证：先通过 Literature root、Work、Active Source 与唯一初始 Continuation Point 的 result-presence 前置条件，再把执行推进到表中 stage 并注入该 reason，最终形成 non-null sealed result，且 `stop_stage` 精确等于该 stage。`ingest` 的三个 retained pair 只覆盖一个已验证 Active Source 的 ingest identity/current repair：可恢复 identity ambiguity 是 blocked，确定 identity conflict 或 repair commit failure 是 failed。Active Source 本身缺失/不可证明与确定 invalid 分别提前映射到 `active_source_unavailable` 与 `active_source_invalid`，不得出现在这 42 个 pair 中。
 
-`handoff_blocked` 与 `import_blocked` 只表示 ADR 0121 的已知缺失、可恢复 continuation prerequisite；`registry_unavailable` 与 `registry_busy` 是 Knowledge Registry 的两个具体可恢复前置条件。确定性的本地完整性、协议、revision、commit 或 Registry conflict 必须使用 failed matrix；commit outcome uncertain 不得选择任一 pair。
+ADR 0121 的映射按闭合层级执行：实际消费 Data Root 的 physical gate 先选择 context-specific root primary，不能改写为 stage pair；Resume 的 Registry unavailable/busy 分别只选择 `knowledge_import/registry_unavailable` 或 `knowledge_import/registry_busy`，与 `import_blocked` 互斥；Handoff 的 revision conflict、asset integrity lost、commit failure，以及 Knowledge import 的 revision conflict、Registry conflict、commit failure，分别只选择对应 specific `stage_failed` reason，并与 generic failed reason 互斥。Specific reason 一律优先；`handoff_blocked`/`import_blocked` 只接收 Handoff/`KnowledgeIntake` interface 的其余已批准 typed recoverable prerequisite，`handoff_failed`/`import_failed` 只接收其余已批准 deterministic typed interface failure。Unknown、untyped、commit-uncertain 不得选择任一 pair。
 
 ### 7.3 Review union
 
@@ -337,6 +343,7 @@ Stage/reason 必须来自表中 ASCII enum，不能拼内部 error/provider/exce
 | `literature.review.handoff_blocked.v1` | blocked | `{}` | non-null |
 | `literature.review.import_blocked.v1` | blocked | `{}` | non-null |
 | `literature.review.data_root_integrity_lost.v1` | failed | 第 7.3 节下方的 closed Data Root object | Decision 未提交时 null；已提交时 non-null |
+| `literature.review.candidate_integrity_lost.v1` | failed | `{}` | null |
 | `literature.review.review_state_invalid.v1` | failed | `{}` | null |
 | `literature.review.review_commit_failed.v1` | failed | `{}` | null |
 | `literature.review.handoff_failed.v1` | failed | `{}` | non-null |
@@ -344,7 +351,7 @@ Stage/reason 必须来自表中 ASCII enum，不能拼内部 error/provider/exce
 
 三个 Review Data Root primary 的 context 都是且只能是 `{"data_root":"literature"}` 或 `{"data_root":"knowledge"}` 两个 exact object 的 closed one-of；不得出现合并字符串、其他 value、其他 key 或 additional property。Unsafe/unavailable 的 `literature` variant 只可能来自 Decision 前的初始 Literature gate，因此 result 为 null；`knowledge` variant 只可能在 Decision 已明确提交或 unchanged 验证、且实际需要 import 后到达，因此 result 为 non-null。Integrity-lost 的 `literature` variant 以 Decision 是否已明确提交决定 result presence；`knowledge` variant 必然在 Decision 后且 result 为 non-null。
 
-`handoff_blocked`/`import_blocked` 只接受已知缺失且可恢复的 prerequisite；确定性的本地完整性、协议、revision、commit 或 Registry conflict 分别选择 `handoff_failed`/`import_failed`。两类 continuation outcome 都保留已提交 Decision 的 non-null receipt，uncertain commit 位于本 union 外。
+`candidate_invalid` 只表示 raw selector 的格式、大小写或规范性无效；一旦规范 Candidate ID 已解析到现存 Candidate，任何 ID/hash/canonical bytes/provenance/Evidence/payload/collision/asset 完整性失败都只选择 `candidate_integrity_lost`。实际消费 root 的 physical gate 先选择 Data Root primary；`handoff_blocked`/`import_blocked` 只接受已知缺失且可恢复的 typed interface prerequisite，确定性的其余已批准 Handoff/KnowledgeIntake 完整性、协议、revision、commit 或 Registry failure 分别选择 `handoff_failed`/`import_failed`。Continuation outcome 保留已提交 Decision 的 non-null receipt；unknown、untyped 与 uncertain commit 位于本 union 外。
 
 ### 7.4 Primary 仲裁与同 gate fail-fast
 
@@ -354,9 +361,9 @@ Gate 仍按第 2.1 节严格串行；首个 handled fault 立即 stop-new-work�
 |---|---|---|
 | add | `data_root_integrity_lost` > `source_changed` > `content_identity_collision` > `commit_failed` > `catalog_projection_failed` | `configuration_invalid` > `data_root_unsafe` > `data_root_unavailable` > `input_invalid` > `identity_intake_busy` > `pdf_unavailable` > `work_not_found` > `identity_review_required` > `identity_conflict` > `work_busy` |
 | resume | `data_root_integrity_lost` > `active_source_invalid` > `stage_failed` > `recovery_failed` | `configuration_invalid` > `data_root_unsafe` > `data_root_unavailable` > `work_invalid` > `work_not_found` > `work_busy` > `active_source_unavailable` > `stage_blocked` |
-| review | `data_root_integrity_lost` > `review_state_invalid` > `review_commit_failed` > `handoff_failed` > `import_failed` | `configuration_invalid` > `data_root_unsafe` > `data_root_unavailable` > `candidate_invalid` > `candidate_not_found` > `work_busy` > `handoff_blocked` > `import_blocked` |
+| review | `data_root_integrity_lost` > `candidate_integrity_lost` > `review_state_invalid` > `review_commit_failed` > `handoff_failed` > `import_failed` | `configuration_invalid` > `data_root_unsafe` > `data_root_unavailable` > `candidate_invalid` > `candidate_not_found` > `work_busy` > `handoff_blocked` > `import_blocked` |
 
-表中 suffix 自动带所属 `literature.<command>.` prefix 与 `.v1`。同一个 code 有多个合法 context candidate 时，add 的 `input_invalid.field` 顺序固定为 `pdf_path`、`work_id`、`doi`、`arxiv_id`、`citation`、`pdf_content`；这些 raw fields 全部通过后才允许稳定读取选择较晚的 `pdf_content`。Resume 的 stage context 先按第 3 节七阶段顺序，再按第 7.2 节对应 stage 行内 reason 顺序；review 的 Data Root context 使用 `literature`、`knowledge` 顺序。Add 的 unresolved root scope 与 resolved Work scope 互斥，因此 `identity_intake_busy` 与 `work_busy` 不得作为同一 ownership snapshot 的两个候选。Resume 只有一个 `work_id`，review 只有一个 `candidate_id`，action 冲突已在 grammar gate 结束。单一 field 内的多个缺陷映射到同一 code/context，不产生第二 primary。
+表中 suffix 自动带所属 `literature.<command>.` prefix 与 `.v1`。同一个 code 有多个合法 context candidate 时，add 的 `input_invalid.field` 顺序固定为 `pdf_path`、`work_id`、`doi`、`arxiv_id`、`citation`、`pdf_content`；这些 raw fields 全部通过后才允许稳定读取选择较晚的 `pdf_content`。Resume 与 review 的 Data Root context 都使用 `literature`、`knowledge` 顺序；Resume 的 stage context 先按第 3 节七阶段顺序，再按第 7.2 节对应 stage 行内 reason 顺序。Add 的 unresolved root scope 与 resolved Work scope 互斥，因此 `identity_intake_busy` 与 `work_busy` 不得作为同一 ownership snapshot 的两个候选。Resume 只有一个 `work_id`；review 先结束 raw Candidate selector gate，解析到现存 Candidate 后才进入完整性 gate，且只有一个 `candidate_id`；action 冲突已在 grammar gate 结束。单一 field 内的多个缺陷映射到同一 code/context，不产生第二 primary。
 
 仲裁后恰好发出胜出 code 的一个 primary item及其唯一 closed context；T04 没有 supplemental，其他 candidate 不输出、不聚合也不改 result。Uncertain commit、外部 termination、未批准 cancellation 与 presentation failure继续位于该仲裁和正常 envelope之外。
 
@@ -378,7 +385,7 @@ Human renderer消费同一 sealed outcome/result/diagnostic，不重读资产。
 | resume succeeded / blocked / failed | `Literature resume：完成` / `Literature resume：已阻塞` / `Literature resume：失败` |
 | review succeeded / blocked / failed | `Literature review：完成` / `Literature review：已阻塞` / `Literature review：失败` |
 
-存在 result时显示稳定 ID、disposition/阶段或 Review→Handoff→Import状态；不得显示 PDF path、citation、文档内容、异常/provider文本。Resume pending Candidate先在 result array逐个显示完整 ID；仅 awaiting-review blocked分支再一一给出显式 `gezhi literature review <candidate_id> --accept|--reject|--defer` 审核命令行，这些行不使用 `下一步` 标签。Renderer不能 prompt、默认、倒计时接受或把回车当批准。Primary code/context映射为固定中文原因/下一步。颜色/box drawing/terminal width不冻结；redirected non-color subprocess必须保留首行、稳定字段顺序、单末尾 LF、同 exit且无 ANSI。
+存在 result时显示稳定 ID、disposition/阶段或 Review→Handoff→Import状态；不得显示 PDF path、citation、文档内容、异常/provider文本。Resume pending Candidate先在 result array逐个显示完整 ID；仅 awaiting-review blocked分支再按每个 Candidate 分别给出 `--accept`、`--reject`、`--defer` 三条完整可复制命令，action 顺序固定后才进入下一个 Candidate，不能输出带 raw `|` 的缩写命令。这些行不使用 `下一步` 标签。Renderer不能 prompt、默认、倒计时接受或把回车当批准。Primary code/context映射为固定中文原因/下一步。颜色/box drawing/terminal width不冻结；redirected non-color subprocess必须保留首行、稳定字段顺序、单末尾 LF、同 exit且无 ANSI。
 
 
 完整 Human body 的语义行顺序固定为：首行；若 `result` 非 `null`，按下列映射表自上而下输出全部字段；仅对第 8 节随后冻结的 resume `stage=review/reason=awaiting_review` pair 输出逐 Candidate 审核命令行；若有 primary，输出 `原因：<catalog 原因正文>`；最后输出恰好一行 `下一步：<正文>`。成功没有 `原因` 行；blocked/failed 的原因与下一步必须逐字来自第 8.1–8.3 节，并只按各 catalog 明确批准的 placeholder 来源替换字面 `<...>`。Renderer 不得改写、拼异常或回显输入。
@@ -414,13 +421,17 @@ Human renderer消费同一 sealed outcome/result/diagnostic，不重读资产。
 
 String/enum/ID/hash/schema value 逐字输出且不加引号；boolean 只输出 `是` / `否`；`null` 只输出 `无`；integer 使用无正号、无前导零的 ASCII 十进制。空 array 恰好一行 `标签：[]`。非空 array 先输出 `标签：`，随后每项一行、恰好两个 ASCII space 加 `- ` 再加逐字 item；不得逗号连接、编号、截断或省略。所有语义行使用上述全角 `：`，无行尾空白，以单个 LF 分隔并恰好一个末尾 LF。Interactive Rich 最多增加 ANSI/box decoration，不得改变语义行文本或顺序；redirected subprocess 必须输出下列无 ANSI UTF-8 bytes。
 
-当且仅当 primary 为 `literature.resume.stage_blocked.v1`、context 恰好 `{"reason":"awaiting_review","stage":"review"}` 且 sealed result 非 null 时，`pending_candidate_ids` 必须有 1–12 项。Renderer 仍先按上面的非空 array 规则完整输出 `待审核 Candidate`；在最后一个 mapped result 字段 `Work ID` 之后、`原因` 之前，再按同一 Candidate 顺序一一输出且只输出：
+当且仅当 primary 为 `literature.resume.stage_blocked.v1`、context 恰好 `{"reason":"awaiting_review","stage":"review"}` 且 sealed result 非 null 时，`pending_candidate_ids` 必须有 1–12 项。Renderer 仍先按上面的非空 array 规则完整输出 `待审核 Candidate`；在最后一个 mapped result 字段 `Work ID` 之后、`原因` 之前，对数组中的每个 Candidate 相邻输出以下三行，先按 `accept`、`reject`、`defer` action 顺序，再进入下一个 Candidate：
 
 ```text
-审核命令：gezhi literature review <candidate_id> --accept|--reject|--defer
+审核命令：gezhi literature review <candidate_id> --accept
+审核命令：gezhi literature review <candidate_id> --reject
+审核命令：gezhi literature review <candidate_id> --defer
 ```
 
-`<candidate_id>` 逐字取 sealed array 当前项，不加引号或 shell escape。审核命令行是由 result 派生的显式 action hint，不替代、不截断数组，也不使用 `下一步` 标签；整个 receipt 仍只有最后那一行 `下一步`。其他 primary、成功 resume 与空 pending array 都不得输出审核命令行。
+`<candidate_id>` 逐字取 sealed array 当前项，不加引号或 shell escape。每项恰好三条审核命令，因此 N 个 Candidate 恰好输出 `3N` 条，最大 12 项时为 36 条；命令中不得出现 raw `|`。这些 action hint 不替代、不截断数组，也不使用 `下一步` 标签；整个 receipt 仍只有最后那一行 `下一步`。其他 primary、成功 resume 与空 pending array 都不得输出审核命令行。
+
+Awaiting-review Human 的 32 KiB 证明冻结如下：规范 Candidate ID 为 29 raw UTF-8 bytes，其 array item 连 LF 为 34 bytes；三条命令连 LF 分别为 78、78、77 bytes，所以每项 Candidate 总增量恰好 267 bytes。实现测试必须枚举所有冻结的非 Candidate 字段、catalog 替换与边界值，并证明其最长固定部分不超过 2,048 bytes；于是 12 项上界为 `2,048 + 12 × 267 = 5,252` bytes，严格小于 32,768。JSON 不包含 Human action hint，pending ID 增量更小，仍单独服从同一全 buffer cap。V1 的 Candidate 上限因此保持 12；提高上限必须同时修订本证明与验收。
 
 成功的 `下一步` 唯一为：add 与 review 使用 `运行 gezhi literature resume <work_id>`，其中 ID 取 sealed result；resume succeeded 必须 `pipeline_complete=true`，并使用 `无需操作`。若 resume 尚未 complete，则必须由 closed blocked/failed primary 呈现，不能用 succeeded 配其他下一步。
 
@@ -475,8 +486,12 @@ Schema：gezhi.literature_resume_result.v1
 开始阶段：ocr
 停止阶段：review
 Work ID：wrk_123e4567-e89b-42d3-a456-426614174000
-审核命令：gezhi literature review cand_aaaaaaaaaaaaaaaaaaaaaaaa --accept|--reject|--defer
-审核命令：gezhi literature review cand_cccccccccccccccccccccccc --accept|--reject|--defer
+审核命令：gezhi literature review cand_aaaaaaaaaaaaaaaaaaaaaaaa --accept
+审核命令：gezhi literature review cand_aaaaaaaaaaaaaaaaaaaaaaaa --reject
+审核命令：gezhi literature review cand_aaaaaaaaaaaaaaaaaaaaaaaa --defer
+审核命令：gezhi literature review cand_cccccccccccccccccccccccc --accept
+审核命令：gezhi literature review cand_cccccccccccccccccccccccc --reject
+审核命令：gezhi literature review cand_cccccccccccccccccccccccc --defer
 原因：review 阶段已阻塞（awaiting_review）
 下一步：修复该前置条件后重新运行 resume；awaiting_review 时对列出的 Candidate 显式 review
 ```
@@ -526,17 +541,19 @@ Work ID：wrk_123e4567-e89b-42d3-a456-426614174000
 | code | 原因正文 | 下一步正文 |
 |---|---|---|
 | `literature.resume.configuration_invalid.v1` | 配置无效 | 修正格致配置后重新运行 resume |
-| `literature.resume.data_root_unsafe.v1` | Literature 数据目录不安全 | 运行 gezhi doctor 并移除不受支持的 namespace 或路径别名 |
-| `literature.resume.data_root_unavailable.v1` | Literature 数据目录不可用 | 运行 gezhi doctor 并修复 Literature 数据目录 |
+| `literature.resume.data_root_unsafe.v1` | `<data_root>` 数据目录不安全 | 运行 gezhi doctor 并移除 `<data_root>` 数据目录不受支持的 namespace 或路径别名 |
+| `literature.resume.data_root_unavailable.v1` | `<data_root>` 数据目录不可用 | 运行 gezhi doctor 并修复 `<data_root>` 数据目录 |
 | `literature.resume.work_invalid.v1` | Work ID 格式无效 | 使用完整规范 Work ID 重试 |
 | `literature.resume.work_not_found.v1` | 指定 Work 不存在 | 核对 Work ID 后重试 |
 | `literature.resume.work_busy.v1` | 该 Work 正由另一个写流程处理 | 等待该流程结束后重试 |
 | `literature.resume.active_source_unavailable.v1` | Active Source 不可用 | 先用 literature add 明确选择可用 Source |
 | `literature.resume.stage_blocked.v1` | `<stage>` 阶段已阻塞（`<reason>`） | 修复该前置条件后重新运行 resume；awaiting_review 时对列出的 Candidate 显式 review |
-| `literature.resume.data_root_integrity_lost.v1` | Literature 数据目录身份在执行中失去可信性 | 停止写入并运行 gezhi doctor |
+| `literature.resume.data_root_integrity_lost.v1` | `<data_root>` 数据目录身份在执行中失去可信性 | 停止写入并运行 gezhi doctor 检查 `<data_root>` 数据目录身份 |
 | `literature.resume.active_source_invalid.v1` | Active Source 资产无效 | 保留现有资产并检查 Source manifest、ID、hash 与 bytes |
 | `literature.resume.stage_failed.v1` | `<stage>` 阶段失败（`<reason>`） | 保留现有资产，修复该阶段后重新运行 resume |
-| `literature.resume.recovery_failed.v1` | Literature 恢复检查失败 | 保留 staging 与历史资产并运行 gezhi doctor |
+| `literature.resume.recovery_failed.v1` | Literature 恢复检查失败 | 停止相关写入并保留 staging 与恢复证据；运行 gezhi status，按 Operations 的 inspect_recovery 指引进行维护检查；不要手工删除或改名 |
+
+Resume catalog 的 `<data_root>` 逐字取胜出 root primary context 中的 `data_root`，只能是 `literature` 或 `knowledge`；`<stage>` 与 `<reason>` 逐字取胜出 stage context。不得从异常、路径或其他资产补值。
 
 
 ### 8.3 Review Human primary catalog
@@ -546,16 +563,19 @@ Work ID：wrk_123e4567-e89b-42d3-a456-426614174000
 | `literature.review.configuration_invalid.v1` | 配置无效 | 修正格致配置后重新运行 review |
 | `literature.review.data_root_unsafe.v1` | `<data_root>` 数据目录不安全 | 移除不受支持的 namespace 或路径别名后用相同 action 重试 |
 | `literature.review.data_root_unavailable.v1` | `<data_root>` 数据目录不可用 | 修复该 Context 数据目录后用相同 action 重试 |
-| `literature.review.candidate_invalid.v1` | Candidate 资产无效 | 核对 Candidate 来源与完整性 |
+| `literature.review.candidate_invalid.v1` | Candidate ID 格式无效 | 使用完整规范 Candidate ID 重试 |
 | `literature.review.candidate_not_found.v1` | 指定 Candidate 不存在 | 核对 Candidate ID 后重试 |
 | `literature.review.work_busy.v1` | Candidate 所属 Work 正由另一个写流程处理 | 等待该流程结束后重试 |
 | `literature.review.handoff_blocked.v1` | Review Decision 已保存，但 Handoff 尚未完成 | 用相同 action 重试或运行 literature resume |
 | `literature.review.import_blocked.v1` | Review Decision 与 Handoff 已保存，但 Knowledge import 尚未完成 | 修复 Knowledge 前置条件后用相同 action 重试或运行 literature resume |
 | `literature.review.data_root_integrity_lost.v1` | `<data_root>` 数据目录身份在执行中失去可信性 | 停止写入并运行 gezhi doctor |
+| `literature.review.candidate_integrity_lost.v1` | Candidate 资产完整性失效 | 保留 Candidate 与 Evidence 资产，运行 gezhi status 并检查 ID、hash、canonical bytes、provenance、Evidence、payload、collision 与 asset 完整性 |
 | `literature.review.review_state_invalid.v1` | Candidate Review 历史无效 | 保留审核资产并检查 revision 与 payload identity |
 | `literature.review.review_commit_failed.v1` | Review Decision 提交失败 | 保持相同 Candidate 与 action 重试 |
-| `literature.review.handoff_failed.v1` | Review Decision 已保存，但 Handoff 失败 | 保留 Decision 并用相同 action 重试 |
-| `literature.review.import_failed.v1` | Review Decision 与 Handoff 已保存，但 Knowledge import 失败 | 保留前置事实并修复 Registry 冲突 |
+| `literature.review.handoff_failed.v1` | Review Decision 已保存，但 Handoff 失败 | 保留 Decision 与 Handoff 资产，运行 gezhi status 检查 Handoff 完整性、协议、revision 与提交状态；修复确定原因后以同一 identity 续行 |
+| `literature.review.import_failed.v1` | Review Decision 与 Handoff 已保存，但 Knowledge import 失败 | 保留 Decision、Handoff 与 Registry 前置事实，运行 gezhi status 检查 KnowledgeIntake/Registry 完整性、协议、revision、commit 与 conflict；修复确定原因后以同一 identity 续行 |
+
+Review catalog 的 `<data_root>` 逐字取胜出 root primary context 中的 `data_root`，只能是 `literature` 或 `knowledge`；不得从路径或异常补值。
 
 
 
@@ -586,24 +606,25 @@ Work ID：wrk_123e4567-e89b-42d3-a456-426614174000
 
 - 七阶段每个 valid success跳过；directory committed/pointer missing只补 pointer；从 ingest自动推进到 pending review并返回 IDs，不写 Decision。
 - Zero Candidate完成 no-op；全部有 decision时补 Handoff/Import；有已授权 backlog和其他 pending时先补 backlog再 awaiting_review。
-- Resume result seal逐 primary覆盖：17 个 `stage_blocked` pair 与 25 个 `stage_failed` pair 逐项具有可达见证并返回 non-null；其余十个 primary 返回 null。Active Source 的缺失/identity-unprovable 与确定 invalidity 分别由 seal 前的 `active_source_unavailable` 与 `active_source_invalid` 闭合，不进入 ingest matrix；`commit_failed` 不把当前 stage列入 `advanced_stages`，uncertain commit不形成 handled receipt。
-- Awaiting-review redirected Human完整匹配 witness：Candidate array与逐项审核命令一一同序，命令位于 `Work ID` 后、`原因` 前，且全 receipt恰好一个最终 `下一步` 行。
+- Resume result seal逐 variant覆盖：17 个 `stage_blocked` pair 与 25 个 `stage_failed` pair 逐项具有可达见证并返回 non-null，42 个 stage pair 的可达性与计数不变；七个固定 null code 加三个 Literature root variant 恰好形成十个 null variants，三个 Knowledge root variant 均形成 non-null sealed result、`stop_stage=knowledge_import` 并保留已明确提交的进度。Active Source 的缺失/identity-unprovable 与确定 invalidity 分别由 seal 前的 `active_source_unavailable` 与 `active_source_invalid` 闭合，不进入 ingest matrix；`commit_failed` 不把当前 stage列入 `advanced_stages`，uncertain commit不形成 handled receipt。
+- Awaiting-review redirected Human完整匹配 witness：N 项 Candidate array 按外层 Candidate 顺序、内层 accept/reject/defer 顺序输出恰好 `3N` 条完整命令，最多 36 条且命令不含 raw `|`；命令位于 `Work ID` 后、`原因` 前，全 receipt 恰好一个最终 `下一步` 行。
 - 每阶段 blocked/failed、历史 interrupted、遗留 running、partial/invalid orphan、target conflict、uncertain均无 partial success/overwrite。
 - OCR缺失只在 ocr阻塞；Codex缺失只在 read；Knowledge root只在 import；已完成阶段仍可读。
-- Resume 初始 Literature root 的 unsafe/unavailable 与通过 gate 后 integrity drift 使用三个不同 primary；Active Source unavailable/invalid 也分别覆盖 blocked/failed 且都在 seal 前返回 null。
+- Resume 三个 root code 各覆盖 `literature`、`knowledge` 两个 exact context，合计六个 context variants：Literature variant 为 null，Knowledge variant 为 non-null 且不属于 42 个 stage pair；Knowledge root fault 不要求 Literature root 同时失信。Active Source unavailable/invalid 分别覆盖 blocked/failed 且都在 seal 前返回 null。
 
 ### Review
 
 - 三 action、首 revision、同 action幂等、不同 action追加；accepted→active；never-accepted nonaccepted→no action；accepted后 nonaccepted→withdrawn；之后 accepted→active。
-- 新 payload不继承旧 decision；坏 Evidence/hash/collision拒绝。
-- Decision/Handoff/Registry/presentation逐点失败保留前置事实，retry同 identity续行。
+- Raw Candidate selector 的格式、大小写或规范性无效只选择 blocked `candidate_invalid`；一旦规范 ID 解析到现存 Candidate，ID/hash/canonical bytes/provenance/Evidence/payload/collision/asset 任一确定失败只选择 failed `candidate_integrity_lost`，两者都为 null。
+- Decision/Handoff/Registry/presentation逐点失败保留前置事实，retry 同 identity 续行；`handoff_failed`/`import_failed` 的 Human 指引覆盖完整性、协议、revision、commit 与 Registry consistency 检查，不把 deterministic failure 简化为自动原样重试。
 - Review 对 Literature/Knowledge root 的 unsafe/unavailable 使用两个 exact context object；Literature 初始 gate 位于 Decision 前且 result 为 null，Knowledge import gate 位于 Decision 后且 result 为 non-null，通过 gate 后 drift 使用 context-matched `data_root_integrity_lost`。
-- ADR 0121 分类逐项覆盖：已知缺失且可恢复的 Handoff/Import prerequisite 为 blocked，确定性本地完整性/协议/revision/commit/Registry conflict 为 failed，uncertain commit 位于 handled matrix 外；先前提交事实不回滚且重试 identity 不变。
+- ADR 0121 分类逐项覆盖：root physical gate 先选择 root primary；Resume 的 Registry unavailable/busy、revision conflict、Registry conflict、asset integrity 与 commit failure 优先选择 mutually exclusive specific stage reason；只有其余已批准 typed interface verdict 使用 generic blocked/failed，unknown、untyped 与 uncertain commit 位于 handled matrix 外；先前提交事实不回滚且续行 identity 不变。
 - Codex/resume/status/reader不能写 Decision；无 default accept、batch、note、Promotion或Research Interest。
 
 ### Presentation
 
 - 每 command 的 succeeded/blocked/failed覆盖 Human/JSON；完整 canonical bytes、32 KiB inclusive cap、单 LF、channel/exit匹配。
+- Awaiting-review 最大 witness 使用 12 个 Candidate、36 条审核命令，并验证固定部分不超过 2,048 bytes、总上界为 5,252 bytes；Candidate 上限变化必须同步修订证明。
 - Result presence符合第4.4、5.3、6.3、7.2–7.3节；earlier commit不自动使 outer succeeded。
 - 每个 command注入同 gate多字段/多 code故障和已启动 operation的并发故障，以固定 field/context顺序与静态 priority恰好选择一个 primary；losing candidate不输出。
 - Redirected Human无 ANSI，首行/稳定字段/next action可断言；Human/JSON来自同一 outcome。
