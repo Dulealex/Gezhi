@@ -92,6 +92,14 @@ _Avoid_: Mutable Flag, Model Approval
 只携带已审核 Candidate Knowledge 及其身份、Evidence Support、Review Risk Flag、证据和状态的跨上下文交接。
 _Avoid_: Archive Export, Promoted Knowledge
 
+**Literature Stage**:
+本地资料从进入到 Knowledge 接收之间的一个固定业务职责位置；V1 依次为 ingest、ocr、canonicalize、read、review、handoff 与 knowledge_import。
+_Avoid_: Generic Job, Plugin Step, DAG Node
+
+**Continuation Point**:
+一个 Work 在当前权威资产下最早尚未被满足的 Literature Stage 或已授权交接义务，是显式 resume 的起点。
+_Avoid_: Last Log Line, Staging Guess, Current Command
+
 ## Candidate 类型
 
 **Method Candidate**:
