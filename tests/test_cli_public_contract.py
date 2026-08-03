@@ -1,106 +1,69 @@
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
-from pathlib import Path
+from typing import Any
 
 import pytest
-
-REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-SOURCE_ROOT = REPOSITORY_ROOT / "src"
-PYTHON_EXE = Path(sys.executable)
-CONSOLE_EXE = PYTHON_EXE.with_name("gezhi.exe")
-RESOURCE_LIMIT_STDERR = b"gezhi: error: command-line input exceeds safety limits\r\n"
+from launcher_support import RESOURCE_LIMIT_STDERR, run_both_launchers
 
 
-def _launcher_commands(arguments: tuple[str, ...]) -> tuple[list[str], list[str]]:
-    return (
-        [str(CONSOLE_EXE), *arguments],
-        [str(PYTHON_EXE), "-m", "gezhi", *arguments],
-    )
-
-
-def _run_launcher(
-    command: list[str],
-    *,
-    cwd: Path = REPOSITORY_ROOT,
-    environment_updates: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[bytes]:
-    environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(SOURCE_ROOT)
-    if environment_updates is not None:
-        environment.update(environment_updates)
-    return subprocess.run(
-        command,
-        cwd=cwd,
-        env=environment,
-        capture_output=True,
-        check=False,
-    )
-
-
-def test_help_uses_the_fixed_product_name_and_has_no_completion_options() -> None:
-    results = [_run_launcher(command) for command in _launcher_commands(("--help",))]
-
-    assert [
-        (result.returncode, result.stdout, result.stderr) for result in results
-    ] == [
-        (0, results[0].stdout, b""),
-        (0, results[0].stdout, b""),
-    ]
-    assert b"Usage: gezhi " in results[0].stdout
-    assert b"--install-completion" not in results[0].stdout
-    assert b"--show-completion" not in results[0].stdout
-
-
-def test_completion_environment_inputs_are_ignored_by_both_launchers() -> None:
+def test_help_has_launcher_parity_and_ignores_completion_environment() -> None:
+    baseline = run_both_launchers(("--help",))
     completion_environment = {
         "_GEZHI_COMPLETE": "complete_bash",
         "_TYPER_COMPLETE_ARGS": "untrusted completion words",
         "_TYPER_COMPLETE_WORD_TO_COMPLETE": "untrusted",
     }
-    results = [
-        _run_launcher(command, environment_updates=completion_environment)
-        for command in _launcher_commands(())
-    ]
+    with_completion_environment = run_both_launchers(
+        ("--help",),
+        environment_updates=completion_environment,
+    )
 
     assert [
-        (result.returncode, result.stdout, result.stderr) for result in results
-    ] == [(0, b"", b""), (0, b"", b"")]
-
-
-@pytest.mark.parametrize(
-    "literal_token",
-    [
-        pytest.param("*.txt", id="glob-star"),
-        pytest.param("?.txt", id="glob-question"),
-        pytest.param("[ab].txt", id="glob-class"),
-        pytest.param("~", id="home"),
-        pytest.param("%GEZHI_EXPANSION%", id="percent-environment"),
-        pytest.param("$GEZHI_EXPANSION", id="dollar-environment"),
-    ],
-)
-def test_windows_expansion_tokens_reach_typer_unchanged(
-    tmp_path: Path,
-    literal_token: str,
-) -> None:
-    (tmp_path / "a.txt").write_text("a", encoding="utf-8")
-    (tmp_path / "b.txt").write_text("b", encoding="utf-8")
-    results = [
-        _run_launcher(
-            command,
-            cwd=tmp_path,
-            environment_updates={"GEZHI_EXPANSION": "expanded-value"},
-        )
-        for command in _launcher_commands((literal_token,))
+        (result.returncode, result.stdout, result.stderr) for result in baseline
+    ] == [
+        (0, baseline[0].stdout, b""),
+        (0, baseline[0].stdout, b""),
     ]
-    expected_error = f"No such command '{literal_token}'.".encode("ascii")
+    assert [result.stdout for result in with_completion_environment] == [
+        baseline[0].stdout,
+        baseline[0].stdout,
+    ]
+    assert all(result.returncode == 0 for result in with_completion_environment)
+    assert all(result.stderr == b"" for result in with_completion_environment)
+    assert b"Usage: gezhi " in baseline[0].stdout
+    assert b"--install-completion" not in baseline[0].stdout
+    assert b"--show-completion" not in baseline[0].stdout
 
-    for result in results:
-        assert result.returncode == 1
-        assert result.stdout == b""
-        assert expected_error in result.stderr
+
+def test_parser_call_receives_exact_snapshot_suffix_and_fixed_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gezhi import _cli
+
+    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    class _ParserCallSpy:
+        def __call__(self, *args: Any, **kwargs: Any) -> None:
+            calls.append((args, kwargs))
+
+    spy = _ParserCallSpy()
+    monkeypatch.setattr(_cli, "_build_cli", lambda: spy)
+    literal_arguments = (
+        "first",
+        "*.txt",
+        "~",
+        "%GEZHI_EXPANSION%",
+        "$GEZHI_EXPANSION",
+        "二",
+    )
+
+    assert _cli.run_cli(literal_arguments) == 0
+    assert len(calls) == 1
+    positional, keywords = calls[0]
+    assert positional == ()
+    assert keywords["args"] == literal_arguments
+    assert keywords["prog_name"] == "gezhi"
+    assert keywords["windows_expand_args"] is False
 
 
 @pytest.mark.parametrize(
@@ -116,7 +79,7 @@ def test_windows_expansion_tokens_reach_typer_unchanged(
 def test_resource_rejection_precedes_all_token_semantics(
     arguments: tuple[str, ...],
 ) -> None:
-    results = [_run_launcher(command) for command in _launcher_commands(arguments)]
+    results = run_both_launchers(arguments)
 
     assert [
         (result.returncode, result.stdout, result.stderr) for result in results

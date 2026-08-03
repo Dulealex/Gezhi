@@ -1,46 +1,67 @@
 from __future__ import annotations
 
 import pytest
+from launcher_support import RESOURCE_LIMIT_STDERR
 
 from gezhi import bootstrap
 
-RESOURCE_LIMIT_STDERR = b"gezhi: error: command-line input exceeds safety limits\r\n"
+
+def _set_overlimit_argv(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bootstrap.sys, "argv", ["gezhi", "x" * 8193])
 
 
-def test_presenter_retries_with_each_exact_remaining_suffix(
+@pytest.mark.parametrize(
+    ("returned_counts", "expected_requests"),
+    [
+        pytest.param(
+            (56,),
+            [RESOURCE_LIMIT_STDERR],
+            id="full-write",
+        ),
+        pytest.param(
+            (7, 13, 36),
+            [
+                RESOURCE_LIMIT_STDERR,
+                RESOURCE_LIMIT_STDERR[7:],
+                RESOURCE_LIMIT_STDERR[20:],
+            ],
+            id="short-writes",
+        ),
+    ],
+)
+def test_main_writes_each_exact_remaining_suffix_and_returns_two(
     monkeypatch: pytest.MonkeyPatch,
+    returned_counts: tuple[int, ...],
+    expected_requests: list[bytes],
 ) -> None:
+    counts = iter(returned_counts)
     requested: list[bytes] = []
-    returned_counts = iter((7, 13, len(RESOURCE_LIMIT_STDERR) - 20))
+    setmode_calls: list[tuple[int, int]] = []
+
+    def setmode(fd: int, mode: int) -> int:
+        setmode_calls.append((fd, mode))
+        return mode
 
     def write(fd: int, remaining: bytes | memoryview) -> int:
         assert fd == 2
         requested.append(bytes(remaining))
-        return next(returned_counts)
+        return next(counts)
 
-    setmode_calls: list[tuple[int, int]] = []
-    monkeypatch.setattr(
-        bootstrap.msvcrt,
-        "setmode",
-        lambda fd, mode: setmode_calls.append((fd, mode)),
-    )
+    _set_overlimit_argv(monkeypatch)
+    monkeypatch.setattr(bootstrap.msvcrt, "setmode", setmode)
     monkeypatch.setattr(bootstrap.os, "write", write)
 
-    bootstrap._present_resource_limit_exceeded()
-
+    assert bootstrap.main() == 2
+    assert len(RESOURCE_LIMIT_STDERR) == 56
     assert setmode_calls == [(2, bootstrap.os.O_BINARY)]
-    assert requested == [
-        RESOURCE_LIMIT_STDERR,
-        RESOURCE_LIMIT_STDERR[7:],
-        RESOURCE_LIMIT_STDERR[20:],
-    ]
+    assert requested == expected_requests
 
 
 @pytest.mark.parametrize(
     "failing_operation",
     ["setmode", "first-write", "partial-write"],
 )
-def test_presenter_treats_direct_os_errors_as_completed_failure(
+def test_main_returns_two_after_a_direct_os_error(
     monkeypatch: pytest.MonkeyPatch,
     failing_operation: str,
 ) -> None:
@@ -62,11 +83,11 @@ def test_presenter_treats_direct_os_errors_as_completed_failure(
             return 5
         return fail()
 
+    _set_overlimit_argv(monkeypatch)
     monkeypatch.setattr(bootstrap.msvcrt, "setmode", setmode)
     monkeypatch.setattr(bootstrap.os, "write", write)
 
-    bootstrap._present_resource_limit_exceeded()
-
+    assert bootstrap.main() == 2
     expected_requests = {
         "setmode": [],
         "first-write": [RESOURCE_LIMIT_STDERR],
@@ -79,7 +100,7 @@ def test_presenter_treats_direct_os_errors_as_completed_failure(
 
 
 @pytest.mark.parametrize("invalid_count", [True, None, 0, -1, 57])
-def test_presenter_stops_after_an_invalid_write_count(
+def test_main_returns_two_after_an_invalid_write_count(
     monkeypatch: pytest.MonkeyPatch,
     invalid_count: object,
 ) -> None:
@@ -90,25 +111,30 @@ def test_presenter_stops_after_an_invalid_write_count(
         write_requests.append(bytes(remaining))
         return invalid_count
 
+    _set_overlimit_argv(monkeypatch)
     monkeypatch.setattr(bootstrap.msvcrt, "setmode", lambda fd, mode: mode)
-    monkeypatch.setattr(
-        bootstrap.os,
-        "write",
-        write,
-    )
+    monkeypatch.setattr(bootstrap.os, "write", write)
 
-    bootstrap._present_resource_limit_exceeded()
-
+    assert bootstrap.main() == 2
     assert write_requests == [RESOURCE_LIMIT_STDERR]
 
 
-def test_presenter_does_not_swallow_non_os_errors(
+@pytest.mark.parametrize("failing_operation", ["setmode", "write"])
+def test_main_does_not_swallow_non_os_errors(
     monkeypatch: pytest.MonkeyPatch,
+    failing_operation: str,
 ) -> None:
-    def fail(fd: int, mode: int) -> int:
-        raise RuntimeError("unexpected implementation failure")
+    def setmode(fd: int, mode: int) -> int:
+        if failing_operation == "setmode":
+            raise RuntimeError("unexpected setmode failure")
+        return mode
 
-    monkeypatch.setattr(bootstrap.msvcrt, "setmode", fail)
+    def write(fd: int, remaining: bytes | memoryview) -> int:
+        raise RuntimeError("unexpected write failure")
 
-    with pytest.raises(RuntimeError, match="unexpected implementation failure"):
-        bootstrap._present_resource_limit_exceeded()
+    _set_overlimit_argv(monkeypatch)
+    monkeypatch.setattr(bootstrap.msvcrt, "setmode", setmode)
+    monkeypatch.setattr(bootstrap.os, "write", write)
+
+    with pytest.raises(RuntimeError, match=f"unexpected {failing_operation} failure"):
+        bootstrap.main()

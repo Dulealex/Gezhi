@@ -4,6 +4,13 @@ import pytest
 
 from gezhi._raw_argv import RawArgvPreflightV1, RawArgvPreflightVerdictV1
 
+OVERLONG_UNICODE_ARGV0 = "界" * 20_000
+
+
+def _token_with_element_count(pattern: str, element_count: int) -> str:
+    repetitions, remainder = divmod(element_count, len(pattern))
+    return pattern * repetitions + pattern[:remainder]
+
 
 @pytest.mark.parametrize(
     ("argument_count", "expected"),
@@ -20,31 +27,40 @@ def test_argument_count_limit_is_inclusive_and_counts_empty_tokens(
     suffix = ("",) * argument_count
 
     assert RawArgvPreflightV1.evaluate(("launcher", *suffix)) is expected
-    assert RawArgvPreflightV1.evaluate(("x" * 20_000, *suffix)) is expected
+    assert RawArgvPreflightV1.evaluate((OVERLONG_UNICODE_ARGV0, *suffix)) is expected
 
 
 @pytest.mark.parametrize(
-    "at_limit",
+    "pattern",
     [
-        pytest.param("a" * 8192, id="ascii"),
-        pytest.param("汉" * 8192, id="han"),
-        pytest.param("😀" * 8192, id="astral"),
-        pytest.param("é" * 8192, id="composed"),
-        pytest.param("e\u0301" * 4096, id="decomposed"),
-        pytest.param("\0" * 8192, id="nul"),
-        pytest.param("\x1f" * 8192, id="control"),
-        pytest.param("\ud800" * 8192, id="lone-surrogate"),
+        pytest.param("a", id="ascii"),
+        pytest.param("汉", id="han"),
+        pytest.param("😀", id="astral"),
+        pytest.param("é", id="composed"),
+        pytest.param("e\u0301", id="decomposed"),
+        pytest.param("\0", id="nul"),
+        pytest.param("\x1f", id="control"),
+        pytest.param("\ud800", id="lone-surrogate"),
     ],
 )
-def test_character_matrix_uses_python_string_elements_without_encoding(
-    at_limit: str,
+@pytest.mark.parametrize(
+    ("element_count", "expected"),
+    [
+        (8191, RawArgvPreflightVerdictV1.PASS),
+        (8192, RawArgvPreflightVerdictV1.PASS),
+        (8193, RawArgvPreflightVerdictV1.RESOURCE_LIMIT_EXCEEDED),
+    ],
+)
+def test_character_matrix_counts_python_string_elements_and_excludes_argv0(
+    pattern: str,
+    element_count: int,
+    expected: RawArgvPreflightVerdictV1,
 ) -> None:
-    assert RawArgvPreflightV1.evaluate(("launcher", at_limit)) is (
-        RawArgvPreflightVerdictV1.PASS
-    )
-    assert RawArgvPreflightV1.evaluate(("launcher", at_limit + "x")) is (
-        RawArgvPreflightVerdictV1.RESOURCE_LIMIT_EXCEEDED
-    )
+    token = _token_with_element_count(pattern, element_count)
+    assert len(token) == element_count
+
+    assert RawArgvPreflightV1.evaluate(("launcher", token)) is expected
+    assert RawArgvPreflightV1.evaluate((OVERLONG_UNICODE_ARGV0, token)) is expected
 
 
 def test_raw_whitespace_is_rejected_before_later_normalization() -> None:
