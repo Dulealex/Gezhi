@@ -157,13 +157,13 @@ Source bundle 在同卷 staging 完整写入、关闭、hash/manifest readback�
 
 `resume` 永不创建 Review Decision、把 pending/deferred改 accepted、选择 action、伪造 reviewer或调用模型审核。没有 decision 的 Candidate 保持 pending；deferred是已发生的人类 decision，不等同 pending，也不进入 accept Handoff。
 
-在返回 `awaiting_review` 前，resume必须先补齐已由历史显式 decision授权而未完成的 Handoff/Import backlog，按 `(candidate_id ASCII bytes, review_revision)` 升序执行；这只续行已提交决定。Backlog处理完仍有 pending Candidate时，Continuation Point为 review且 outer blocked。零 Candidate或全部 Candidate有 accepted/rejected/deferred decision时，review obligation可满足并继续。
+在返回 `awaiting_review` 前，resume必须先补齐已由历史显式 decision授权而未完成的 Handoff/Import backlog，按 `(candidate_id ASCII bytes, review_revision)` 升序执行；这只续行已提交决定。若 backlog 在 `handoff` 或 `knowledge_import` 形成 handled blocked/failed，本 invocation 立即停在该实际 stage，`stop_stage` 与 primary context 的 stage 相同；即使其他 Candidate 仍 pending、`pending_candidate_ids` 非空且 Work 的全局 Continuation Point 仍是 `review`，也不得把这次停止改写为 `awaiting_review`。只有 backlog 全部成功结清后才能呈现 `awaiting_review`；此时若仍有 pending Candidate，实际 `stop_stage=review`、Continuation Point 为 `review` 且 outer blocked。零 Candidate或全部 Candidate有 accepted/rejected/deferred decision时，review obligation可满足并继续。
 
 聚合 success 条件：review要求当前 semantic result每个 Candidate都有绑定同一 payload hash的 current decision（零 Candidate自动满足）；handoff要求每个 decision有 matching accept/withdraw Handoff或“从未 accept且当前 non-accepted”的 no-action receipt；knowledge_import要求每个 required Handoff有 Registry receipt、每个 no-action有同一 deterministic receipt。
 
 ### 5.3 Resume result
 
-`ResumeResultV1` 的 presence 由唯一 `resume result seal` 决定。进入该 seal 前发生的任何 handled failure 都是 `result=null`。Seal 必须同时证明：Literature root、Work 与 Active Source identity 完整有效；invocation 初始 Continuation Point 唯一；每个列入 `advanced_stages` 的 success run、pointer 或 receipt 已明确提交并 readback；所有已启动的 stage/child/handle 已 settle；呈现前从当前 authority 重建的 `stop_stage`、pending Candidate 序列与其他字段完整、有界且互相一致。满足这些事实后 result 恰好为以下 closed snapshot：
+`ResumeResultV1` 的 presence 由唯一 `resume result seal` 决定。进入该 seal 前发生的任何 handled failure 都是 `result=null`。Seal 必须同时证明：Literature root、Work 与 Active Source identity 完整有效；invocation 初始 Continuation Point 唯一；每个列入 `advanced_stages` 的 success run、pointer 或 receipt 已明确提交并 readback；所有已启动的 stage/child/handle 已 settle；根据本 invocation 已确认的停止事实与当前 authority 重建的实际 `stop_stage`、pending Candidate 序列及其他字段完整、有界且互相一致。满足这些事实后 result 恰好为以下 closed snapshot：
 
 ```json
 {
@@ -178,9 +178,9 @@ Source bundle 在同卷 staging 完整写入、关闭、hash/manifest readback�
 }
 ```
 
-`start_stage`/`stop_stage` 各为七阶段值或 `complete`，分别是 invocation初始/呈现前的 Continuation Point。`advanced_stages` 是本 invocation明确发布 success或只修复 success pointer/receipt的阶段，无重复且按阶段顺序；既有 skip不列入。`pending_candidate_ids` 最多12项，按 Candidate Knowledge v1顺序，只列无 decision 的当前 Candidate；deferred不列入。
+`start_stage`/`stop_stage` 各为七阶段值或 `complete`。`start_stage` 始终是 invocation 初始 Continuation Point；`stop_stage` 是本 invocation 在完成允许的自动推进或已授权 backlog 续行后实际停止的 Literature Stage，完整完成时才是 `complete`，它不表示呈现时 Work 的全局 Continuation Point。因 pending Candidate 使初始 Continuation Point 为 `review`、但 invocation 先续行已授权 backlog 时，`start_stage` 仍为 `review`。`advanced_stages` 是本 invocation明确发布 success或只修复 success pointer/receipt的阶段，无重复且按阶段顺序；既有 skip不列入。`pending_candidate_ids` 最多12项，按 Candidate Knowledge v1顺序，只列无 decision 的当前 Candidate；deferred不列入。
 
-`pipeline_complete=true` iff `stop_stage=complete`、pending为空且七阶段当前 obligations全可验证；already-complete调用使用 start/stop=`complete`、advanced=[]。每个合法 `stage_blocked` 或 `stage_failed` stage/reason pair 只能在 `resume result seal` 完成后选择，因此其 result 一律 non-null，`stop_stage` 等于 primary context 的 stage。`commit_failed` 只表示当前 stage 没有达到 success commit point：该 stage 不得进入 `advanced_stages`，已经明确提交的较早阶段仍保留。
+`pipeline_complete=true` iff `stop_stage=complete`、pending为空且七阶段当前 obligations全可验证；already-complete调用使用 start/stop=`complete`、advanced=[]。每个合法 `stage_blocked` 或 `stage_failed` stage/reason pair 只能在 `resume result seal` 完成后选择，因此其 result 一律 non-null，`stop_stage` 等于 primary context 的 stage。`pending_candidate_ids` 非空不推出 `stop_stage=review`：backlog blocked/failed 时可分别为 `handoff` 或 `knowledge_import`，同时 Work 的全局 Continuation Point 仍为 `review`；只有 backlog 成功结清后仍有 pending Candidate 的 `awaiting_review` 分支才要求 `stop_stage=review`。`commit_failed` 只表示当前 stage 没有达到 success commit point：该 stage 不得进入 `advanced_stages`，已经明确提交的较早阶段仍保留。
 
 Active Source gate 位于 seal 前：缺失、当前不可稳定读取或没有正面 invalid 证据而无法完成 identity proof 选择 blocked `active_source_unavailable`；Source asset 存在但 manifest、ID、hash 或 bytes 确定矛盾选择 failed `active_source_invalid`。两者都固定 `result=null`，不得伪装成 `ingest` stage pair。
 
@@ -312,7 +312,7 @@ T04 V1不定义 supplemental Literature diagnostic。成功 `diagnostics=[]`；b
 | `read` | `reader_input_too_large`, `model_context_limit`, `codex_runtime_unavailable`, `codex_timeout_exhausted`, `codex_network_exhausted`, `codex_rate_limit_exhausted`, `codex_server_error_exhausted`, `codex_transient_exhausted` | 8 |
 | `review` | `awaiting_review` | 1 |
 | `handoff` | `handoff_blocked` | 1 |
-| `knowledge_import` | `import_blocked`, `registry_unavailable`, `registry_busy` | 3 |
+| `knowledge_import` | `registry_unavailable`, `registry_busy`, `import_blocked` | 3 |
 
 `stage_failed` closed matrix：
 
@@ -323,8 +323,8 @@ T04 V1不定义 supplemental Literature diagnostic。成功 `diagnostics=[]`；b
 | `canonicalize` | `canonicalization_failed`, `asset_integrity_lost`, `commit_failed` | 3 |
 | `read` | `reader_input_invalid`, `codex_process_failed`, `reader_output_invalid`, `candidate_validation_failed`, `asset_integrity_lost`, `commit_failed` | 6 |
 | `review` | `review_state_invalid`, `asset_integrity_lost`, `commit_failed` | 3 |
-| `handoff` | `handoff_failed`, `revision_conflict`, `asset_integrity_lost`, `commit_failed` | 4 |
-| `knowledge_import` | `import_failed`, `revision_conflict`, `registry_conflict`, `commit_failed` | 4 |
+| `handoff` | `revision_conflict`, `asset_integrity_lost`, `commit_failed`, `handoff_failed` | 4 |
+| `knowledge_import` | `revision_conflict`, `registry_conflict`, `commit_failed`, `import_failed` | 4 |
 
 Stage/reason 必须来自表中 ASCII enum，不能拼内部 error/provider/exception。两张表精确展开为 17 个 blocked pair 与 25 个 failed pair，共 42 个 retained pair；没有隐含组合。每个 retained pair 都必须有独立可达见证：先通过 Literature root、Work、Active Source 与唯一初始 Continuation Point 的 result-presence 前置条件，再把执行推进到表中 stage 并注入该 reason，最终形成 non-null sealed result，且 `stop_stage` 精确等于该 stage。`ingest` 的三个 retained pair 只覆盖一个已验证 Active Source 的 ingest identity/current repair：可恢复 identity ambiguity 是 blocked，确定 identity conflict 或 repair commit failure 是 failed。Active Source 本身缺失/不可证明与确定 invalid 分别提前映射到 `active_source_unavailable` 与 `active_source_invalid`，不得出现在这 42 个 pair 中。
 
@@ -363,7 +363,7 @@ Gate 仍按第 2.1 节严格串行；首个 handled fault 立即 stop-new-work�
 | resume | `data_root_integrity_lost` > `active_source_invalid` > `stage_failed` > `recovery_failed` | `configuration_invalid` > `data_root_unsafe` > `data_root_unavailable` > `work_invalid` > `work_not_found` > `work_busy` > `active_source_unavailable` > `stage_blocked` |
 | review | `data_root_integrity_lost` > `candidate_integrity_lost` > `review_state_invalid` > `review_commit_failed` > `handoff_failed` > `import_failed` | `configuration_invalid` > `data_root_unsafe` > `data_root_unavailable` > `candidate_invalid` > `candidate_not_found` > `work_busy` > `handoff_blocked` > `import_blocked` |
 
-表中 suffix 自动带所属 `literature.<command>.` prefix 与 `.v1`。同一个 code 有多个合法 context candidate 时，add 的 `input_invalid.field` 顺序固定为 `pdf_path`、`work_id`、`doi`、`arxiv_id`、`citation`、`pdf_content`；这些 raw fields 全部通过后才允许稳定读取选择较晚的 `pdf_content`。Resume 与 review 的 Data Root context 都使用 `literature`、`knowledge` 顺序；Resume 的 stage context 先按第 3 节七阶段顺序，再按第 7.2 节对应 stage 行内 reason 顺序。Add 的 unresolved root scope 与 resolved Work scope 互斥，因此 `identity_intake_busy` 与 `work_busy` 不得作为同一 ownership snapshot 的两个候选。Resume 只有一个 `work_id`；review 先结束 raw Candidate selector gate，解析到现存 Candidate 后才进入完整性 gate，且只有一个 `candidate_id`；action 冲突已在 grammar gate 结束。单一 field 内的多个缺陷映射到同一 code/context，不产生第二 primary。
+表中 suffix 自动带所属 `literature.<command>.` prefix 与 `.v1`。同一个 code 有多个合法 context candidate 时，add 的 `input_invalid.field` 顺序固定为 `pdf_path`、`work_id`、`doi`、`arxiv_id`、`citation`、`pdf_content`；这些 raw fields 全部通过后才允许稳定读取选择较晚的 `pdf_content`。Resume 与 review 的 Data Root context 都使用 `literature`、`knowledge` 顺序；Resume 的 stage context 先按第 3 节七阶段顺序，再按第 7.2 节对应 stage 行内 reason 顺序。受 ADR 0121 约束的三行必须保持 specific-before-generic：`knowledge_import` blocked 为 `registry_unavailable`、`registry_busy`、`import_blocked`，`handoff` failed 为 `revision_conflict`、`asset_integrity_lost`、`commit_failed`、`handoff_failed`，`knowledge_import` failed 为 `revision_conflict`、`registry_conflict`、`commit_failed`、`import_failed`；generic reason 固定在行末，不得按字母或实现枚举重排。Add 的 unresolved root scope 与 resolved Work scope 互斥，因此 `identity_intake_busy` 与 `work_busy` 不得作为同一 ownership snapshot 的两个候选。Resume 只有一个 `work_id`；review 先结束 raw Candidate selector gate，解析到现存 Candidate 后才进入完整性 gate，且只有一个 `candidate_id`；action 冲突已在 grammar gate 结束。单一 field 内的多个缺陷映射到同一 code/context，不产生第二 primary。
 
 仲裁后恰好发出胜出 code 的一个 primary item及其唯一 closed context；T04 没有 supplemental，其他 candidate 不输出、不聚合也不改 result。Uncertain commit、外部 termination、未批准 cancellation 与 presentation failure继续位于该仲裁和正常 envelope之外。
 
@@ -605,8 +605,8 @@ Review catalog 的 `<data_root>` 逐字取胜出 root primary context 中的 `da
 ### Resume
 
 - 七阶段每个 valid success跳过；directory committed/pointer missing只补 pointer；从 ingest自动推进到 pending review并返回 IDs，不写 Decision。
-- Zero Candidate完成 no-op；全部有 decision时补 Handoff/Import；有已授权 backlog和其他 pending时先补 backlog再 awaiting_review。
-- Resume result seal逐 variant覆盖：17 个 `stage_blocked` pair 与 25 个 `stage_failed` pair 逐项具有可达见证并返回 non-null，42 个 stage pair 的可达性与计数不变；七个固定 null code 加三个 Literature root variant 恰好形成十个 null variants，三个 Knowledge root variant 均形成 non-null sealed result、`stop_stage=knowledge_import` 并保留已明确提交的进度。Active Source 的缺失/identity-unprovable 与确定 invalidity 分别由 seal 前的 `active_source_unavailable` 与 `active_source_invalid` 闭合，不进入 ingest matrix；`commit_failed` 不把当前 stage列入 `advanced_stages`，uncertain commit不形成 handled receipt。
+- Zero Candidate完成 no-op；全部有 decision时补 Handoff/Import；有已授权 backlog和其他 pending时先补 backlog再 awaiting_review。对 `handoff` 与 `knowledge_import` 的每个 retained blocked/failed reason 都必须有 backlog+pending 见证：`start_stage=review`，`pending_candidate_ids` 非空且 Work 全局 Continuation Point 仍为 `review`，但 `stop_stage` 精确等于该 blocked/failed primary context 的 stage；backlog 全部成功后才允许以 `stop_stage=review`、`awaiting_review` 呈现。
+- Resume result seal逐 variant覆盖：17 个 `stage_blocked` pair 与 25 个 `stage_failed` pair 逐项具有可达见证并返回 non-null，42 个 stage pair 的可达性与计数不变；三条 ADR 0121 相关 reason 列表逐字验证 specific 在前、generic 在末，并证明第 7.4 节同 stage 仲裁优先选择 specific。七个固定 null code 加三个 Literature root variant 恰好形成十个 null variants，三个 Knowledge root variant 均形成 non-null sealed result、`stop_stage=knowledge_import` 并保留已明确提交的进度。Active Source 的缺失/identity-unprovable 与确定 invalidity 分别由 seal 前的 `active_source_unavailable` 与 `active_source_invalid` 闭合，不进入 ingest matrix；`commit_failed` 不把当前 stage列入 `advanced_stages`，uncertain commit不形成 handled receipt。
 - Awaiting-review redirected Human完整匹配 witness：N 项 Candidate array 按外层 Candidate 顺序、内层 accept/reject/defer 顺序输出恰好 `3N` 条完整命令，最多 36 条且命令不含 raw `|`；命令位于 `Work ID` 后、`原因` 前，全 receipt 恰好一个最终 `下一步` 行。
 - 每阶段 blocked/failed、历史 interrupted、遗留 running、partial/invalid orphan、target conflict、uncertain均无 partial success/overwrite。
 - OCR缺失只在 ocr阻塞；Codex缺失只在 read；Knowledge root只在 import；已完成阶段仍可读。
