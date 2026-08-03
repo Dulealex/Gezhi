@@ -17,7 +17,7 @@ _Avoid_: Knowledge Base
 _Avoid_: Review Status, Promotion Status
 
 **Candidate Withdrawal**:
-由较新的审核决定使既有 Candidate 停止参与检索、但不删除其导入历史和证据的动作。
+由较新的 rejected 或 deferred 审核决定使既有 accepted Candidate 停止参与检索、但不删除其导入历史和证据的动作；pending 审核不产生 Handoff，也不创建或更新 Registry 状态。
 _Avoid_: Delete, Demotion
 
 **Candidate Search Result**:

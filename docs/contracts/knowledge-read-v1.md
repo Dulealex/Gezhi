@@ -129,7 +129,7 @@ Parser 已冻结为 `knowledge show CANDIDATE_ID [--json]`。V1 selector 必须�
   "governance": {
     "intake_status": "active|withdrawn",
     "promotion_status": "not_promoted",
-    "review_status": "pending|accepted|rejected|deferred"
+    "review_status": "accepted|rejected|deferred"
   },
   "result_kind": "candidate_backed",
   "schema_version": "gezhi.knowledge_show_result.v1",
@@ -156,7 +156,8 @@ Parser 已冻结为 `knowledge show CANDIDATE_ID [--json]`。V1 selector 必须�
 `content_import.action` 固定为 `accept`，指向提供当前 Candidate/Citation/Descriptor/Evidence 内容的最近合法 accepted revision。`status_import` 指向当前 Registry 状态的 revision：
 
 - active 时，`review_status=accepted`、`status_import.action=accept`，且两个 import object 逐字段相等；
-- withdrawn 时，`review_status` 只能为 `pending|rejected|deferred`、`status_import.action=withdraw`、其 revision 严格大于 `content_import.review_revision`；正文仍来自最后 accepted content import，仅供历史审计；
+- withdrawn 时，`review_status` 只能为 `rejected|deferred`、`status_import.action=withdraw`、其 revision 严格大于 `content_import.review_revision`；正文仍来自最后 accepted content import，仅供历史审计；
+- `pending` 审核决定不产生 Reviewed Handoff，因而不创建或更新 Candidate Registry 状态，也永远不能出现在 `KnowledgeShowResultV1`；从未 accepted 的 pending Candidate 即使已有 Literature-side Candidate ID，该 ID 也不在 Knowledge Registry，`knowledge show` 返回 `candidate_not_found`；既有 accepted Candidate 的 pending 新审核不改变其 active 状态，只有后续 `rejected|deferred` revision 才能形成 withdraw Handoff；
 - `promotion_status` 在 V1 始终为 `not_promoted`。
 
 每个 Pointer 必须在 content import 中恰好解析到一个已校验 Evidence snapshot。Knowledge 不因 show 回开 Literature Data Root；这里的可解析性是对 Knowledge 持有的不可变 Reviewed Handoff 证据与 Registry provenance 的验证，不伪称已重新读取 PDF、Canonical Asset 或完整 Reading Result。私有审核备注、reviewer identity、文件路径与未绑定原始内容不得进入 result。

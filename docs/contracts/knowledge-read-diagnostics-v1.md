@@ -67,21 +67,284 @@ Gate 顺序是唯一仲裁顺序；一旦 root gate 成功，后续 root trust l
 
 ## Human 中文表示
 
-Human mode 与 JSON mode 必须消费同一个已经验证的 command report，拥有相同 outcome、result cap 与领域排序；即使选择 Human，也先以 would-be canonical success envelope 判定 1,048,576-byte cap。成功只写 stdout，blocked/failed 只把一条固定中文说明和一个末尾 LF 写 stderr 并保持 stdout empty；完整 Human success 同样恰好以一个 LF 结束。两种模式都不输出 prompt、progress、spinner、日志、traceback、ANSI 或旧 PaperBot JSON。
+Human mode 与 JSON mode 必须消费同一个已经验证的 command report，拥有相同 outcome、result cap 与领域排序；即使选择 Human，也先以 would-be canonical success envelope 判定 1,048,576-byte cap。成功只写 stdout，blocked/failed 只把一条固定中文说明和一个末尾 LF 写 stderr 并保持 stdout empty。两种模式都不输出 prompt、progress、spinner、日志、traceback、ANSI 或旧 PaperBot JSON。
 
-Human search success 的前四行依次为 `Knowledge 候选搜索`、下列固定治理说明、`查询：<quoted normalized_text>` 与 `结果：N 条`。随后按 rank 对每项使用固定标签 `候选`、`状态`、`陈述`、`来源`、`证据指针`，呈现 Candidate ID/type、`accepted / active / not_promoted`、规范陈述、Work/Source identity 与全部 Evidence Pointer；只显示 final rank，不显示 atoms、BM25、branch rank、RRF 或 Registry provenance。零结果在 count 后输出 `没有匹配的 active Candidate。`。固定治理说明精确为：
+### HumanTreeV1 逐行语法
+
+成功 Human stdout 由命令前导行加同一个 machine `result` 的完整 `HumanTreeV1` 投影组成。`knowledge search` 前导恰好是下列两行，`knowledge show` 只把第一行替换为 `Knowledge 候选详情`：
 
 ```text
+Knowledge 候选搜索
 治理说明：以下结果仅为已审核但尚未晋升的 Candidate Knowledge，不代表已晋升知识、已验证事实或自动蕴含证明。
 ```
 
-Human show success 按以下固定 section 顺序呈现：标题 `Knowledge 候选详情`、同一治理说明、`候选` 与 `类型`、`状态`、陈述与 source identity、Citation、`内容交接`、`当前交接`、Descriptor snapshots、Evidence snapshots；每个 machine result 字段都必须在对应 section 可见，不生成额外推断。Withdrawn 结果必须在 governance 后额外输出：
+令 `I(d)` 为恰好 `2*d` 个 ASCII SPACE，根 result object 的字段深度为 `d=0`。renderer 必须先验证完整 typed result，再按下列规则逐行生成；这里的 `LF` 是单个 byte `0x0A`，`LABEL(k)` 来自后文封闭表：
+
+- 非空 object 的 field 按 machine key 的 Python 3.11 string 升序输出；根 object 不输出 `{` 或 `}`，nested object 由其 field label 建立边界。Array 保持合同已经冻结的领域顺序，不排序。
+- scalar field 是 `I(d) + LABEL(k) + ": " + SCALAR(v)`；empty array field 用同一前缀加字面量 `[]`，empty object field 加字面量 `{}`。
+- nonempty array/object field 是 `I(d) + LABEL(k) + ":" + LF`，随后以 `d+1` 渲染 container body；冒号后不得有 SPACE。
+- array 中每个 scalar item 是 `I(d) + "- " + SCALAR(v)`；empty array/object item 分别是 `I(d) + "- []"` 与 `I(d) + "- {}"`；nonempty array/object item 是 `I(d) + "-" + LF`，随后以 `d+1` 渲染其 body。重复项相邻输出，每项各有一个同深度 `-`，项间没有空行或其他分隔符。
+- `SCALAR(null)` 是 ASCII `null`；boolean 必须先于 integer 分派并精确为 `true` 或 `false`；integer 是无 `+`、无多余前导零的 ASCII 十进制（零为 `0`）；string 是 Python 3.11 `json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))` 产生的单个 JSON string token。Float、未知 key、未知类型或未经验证的值不能进入 renderer。
+- 所有逻辑行只用一个 LF 连接，无物理 CR、空行、尾随 SPACE、BOM 或 ANSI；完整 stdout 在最后一行后追加恰好一个 LF。每个 machine field 恰好生成一个带 `[machine_key]` 的 field label；不得省略、合并、摘要或另行推断字段。
+
+`LABEL(k)` 的封闭映射如下；square brackets 是输出字符，不是本文元语法：
+
+| machine key | exact `LABEL(k)` |
+|---|---|
+| `action` | `动作 [action]` |
+| `arxiv_id` | `arXiv ID [arxiv_id]` |
+| `author_count` | `作者总数 [author_count]` |
+| `block_id` | `Block ID [block_id]` |
+| `candidate` | `Candidate [candidate]` |
+| `candidate_count` | `Candidate 数量 [candidate_count]` |
+| `candidate_id` | `Candidate ID [candidate_id]` |
+| `candidate_type` | `Candidate 类型 [candidate_type]` |
+| `candidates_sha256` | `candidates.jsonl SHA-256 [candidates_sha256]` |
+| `canonical_content_sha256` | `Canonical 内容 SHA-256 [canonical_content_sha256]` |
+| `citation` | `引用快照 [citation]` |
+| `content_import` | `内容交接 [content_import]` |
+| `descriptor_id` | `Descriptor ID [descriptor_id]` |
+| `descriptor_refs` | `Descriptor 引用 [descriptor_refs]` |
+| `descriptor_snapshots` | `Descriptor 快照 [descriptor_snapshots]` |
+| `doi` | `DOI [doi]` |
+| `evidence_pointers` | `证据指针 [evidence_pointers]` |
+| `evidence_snapshots` | `证据快照 [evidence_snapshots]` |
+| `excerpt` | `摘录 [excerpt]` |
+| `governance` | `治理 [governance]` |
+| `handoff_id` | `Handoff ID [handoff_id]` |
+| `intake_status` | `接收状态 [intake_status]` |
+| `items` | `候选项 [items]` |
+| `kind` | `类型 [kind]` |
+| `label` | `名称 [label]` |
+| `manifest_sha256` | `manifest.json SHA-256 [manifest_sha256]` |
+| `page_index` | `页索引 [page_index]` |
+| `payload` | `Payload [payload]` |
+| `payload_sha256` | `Payload SHA-256 [payload_sha256]` |
+| `pointer` | `证据指针 [pointer]` |
+| `primary_authors` | `主要作者 [primary_authors]` |
+| `promotion_status` | `晋升状态 [promotion_status]` |
+| `query` | `规范查询 [query]` |
+| `rank` | `排名 [rank]` |
+| `reference` | `Descriptor 引用 [reference]` |
+| `research_interest_id` | `Research Interest ID [research_interest_id]` |
+| `result_kind` | `结果种类 [result_kind]` |
+| `review_revision` | `审核修订 [review_revision]` |
+| `review_status` | `审核状态 [review_status]` |
+| `risk_flags` | `审核风险标记 [risk_flags]` |
+| `schema_version` | `架构版本 [schema_version]` |
+| `source_id` | `Source ID [source_id]` |
+| `source_sha256` | `Source SHA-256 [source_sha256]` |
+| `source_terms` | `来源术语 [source_terms]` |
+| `statement` | `陈述 [statement]` |
+| `status_import` | `当前交接 [status_import]` |
+| `support_kind` | `支持类型 [support_kind]` |
+| `text` | `文本 [text]` |
+| `title` | `标题 [title]` |
+| `value` | `值 [value]` |
+| `work_id` | `Work ID [work_id]` |
+| `year` | `年份 [year]` |
+
+上述 union 覆盖 `KnowledgeSearchResultV1`、`KnowledgeShowResultV1`、`CandidateKnowledgeV1`、Citation/Descriptor/Evidence snapshots、Descriptor payload 的两个 `value` variant、governance 与 import object 的全部允许 key。首个切片不会产生 `research_interest_id`；保留其 label 不授权 Relevance Candidate。由于 `search` machine result 只有完整 Candidate、治理和 final rank，Human search 同样不泄露 Citation/Descriptor snapshot、excerpt/page、Handoff/import、atoms、BM25、branch rank、RRF 或 Registry provenance。`show` 则按同一语法完整呈现全部治理与审计字段。
+
+若且仅若 show result 的 `governance.intake_status="withdrawn"`，renderer 在完整 `governance` subtree 后、下一个根 field 前插入下列 depth-0 固定行；active 时禁止该行。Withdrawn 的 `review_status` 只能是 `rejected|deferred`，pending 不产生 Handoff 或 Registry 状态，因而没有 Human withdrawn 表示。
 
 ```text
 注意：该 Candidate 已撤回，不参与 search 或 ask 检索；以下内容仅供历史审计。
 ```
 
-所有外部或人类文本（Query、陈述、source term、title、author、DOI、Descriptor label、block ID、excerpt）均以 Python 3.11 `json.dumps(value, ensure_ascii=False)` 的单个 JSON string token 显示，使 LF/TAB/引号不能伪造 section；ID、enum、hash、integer 可按已验证 ASCII/十进制规范值直接显示，null 固定显示 `未知`。Human renderer 不裁剪、改写、翻译、摘要或生成 URL。
+### Redirected success exact-byte witnesses
+
+下列四个 fence 内从首字符到末字符是 redirected stdout 的完整 UTF-8 文本；closing fence 前的换行就是唯一 final LF。四项 stderr 都是 zero bytes、process exit 都是 `0`；stdout 无 BOM、CR、ANSI、console wrapping 或 fence 字符。示例 Candidate 的 `payload_sha256` 是所示 payload 的真实 CanonicalJsonV1 SHA-256，`candidate_id` 与其前 24 位一致。
+
+#### search：0 项
+
+```text
+Knowledge 候选搜索
+治理说明：以下结果仅为已审核但尚未晋升的 Candidate Knowledge，不代表已晋升知识、已验证事实或自动蕴含证明。
+Candidate 数量 [candidate_count]: 0
+候选项 [items]: []
+规范查询 [query]: "没有结果"
+结果种类 [result_kind]: "candidate_backed"
+架构版本 [schema_version]: "gezhi.knowledge_search_result.v1"
+```
+
+#### search：1 项
+
+```text
+Knowledge 候选搜索
+治理说明：以下结果仅为已审核但尚未晋升的 Candidate Knowledge，不代表已晋升知识、已验证事实或自动蕴含证明。
+Candidate 数量 [candidate_count]: 1
+候选项 [items]:
+  -
+    Candidate [candidate]:
+      Candidate ID [candidate_id]: "cand_3a421e895f79e2c167e2ef4b"
+      Payload [payload]:
+        Candidate 类型 [candidate_type]: "claim"
+        Canonical 内容 SHA-256 [canonical_content_sha256]: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        Descriptor 引用 [descriptor_refs]: []
+        架构版本 [schema_version]: "gezhi.candidate_payload.v1"
+        Source ID [source_id]: "src_bbbbbbbbbbbbbbbbbbbbbbbb"
+        Source SHA-256 [source_sha256]: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        陈述 [statement]:
+          证据指针 [evidence_pointers]:
+            -
+              Block ID [block_id]: "block-001"
+              Canonical 内容 SHA-256 [canonical_content_sha256]: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+              架构版本 [schema_version]: "gezhi.evidence_pointer.v1"
+          审核风险标记 [risk_flags]: []
+          来源术语 [source_terms]:
+            - "source term"
+          支持类型 [support_kind]: "direct"
+          文本 [text]: "示例结论"
+        Work ID [work_id]: "wrk_123e4567-e89b-42d3-a456-426614174000"
+      Payload SHA-256 [payload_sha256]: "3a421e895f79e2c167e2ef4b4f42ece44839ca487c11e6659870904f268eabf1"
+      架构版本 [schema_version]: "gezhi.candidate_knowledge.v1"
+    治理 [governance]:
+      接收状态 [intake_status]: "active"
+      晋升状态 [promotion_status]: "not_promoted"
+      审核状态 [review_status]: "accepted"
+    排名 [rank]: 1
+规范查询 [query]: "source term"
+结果种类 [result_kind]: "candidate_backed"
+架构版本 [schema_version]: "gezhi.knowledge_search_result.v1"
+```
+
+#### show：active
+
+```text
+Knowledge 候选详情
+治理说明：以下结果仅为已审核但尚未晋升的 Candidate Knowledge，不代表已晋升知识、已验证事实或自动蕴含证明。
+Candidate [candidate]:
+  Candidate ID [candidate_id]: "cand_3a421e895f79e2c167e2ef4b"
+  Payload [payload]:
+    Candidate 类型 [candidate_type]: "claim"
+    Canonical 内容 SHA-256 [canonical_content_sha256]: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    Descriptor 引用 [descriptor_refs]: []
+    架构版本 [schema_version]: "gezhi.candidate_payload.v1"
+    Source ID [source_id]: "src_bbbbbbbbbbbbbbbbbbbbbbbb"
+    Source SHA-256 [source_sha256]: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    陈述 [statement]:
+      证据指针 [evidence_pointers]:
+        -
+          Block ID [block_id]: "block-001"
+          Canonical 内容 SHA-256 [canonical_content_sha256]: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          架构版本 [schema_version]: "gezhi.evidence_pointer.v1"
+      审核风险标记 [risk_flags]: []
+      来源术语 [source_terms]:
+        - "source term"
+      支持类型 [support_kind]: "direct"
+      文本 [text]: "示例结论"
+    Work ID [work_id]: "wrk_123e4567-e89b-42d3-a456-426614174000"
+  Payload SHA-256 [payload_sha256]: "3a421e895f79e2c167e2ef4b4f42ece44839ca487c11e6659870904f268eabf1"
+  架构版本 [schema_version]: "gezhi.candidate_knowledge.v1"
+引用快照 [citation]:
+  arXiv ID [arxiv_id]: null
+  作者总数 [author_count]: 1
+  DOI [doi]: null
+  主要作者 [primary_authors]:
+    - "张三"
+  Source ID [source_id]: "src_bbbbbbbbbbbbbbbbbbbbbbbb"
+  Source SHA-256 [source_sha256]: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  标题 [title]: "示例论文"
+  Work ID [work_id]: "wrk_123e4567-e89b-42d3-a456-426614174000"
+  年份 [year]: 2024
+内容交接 [content_import]:
+  动作 [action]: "accept"
+  candidates.jsonl SHA-256 [candidates_sha256]: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  Handoff ID [handoff_id]: "handoff_accept_1"
+  manifest.json SHA-256 [manifest_sha256]: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  审核修订 [review_revision]: 1
+Descriptor 快照 [descriptor_snapshots]: []
+证据快照 [evidence_snapshots]:
+  -
+    摘录 [excerpt]: "Example evidence."
+    页索引 [page_index]: null
+    证据指针 [pointer]:
+      Block ID [block_id]: "block-001"
+      Canonical 内容 SHA-256 [canonical_content_sha256]: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      架构版本 [schema_version]: "gezhi.evidence_pointer.v1"
+治理 [governance]:
+  接收状态 [intake_status]: "active"
+  晋升状态 [promotion_status]: "not_promoted"
+  审核状态 [review_status]: "accepted"
+结果种类 [result_kind]: "candidate_backed"
+架构版本 [schema_version]: "gezhi.knowledge_show_result.v1"
+当前交接 [status_import]:
+  动作 [action]: "accept"
+  candidates.jsonl SHA-256 [candidates_sha256]: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  Handoff ID [handoff_id]: "handoff_accept_1"
+  manifest.json SHA-256 [manifest_sha256]: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  审核修订 [review_revision]: 1
+```
+
+#### show：withdrawn/rejected
+
+```text
+Knowledge 候选详情
+治理说明：以下结果仅为已审核但尚未晋升的 Candidate Knowledge，不代表已晋升知识、已验证事实或自动蕴含证明。
+Candidate [candidate]:
+  Candidate ID [candidate_id]: "cand_3a421e895f79e2c167e2ef4b"
+  Payload [payload]:
+    Candidate 类型 [candidate_type]: "claim"
+    Canonical 内容 SHA-256 [canonical_content_sha256]: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    Descriptor 引用 [descriptor_refs]: []
+    架构版本 [schema_version]: "gezhi.candidate_payload.v1"
+    Source ID [source_id]: "src_bbbbbbbbbbbbbbbbbbbbbbbb"
+    Source SHA-256 [source_sha256]: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    陈述 [statement]:
+      证据指针 [evidence_pointers]:
+        -
+          Block ID [block_id]: "block-001"
+          Canonical 内容 SHA-256 [canonical_content_sha256]: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          架构版本 [schema_version]: "gezhi.evidence_pointer.v1"
+      审核风险标记 [risk_flags]: []
+      来源术语 [source_terms]:
+        - "source term"
+      支持类型 [support_kind]: "direct"
+      文本 [text]: "示例结论"
+    Work ID [work_id]: "wrk_123e4567-e89b-42d3-a456-426614174000"
+  Payload SHA-256 [payload_sha256]: "3a421e895f79e2c167e2ef4b4f42ece44839ca487c11e6659870904f268eabf1"
+  架构版本 [schema_version]: "gezhi.candidate_knowledge.v1"
+引用快照 [citation]:
+  arXiv ID [arxiv_id]: null
+  作者总数 [author_count]: 1
+  DOI [doi]: null
+  主要作者 [primary_authors]:
+    - "张三"
+  Source ID [source_id]: "src_bbbbbbbbbbbbbbbbbbbbbbbb"
+  Source SHA-256 [source_sha256]: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  标题 [title]: "示例论文"
+  Work ID [work_id]: "wrk_123e4567-e89b-42d3-a456-426614174000"
+  年份 [year]: 2024
+内容交接 [content_import]:
+  动作 [action]: "accept"
+  candidates.jsonl SHA-256 [candidates_sha256]: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  Handoff ID [handoff_id]: "handoff_accept_1"
+  manifest.json SHA-256 [manifest_sha256]: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  审核修订 [review_revision]: 1
+Descriptor 快照 [descriptor_snapshots]: []
+证据快照 [evidence_snapshots]:
+  -
+    摘录 [excerpt]: "Example evidence."
+    页索引 [page_index]: null
+    证据指针 [pointer]:
+      Block ID [block_id]: "block-001"
+      Canonical 内容 SHA-256 [canonical_content_sha256]: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      架构版本 [schema_version]: "gezhi.evidence_pointer.v1"
+治理 [governance]:
+  接收状态 [intake_status]: "withdrawn"
+  晋升状态 [promotion_status]: "not_promoted"
+  审核状态 [review_status]: "rejected"
+注意：该 Candidate 已撤回，不参与 search 或 ask 检索；以下内容仅供历史审计。
+结果种类 [result_kind]: "candidate_backed"
+架构版本 [schema_version]: "gezhi.knowledge_show_result.v1"
+当前交接 [status_import]:
+  动作 [action]: "withdraw"
+  candidates.jsonl SHA-256 [candidates_sha256]: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  Handoff ID [handoff_id]: "handoff_withdraw_2"
+  manifest.json SHA-256 [manifest_sha256]: "9999999999999999999999999999999999999999999999999999999999999999"
+  审核修订 [review_revision]: 2
+```
 
 非成功 primary 的固定中文行如下；相同 cause 在 search/show 复用同一句：
 
@@ -127,11 +390,11 @@ T19 实现至少必须覆盖：
 
 - Query normalization、空/纯符号/单 Han、2000/8192 边界、双路各 128 atom 边界与 FTS syntax injection；
 - 两个 tokenizer 的实际 SQLite probe、每路 48、精确 RRF `k=12`、Candidate ID tie-break、最多 12、单路无 atoms、双路零匹配；
-- active/withdrawn 混合数据、withdraw 后 search 排除、重新 accept 后恢复、show withdrawn 仍成功；
+- accepted/active、rejected/withdrawn 与 deferred/withdrawn 混合数据；从未 accepted 的 pending 不产生 Handoff、不在 Registry 建立状态且 show 为 `candidate_not_found`，既有 active Candidate 的 pending 新审核不改变 show/search；rejected 或 deferred withdraw 后 search 排除，随后 accept 恢复，show withdrawn 仍成功；
 - search result 只含完整 Candidate/治理/rank，show result 的 Candidate/Citation/Descriptor/Evidence/import 交叉约束；
 - invalid ID、missing ID、unknown Registry generation、缺 FTS、数据库损坏、branch failure、Candidate hash mismatch、import/hash/evidence 缺失与 root identity loss；
 - read-only connection 与副作用断言：Registry logical state、main database pages、immutable imports 与 answer tree 不变且不新增业务文件；已存在 WAL/SHM 中只服务 read snapshot 的 SQLite lock/read-coordination metadata 不算业务 mutation，但不得执行 DML/DDL、checkpoint、migration 或 vacuum；
-- 1,048,576/1,048,577-byte presentation 边界、canonical JSON LF、Human 固定中文、stdout/stderr 隔离与 `0/2/1` exit；
+- 1,048,576/1,048,577-byte presentation 边界、canonical JSON LF、Human 固定中文、stdout/stderr 隔离与 `0/2/1` exit；`HumanTreeV1` 逐项覆盖 null/bool/int/string、empty/nonempty array/object、nested object、多个相邻 array item、全部 label/key 与四个 redirected exact-byte witness；
 - 同一 synthetic Registry snapshot 与 Query 至少两次独立进程运行得到相同 JSON bytes；show 对同一 Candidate/import bytes 同样复验；
 - 缺失 Codex、OCR、embedding/vector/model runtime 时两个命令仍可成功，且没有 provider、网络或 child-process probe。
 
