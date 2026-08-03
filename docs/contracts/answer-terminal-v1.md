@@ -22,11 +22,11 @@ V1 威胁边界仍是服从同一 writer mutex 的协作进程与 crash / power-
 1. `read_committed(answer_id)`：只读并整体接受或拒绝字面 `answers/<answer_id>/`。
 2. `inspect_orphan(staging_entry)`：只允许在当前线程持有该 Knowledge 数据根 writer ownership 时检查 `.staging/` 的一个直接子项。
 3. `complete_orphan(inspected_orphan)`：只消费同一次完整检查得到的不可变证据，最多执行一次 non-replacing same-volume directory rename。
-4. `publish_current(owned_terminal_candidate)`：只消费本次 invocation 为当前 writer 建立、不可伪造且单次使用的 terminal candidate 能力，并独占新 Answer 从唯一 canonical manifest buffer 到明确 commit / no-commit / uncertain observation 的完整发布生命周期；详见后文专节。
+4. `publish_current(current_terminal_request)`：只接受本次 invocation 当前 writer 的声明式终态请求；module 不信任 caller 提供的路径或验证证据，而是从 writer ownership、frozen root 与 expected `answer_id` 安全派生 current staging，在内部建立并消费不可伪造的单次 terminal candidate，并独占新 Answer 从唯一 canonical manifest buffer 到明确 commit / no-commit / uncertain observation 的完整发布生命周期；详见后文专节。
 
-这四个名称描述概念行为合同，不冻结 Python module path、class、函数签名、exception 或返回对象。CLI adapter、Human renderer、diagnostic constructor、Knowledge Answer writer 与未来 Context 都不得绕过该 module 直接解释、验证或发布 Answer 文件。`owned_terminal_candidate` 不是 path、`answer_id`、boolean、普通 object/dict 或可由 caller 重建的字段集合；它必须把当前 invocation、depth-one writer ownership、frozen Knowledge root physical identity、expected `answer_id`、当前 active staging identity、已锁存 terminal cause 与已经形成、验证并关闭的最终非 manifest 资产绑定为一个 invocation-local opaque capability。
+这四个名称描述概念行为合同，不冻结 Python module path、class、函数签名、exception 或返回对象。CLI adapter、Human renderer、diagnostic constructor、Knowledge Answer writer 与未来 Context 都不得绕过该 module 直接解释、验证或发布 Answer 文件。`current_terminal_request` 只携带既有 Knowledge Answerer 合同已经冻结、形成 terminal manifest 所需的 caller-owned 值；它不是 path、handle、filesystem identity、capability、validator evidence 或 committed proof，也不能授权 caller 选择 staging。`publish_current` 必须自己把当前 invocation、depth-one writer ownership、frozen Knowledge root physical identity、expected `answer_id`、安全派生的 active staging identity、已锁存 terminal cause 与已经形成、验证并关闭的最终非 manifest 资产绑定为 module-private、invocation-local 的 opaque `owned_terminal_candidate`；该 candidate 永不跨越行为 seam。
 
-当前 writer 的 active staging 绝不能传给 `inspect_orphan` 或 `complete_orphan`，这两个 seam 只处理后续持锁 invocation 已重新证明 prior owner 不存在的历史 staging。若当前 invocation 在 `publish_current` 明确成功前 crash 或异常终止，它的能力与全部进程内证据同时失效；下一 invocation 只能重新取得 writer ownership、从当前实际 namespace 与 bytes 开始调用 `inspect_orphan`，通过后才可调用 `complete_orphan`，不得复用旧 candidate、旧 validator 结果或旧 rename observation。
+当前 writer 的 active staging 绝不能传给 `inspect_orphan` 或 `complete_orphan`，这两个 seam 只处理后续持锁 invocation 已重新证明 prior owner 不存在的历史 staging。若当前 invocation 在 `publish_current` 明确成功前 crash 或异常终止，module-private candidate 与全部进程内证据同时失效；下一 invocation 只能重新取得 writer ownership、从当前实际 namespace 与 bytes 开始调用 `inspect_orphan`，通过后才可调用 `complete_orphan`，不得复用旧 candidate、旧 validator 结果或旧 rename observation。
 
 以下四个词是 invocation-local 的检查分类，不写入 manifest、CLI result、diagnostics、sidecar、marker 或 current pointer：
 
@@ -116,13 +116,13 @@ Manifest metadata、`GetFileSizeEx`、目录项 size、一次短 read 或已知 
 
 ## `publish_current` 的唯一高层发布行为
 
-`publish_current` 是当前 writer 发布本次新 Answer 的唯一 seam。Caller 只能移交上述 `owned_terminal_candidate`，不能要求“只验证”“只写 manifest”“跳过 readback”“直接 rename”或把内部 checkpoint 拆成可单独调用的浅 interface。Module 一旦接受调用并取得该单次能力，能力立即从 caller 永久消费并失效；成功、前置条件失败、确定 no-commit、target conflict、uncertain observation、异常或任何其他退出都不得返还、重建或再次使用它。Module 随后独占并串行完成：
+`publish_current` 是当前 writer 发布本次新 Answer 的唯一 seam。Caller 只能提交上述声明式 `current_terminal_request`，不能提交或取得 capability，不能要求“只验证”“只写 manifest”“跳过 readback”“直接 rename”或把内部 checkpoint 拆成可单独调用的浅 interface。Module 接受行为调用时立即把本 invocation 的 publish attempt 锁存为已消费；随后安全派生 current staging 并在内部建立 `owned_terminal_candidate`，建立与消费都发生在同一次行为内且永不暴露给 caller。成功、前置条件失败、确定 no-commit、target conflict、uncertain observation、异常或任何其他退出都不得在同一 invocation 再次调用、返还或重建 candidate。Module 独占并串行完成：
 
-1. 确认能力仍属于本 invocation、当前线程仍 depth-one 持有与 frozen root identity 绑定的 writer ownership，expected target 与 active staging identity 未漂移，全部最终非 manifest 资产已经形成、验证、关闭且私有 entry 已撤销。
+1. 冻结 request 的既有终态值，确认当前线程仍 depth-one 持有与 frozen root identity 绑定的 writer ownership，从 frozen root 与 expected `answer_id` 安全派生 exact target / active staging，拒绝 caller 路径或 authority claim，并证明 staging identity 未漂移、全部最终非 manifest 资产已经形成、验证、关闭且私有 entry 已撤销；只有这些事实同时成立才建立 module-private candidate。
 2. 恰好一次形成 immutable canonical manifest buffer，先执行 manifest 实际 raw length cap，再从该实际长度开始对全部最终 asset 实际 raw byte length checked-add 并执行 aggregate cap；失败不得形成 manifest leaf。
 3. 对字面 `manifest.json` 恰好一次 direct exclusive-create，把同一 buffer 完整 write / completion / close；随后由共享 terminal validator 对最终 leaf、整个 staging 与同一 buffer identity 完成 writer readback。不得二次序列化、另建 manifest、重开写入、修补或跳过 readback。
 4. 关闭 root anchor 以外的 operation-specific handles，紧邻 publish 重新证明 root identity / canonical path、staging 与 target 两条父链 no-reparse、same-volume、expected target absent 以及 current staging identity。
-5. 对当前 staging 到 expected target 恰好尝试一次 non-replacing same-volume directory rename。只有明确成功 observation 才返回本 invocation 可用的等价 committed proof；无论 observation 如何，能力都已在 seam 接受调用时永久失效。该 proof 绑定前述完整 staging validation、紧邻 checkpoint 与本次明确成功 rename，不能被保存给后续 invocation，也不要求当前 invocation 立即从 target 再做一次全量读取。
+5. 对当前 staging 到 expected target 恰好尝试一次 non-replacing same-volume directory rename。只有明确成功 observation 才返回本 invocation 可用的等价 committed proof；无论 observation 如何，本 invocation 的 publish attempt 与 module-private candidate 都已永久失效。该 proof 绑定前述完整 staging validation、紧邻 checkpoint 与本次明确成功 rename，不能被保存给后续 invocation，也不要求当前 invocation 立即从 target 再做一次全量读取。
 
 失败与不确定结果继续由既有边界拥有，`publish_current` 不增加 Schema、diagnostic、outcome、receipt 字段或公开异常文本：
 
@@ -141,7 +141,7 @@ Manifest metadata、`GetFileSizeEx`、目录项 size、一次短 read 或已知 
 
 | 情形 | 持久状态 | 本次 `knowledge.ask result` | current pointer |
 |---|---|---|---|
-| 本次新 Answer 已由 `publish_current` 消费不可伪造的 current-writer capability，共享 terminal validator 完整验证 staging，紧邻 checkpoint 通过，且 non-replacing rename 明确成功 | 本 invocation 以 `publish_current` 返回的等价 committed proof 接受为 `committed`；不要求立即从 target 重读 | 按既有矩阵为非 `null`；若随后 crash / presentation failure，stdout 仍可能没有完整 receipt | 必须缺席 |
+| 本次新 Answer 已由 `publish_current` 从声明式 request 安全派生 staging、内部建立并消费不可伪造的 current-writer candidate，共享 terminal validator 完整验证 staging，紧邻 checkpoint 通过，且 non-replacing rename 明确成功 | 本 invocation 以 `publish_current` 返回的等价 committed proof 接受为 `committed`；不要求立即从 target 重读 | 按既有矩阵为非 `null`；若随后 crash / presentation failure，stdout 仍可能没有完整 receipt | 必须缺席 |
 | 启动时补交旧 `orphaned` Answer 明确成功 | 本 invocation 以同一等价证明接受该历史 Answer 为 `committed`；之后的 invocation 必须 `read_committed` | 不能成为本次 result；新 Ask 是否另有 result 只看自己的新 commit | 必须缺席 |
 | 只读历史 target | 验证通过才是 `committed` | 不构造 `knowledge.ask` receipt | 必须缺席 |
 | 历史 staged/orphaned/quarantined 项自身，且本次新 Answer 最终确定 no-commit | 没有本次 committed target | `result=null`，并服从既有 no-commit outcome/diagnostic 合同 | 必须缺席 |
@@ -160,7 +160,7 @@ V1 已批准的持久 mutation 只有两类：`publish_current` 独占的当前 
 | explicit-ID Answer reader / 历史展示 | 是，只整体读取 target | 否 | 否 | 否 |
 | `status` / 普通只读检查 | 是，只读 | 若其自身合同以后批准报告，最多使用未分类 presence；不能声称 ownerless | 否 | 否 |
 | `knowledge ask` 持锁 pre-ID recovery | 是 | 是 | 是，每候选最多一次 non-replacing rename | 否 |
-| writer 处理自己的 active staging | 否，不以 target 代替 staging | 是，只限 `owned_terminal_candidate` 绑定的目录 | 只经 `publish_current` 提交自己的 terminal Answer；不得调用 orphan seam | 否 |
+| writer 处理自己的 active staging | 否，不以 target 代替 staging | 是，只限 `publish_current` 从 frozen root / expected `answer_id` 安全派生并绑定到 module-private candidate 的目录 | 只经 `publish_current` 提交自己的 terminal Answer；不得调用 orphan seam | 否 |
 | explicit maintenance seam | 不适用；seam 未开放 | 必须以后单独冻结 | V1 无额外 action | V1 mutating action set 为空 |
 
 “V1 mutating action set 为空”是封闭决定，不是允许实现自行补命令：当前不提供 archive、purge、repair、force-promote、terminalize、quarantine marker 或 `resume Answer`。若以后需要显式维护，必须另行冻结入口、授权/确认、exact target、并发 ownership、保留路径、幂等键、失败与不确定结果；在此之前，`ask`、`status`、`doctor`、历史 reader 或后台任务都不能代行。
@@ -242,9 +242,9 @@ Target 的存在性判断使用字面 expected path 与安全 namespace 规则�
 
 - 双件矩阵每个 cell 至少一个测试；无 ownership 时 staging 只能 staged，持锁后才可 orphan/quarantine。
 - 有效 orphan 的 rename 明确成功、target-exists、其他确定失败与 uncertain completion 四分支全部覆盖。
-- `publish_current` 必须从不可伪造且单次使用的 current-writer capability 覆盖完整 manifest/readback/checkpoint/rename 生命周期，并分别验证明确成功、target conflict、其他可证明 no-commit failure 与 uncertain completion；caller 不能逐步调用、跳过门禁或从返回字段伪造 committed proof。
-- `publish_current` 一旦接受 capability，明确成功、所有确定失败、target conflict、uncertain completion 与异常退出都必须永久消费它；只有明确成功返回等价 committed proof，任何其他路径都不得返还可重试能力。
-- 当前 active staging 传入 `inspect_orphan` / `complete_orphan` 必须拒绝；当前 invocation 在明确 commit 前 crash 后，下一 invocation 必须丢弃全部旧能力与证据，从重新取得 ownership、`inspect_orphan` 全量复验开始。
+- `publish_current` 必须从声明式 request 安全派生 exact current staging，在 module 内建立并消费不可伪造且单次使用的 current-writer candidate，覆盖完整 manifest/readback/checkpoint/rename 生命周期，并分别验证明确成功、target conflict、其他可证明 no-commit failure 与 uncertain completion；caller 不能提供 capability、逐步调用、跳过门禁或从返回字段伪造 committed proof。
+- `publish_current` 一旦接受行为调用，本 invocation 的 publish attempt 即永久消费；明确成功、所有确定失败、target conflict、uncertain completion 与异常退出都必须使 module-private candidate 失效。只有明确成功返回等价 committed proof，任何其他路径都不得允许同一 invocation 重试。
+- 当前 active staging 传入 `inspect_orphan` / `complete_orphan` 必须拒绝；当前 invocation 在明确 commit 前 crash 后，下一 invocation 必须丢弃全部 module-private candidate 与证据，从重新取得 ownership、`inspect_orphan` 全量复验开始。
 - 验证明确定 rename 的同一持锁 invocation 可复用紧邻 rename 的完整 staging evidence 作为等价 committed proof，无需立即重复全量读取；后续独立 invocation 不得复用旧证据，必须 `read_committed`。
 - 验证 failure、cap overflow、坏 target 与 target conflict 不得被解释为 succeeded，不得返回 partial Answer 或 non-null Ask receipt。
 - Crash checkpoints 表逐行覆盖；尤其是“rename 成功、receipt 前 crash”必须接受 target 但不能追造 receipt/current pointer。
