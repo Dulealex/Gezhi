@@ -1,0 +1,3 @@
+# 对 Candidate Knowledge 使用内容寻址身份
+
+`CandidateKnowledgeV1` 把不参与自身哈希的 envelope 与 `gezhi.candidate_payload.v1` 分开；payload 包含 Work ID、Source ID 与完整 Source SHA-256、`canonical_content_sha256`、五类 Candidate 类型、中文规范陈述、排序后的来源术语、内容寻址 Evidence Pointer、Evidence Support、Review Risk Flag、Descriptor Reference，以及仅 Relevance Candidate 拥有的 `research_interest_id`。它不包含可修订书目别名、Canonical/semantic run ID、通用 subtype、自由 attributes、时间、Codex 会话或模型置信度。`payload_sha256` 是冻结 CanonicalJsonV1 bytes 的完整 SHA-256，`candidate_id` 为 `cand_<前24位>`；同 ID 与完整 payload 可幂等重放，短 ID 或完整 hash 碰撞必须使运行失败且不得覆盖。Candidate Review 同时绑定 ID 与完整 payload hash，具体字段、规范化与排序以 [Candidate Knowledge v1 合同](../contracts/candidate-knowledge-v1.md) 为唯一规范。

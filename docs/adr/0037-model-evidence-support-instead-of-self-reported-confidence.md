@@ -1,0 +1,3 @@
+# 记录 Evidence Support 而非模型自报置信度
+
+Reading Result 与 Candidate Draft 的每条语义陈述使用最小 `EvidenceStatementV1`，包含中文规范陈述、可在所引证据中定位的 `source_terms`、至少一个有效 Evidence Block、Evidence Support 和受控 Review Risk Flag；Evidence Support 只允许 direct、synthesized、interpretive，Method、Claim、Limitation 不得使用 interpretive，只有 Relevance 与 Open Question 可以使用它。格致不保存或展示模型自报百分比及高/中/低 confidence，也不以其影响审核排序；首版 Review Risk Flag 限于 `numeric_claim`、`comparative_claim`、`translation_sensitive`、`source_ambiguity`、`evidence_gap`，任一非法字段、术语或证据引用使整个 semantic run 校验失败且不部分发布。本决策完善 ADR 0018：Candidate payload 与内容哈希包含 Evidence Support 和排序后的 Review Risk Flag，不再包含 confidence。

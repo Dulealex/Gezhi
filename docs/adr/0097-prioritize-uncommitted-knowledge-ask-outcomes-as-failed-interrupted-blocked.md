@@ -1,0 +1,9 @@
+# 按 failed、interrupted、blocked 仲裁未提交 knowledge.ask
+
+当本次 `knowledge.ask` 已确定没有提交自己的新 Answer、各候选 cause 均能安全报告且进入最终 no-commit arbitration boundary 时，静态 outcome 优先级固定为 `failed > interrupted > blocked`。任一 ADR 0095 的封闭 failed cause 压过受控取消与 provisional blocked；没有 failed 时，ADR 0096 的合格 ID 前取消压过 provisional blocked；两者都没有时才保留 ADR 0094 的 blocked cause。该排序只仲裁在有效最终边界前已经合法产生的候选事实，不授权为了寻找更高优先级 failed 而在 stop condition 后启动新 gate；它也不按线程调度、异常到达时间或动态字符串决定，不改变 failed union 与 blocked union 各自已经冻结的内部仲裁。
+
+Final outcome 只在本次 commit 状态确定、所有适用 mandatory operation 已停止且安全收尾成立后锁存；有效最终边界成立并锁存后，晚到 cancellation callback 不得改写。若后来事实反而证明 commit 状态或安全边界当时并未成立，就不能发布或承认该正常 envelope，路径仍在矩阵外，不能用“不改写”保留旧 outcome。Cleanup/close/release API 调用报错但最终仍能证明安全边界时不自行制造第八个 failed cause，继续按现有候选 facts 仲裁；无法证明 commit 状态、进程/I/O 静止、句柄与 ownership 安全释放时，不进入正常 JSON 矩阵，不能把矩阵外路径当成比 `failed` 更高的第四个 outcome。
+
+本决策只冻结跨 outcome 的静态排序与有效最终锁存的不改写性；后续 ADR 0098 已冻结单一 cancellation latch、固定 observation/commitment checkpoints、stop-new-work、final no-commit lock 与 atomic pre-ID identity barrier，ADR 0099 已冻结 `NoCommitSafeBoundaryV1` 的 typed live-resource ledger、完整 settle、cleanup/close/release、Answer/namespace 后置条件与矩阵外边界。
+
+ADR 0100 后续把“有效最终锁存”收窄为与 `HandledCancellationWindowV1` 从 `ACCEPTING` 到 `SEALED_PASS_THROUGH` 的同一串行转换：`outcome`、`result`、`diagnostics` 与 mode-specific presentation disposition/payload 同时变为 immutable；[ADR 0107](./0107-seal-one-bounded-immutable-knowledge-ask-json-buffer.md) 已把 `knowledge.ask --json` payload 闭合为 token-bound `READY_BYTES` 或 `NO_OUTPUT_PRESENTATION_FAILURE`，callback 先赢时整项 candidate/token 作废并重新参加本 ADR 的既有仲裁。Seal 成功后必须完成所选 cancellation profile 的 zero-in-flight 与 source-specific release proof 并进入 `RELEASED`，才可开始 presentation。Interactive profile 排空 accepted callback 并移除 matching registration；[ADR 0104](./0104-continue-with-a-no-source-cancellation-profile-when-capability-is-absent.md) 的 no-source profile 证明零 in-flight 与 never-registered，不执行 removal。Seal 后 callback 不再参加本 ADR 的排序。

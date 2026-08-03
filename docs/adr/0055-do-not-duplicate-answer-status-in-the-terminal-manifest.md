@@ -1,0 +1,3 @@
+# 不在 terminal manifest 中复制 answer_status
+
+Knowledge v1 保持回答语义状态与运行终态各有唯一持久事实来源：`answer_output.json.answer_status` 独占 `answered` / `insufficient_evidence`，terminal manifest 只记录 `succeeded`、`blocked`、`failed` 或 `interrupted`，不得保存 `answer_status` 或等价语义摘要。历史查询、展示或筛选消费者需要语义状态时必须读取并验证 `answer_output.json`；ADR 0090 只允许产生本次 Answer 的 CLI 在 commit 后临时投影与该正式文件逐规范 byte 相等的完整 `result.answer_output`，不建立第二持久副本。非成功 Answer 没有正式结果文件，也没有可推断的语义状态，其 `result.answer_output` 必须为 `null`。该选择以只读 manifest 的列表不能直接显示语义状态、必要时多读取一个小文件为代价，避免两个持久副本漂移，并维持 ADR 0046 已定义的状态域分离；运行终态、错误、时间与其余已批准字段现在共同受 ADR 0083 的十一字段顶层闭包约束；不得用任何额外 key 复制语义状态。

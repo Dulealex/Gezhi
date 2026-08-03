@@ -1,0 +1,3 @@
+# 使用两文件最小自包含 Reviewed Handoff
+
+Literature 只以 `manifest.json` 与 `candidates.jsonl` 组成 Reviewed Handoff：manifest 固定合同版本、Handoff/Work/Source/Canonical 身份、物理 run locator、provenance 摘要、记录数量和文件哈希；JSONL 使用 accept 或 withdraw 动作表达逐 Candidate 的当前审核修订。accept 携带完整 Candidate Knowledge、按 Descriptor Reference 校验的完整 Descriptor 正文快照、Citation snapshot，以及 Candidate statement 与全部 Descriptor payload 的 Evidence Pointer 去重并集中每个 Pointer 对应的原语言 1–800 字符短摘录和 0-based `page_index|null`，并携带审核收据；单个 Candidate 的并集最多 42 项。withdraw 只携带既有候选身份、payload hash、新审核决定、递增修订号与原因。Descriptor、Citation、页码和摘录是供 Knowledge 物化自包含 Retrieval View 的传输快照，不进入 Candidate payload hash。Handoff 不复制 PDF、规范正文、模型原始输出、完整 Reading Result 或私人审核备注；Knowledge 导入前校验 Schema、哈希、身份、引用、动作和修订，相同内容幂等，冲突或倒序失败，回答只使用 active Candidate。

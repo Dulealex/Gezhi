@@ -1,0 +1,3 @@
+# 记录 Answer 墙钟时间与单调持续时间
+
+Knowledge v1 的 terminal manifest 顶层在四种终态下都必须保存非空 `started_at`、`finished_at` 与 `elapsed_ms`。两个审计时间使用固定毫秒精度的 UTC `YYYY-MM-DDTHH:MM:SS.mmmZ`，分别在生成 `answer_id` 后且创建 staging 前，以及终态和全部非 manifest 资产确定、验证并关闭后且写 manifest 前采集；前者不包含 mutex/recovery，后者不是原子提交时间。持续时间以同一进程 `time.monotonic_ns()` 的边界差向下取整为非负 64-bit JSON integer，不从墙钟或 attempt 求和；允许系统校时导致 `finished_at < started_at`，且不得据此修补或质疑 `elapsed_ms`。完整 terminal manifest 形成前的进程崩溃没有 nullable 半终态，只留下未完成 staging；若字面 manifest 已存在，其有效性仍由共享 reader 与恢复合同裁决；crash recovery 原样保留既有时间，也不得用时间推断 owner、staging 年龄或恢复顺序。该分离以墙钟与持续时间不要求相互吻合为代价，避免系统时钟回拨破坏终态审计，同时不引入无法在同一 manifest 中诚实写入的 `committed_at`。

@@ -1,0 +1,3 @@
+# 将 Codex 语义检索视图与排名审计分离
+
+每次 Knowledge 检索分别冻结 `retrieval_view.json` 与 `retrieval_audit.json`：前者是 Codex 唯一可见、最多 12 条 Candidate 且不超过 262144 bytes 的语义输入，后者保存查询原子、BM25、两路 branch rank、精确 RRF、Registry snapshot 和 revision provenance，但永不发送给模型。View 的每个 item 都独立嵌套完整 Candidate、Citation、Candidate statement 与全部 Descriptor payload 的 Evidence Pointer 确定性去重并集、可重新验 hash 的完整 Descriptor snapshot 与固定三态治理披露；并集最多 42 项，即使跨 item 重复也不使用共享 object pool。任一已选 Candidate 的物化材料缺失或不一致时返回 `failed: retrieval_materialization_failed`，不得丢弃或改排；42 条单项上限不扩大 262144-byte 总预算，语义 View 超限时返回 `blocked: retrieval_view_too_large`，不得截断证据、丢弃已选 Candidate、删除 Descriptor、调用模型压缩或把 audit 充当输入。这种分离既保持完整证据闭环和最小模型权限，也让排名可以完整重建而不污染回答上下文。

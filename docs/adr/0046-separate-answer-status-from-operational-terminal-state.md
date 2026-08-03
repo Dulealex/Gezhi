@@ -1,0 +1,3 @@
+# 将回答语义状态与运行终态分离
+
+Knowledge v1 的 `answer_status` 只允许 `answered` 与 `insufficient_evidence`：前者至少包含一个有 Candidate 引用的事实性回答单元且 `insufficiency_reason=null`；后者的回答与局限数组都为空，并使用 `no_matching_candidates`、`retrieved_candidates_not_responsive`、`unresolved_evidence_conflict` 或 `evidence_support_too_weak` 之一说明受控语义原因。零条 Candidate 时只由 Python 生成 `no_matching_candidates`；非零时 Codex 依次判断“无实质回应 → 实质冲突本身阻止任何回答 → 其余支持不足”，冲突与支持不足同时成立时优先冲突，再由 Python 校验结构组合；不提供自由原因文本。Python 在 `answer.md` 中只生成固定 `## 证据不足` 和该 enum 唯一映射的冻结中文段落，不显示机器 enum，也不添加回答、局限、建议、引用或检索来源。局限与部分覆盖不新增第三状态，能够合规回答时随 `answered` 披露，否则使用 `insufficient_evidence`；`failed`、`blocked` 等只属于运行 manifest，因此证据不足可以是成功发布的正常语义结果。

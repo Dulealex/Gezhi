@@ -1,3 +1,7 @@
+[build-system]
+requires = ["uv_build>=0.11.26,<0.12"]
+build-backend = "uv_build"
+
 [project]
 name = "gezhi"
 version = "0.1.0"
@@ -15,6 +19,9 @@ dependencies = [
     "typer",
 ]
 
+[project.scripts]
+gezhi = "gezhi.bootstrap:main"
+
 [dependency-groups]
 dev = [
     "mypy",
@@ -25,4 +32,4 @@ dev = [
 ]
 
 [tool.uv]
-package = false
+package = true

@@ -1,0 +1,3 @@
+# 用单遍 CommonMark token 转换转义不可信可见文本
+
+`answer.md` 中的 Question、模型文本与外部书目显示值统一使用版本化 `PlainTextToCommonMarkV1`，由纯 Python 按输入 Unicode scalar 单遍生成 token：所有 ASCII punctuation 反斜杠转义，Tab、Zl/Zp 与容器敏感换行使用不可充当 Markdown 结构的固定字符引用或可信 hard break，所有字段开头的 Space/Tab run 都实体化；Question 使用 `question_block`，其余字段使用 `inline_fragment`，可信模板语法与 link destination 永远不进入该转换。除 Tab/LF 外的 `Cc` 在 Question、Reader 书目 metadata 与 Retrieval View 的最早权威边界直接拒绝，因为 HTML5/CommonMark 会重映射部分 C1 numeric references，保留 raw control、静默替换或显示 `\uNNNN` 都无法同时保证内容往返与纯文本安全。生产运行时不引入 Markdown parser 或新依赖，并禁止递归 escaping、二次 Markdown/entity decode 及 raw HTML/code-block fallback，以牺牲罕见非法控制字符的可接受性换取 CommonMark 0.31.2 下可验证、可复现且不能注入结构的渲染边界。

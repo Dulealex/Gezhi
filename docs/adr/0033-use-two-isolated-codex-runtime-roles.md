@@ -1,0 +1,3 @@
+# 使用两个隔离的 Codex 运行角色
+
+格致把唯一语义提供方 Codex CLI 配置为 `literature_reader_v1` 与 `knowledge_answerer_v1` 两个独立角色：两者首版均显式锁定 `gpt-5.6-sol` 和 `high` reasoning，但分别拥有自己的提示词、Schema、输入限制、超时、评测与版本演进；前者只把 Canonical Reader Input View 转换为 Reading Result 和 Candidate Draft，后者只把 Question 与冻结 Retrieval View 转换为带引用的 Candidate-backed Answer。每次调用均使用项目锁定的 `codex exec`，并按 [ADR 0106](./0106-run-command-owned-children-without-a-console.md) 直接启动已验证的项目 native CLI root；采用 ephemeral、忽略用户配置和规则、只读 sandbox、禁止交互式批准、禁用模型发起的任意网络访问与无关工具，只允许 Codex CLI 到 OpenAI 服务所必需的 provider transport，并保存严格 output schema、JSONL 事件与最终结构化结果。运行之间不恢复会话，也不自动切换模型或降级到 Ollama；模型、登录、CLI 版本或必要能力不可用时由所属阶段返回 blocked。

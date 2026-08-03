@@ -1,0 +1,3 @@
+# 首版 Knowledge 问题使用单轮自包含边界
+
+`knowledge_answerer_v1` 首版的 `QuestionEnvelopeV1` 只含一个 1–2000 Unicode code point 且不超过 8192 UTF-8 bytes 的规范 `question`；通过 Question 校验只是创建 Answer 的必要条件，只有 ADR 0094 的后续 Configuration、Provenance、Data Root、Writer 与 orphan scan gate 也成功，并由 ADR 0098 的 atomic pre-ID barrier 成功生成、验证、锁存 `ans_<UUIDv4>` identity 后，才执行全局 active Candidate 检索。相同问题在全部 pre-Answer gate 与 barrier 成功时也不复用或覆盖旧 Answer。首版刻意不接受对话历史、父 Answer、附件/URL 资源、范围过滤、回答风格、Research Interest、额外上下文或提示词覆盖，以保证每个 Answer 的输入自包含、可重建并适合一晚实现；未来对话或过滤必须作为独立版本增加。为使可读结果单独打开时仍自包含，Python 在治理披露后固定生成 `## 问题`，并从已验证 `question.json` 回显规范 Question；answered、insufficient_evidence 与零 Candidate 分支都生成该区段，模型不能复述或替换它，`AnswerOutputV1` 也不复制 Question。
