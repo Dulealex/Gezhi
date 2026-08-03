@@ -1404,7 +1404,7 @@ Framing 或任一 record 失败在两个 capture 已安全关闭、读取、哈�
 一个 attempt 在 launch commitment 时成立。编排器必须按以下不可分割顺序执行：
 
 1. 完成本次固定 prompt、Schema、Question/View、有效配置与 Codex runtime 前置检查，并准备好该 ordinal 的审计接收位置；
-2. 在进入 commitment 前最后检查用户中断、单 attempt timeout 与整个 attempt-window budget；
+2. 在进入 commitment 前最后检查用户中断，以及仅在先前成功启动已建立时才存在的 95-minute shared attempt-window deadline；首个 attempt 前不存在可检查的单-attempt absolute deadline；
 3. 将当前 ordinal 不可逆地加入本次 Answer 的 attempt 序列；
 4. 紧接着按 ADR 0106 的已证明 launch plan 恰好调用一次 Windows `CreateProcessW`，直接创建绝对路径的项目 native Codex CLI root；不存在 PowerShell/“等价 wrapper”、shell、版本探针或普通启动回退。
 
