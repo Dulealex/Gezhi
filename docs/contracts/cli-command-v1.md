@@ -15,7 +15,7 @@ The following sources remain authoritative except where the three explicitly sco
 - [ADR 0118](../adr/0118-limit-v1-candidate-review-to-one-candidate-and-action.md): one Candidate plus one action in V1; it supersedes only ADR 0008's public-batch permission and leaves ADR 0019 append-only semantics intact.
 - [ADR 0119](../adr/0119-lazy-load-only-the-selected-context-command-adapter.md): the inert full routing grammar/graph and selected-adapter late-load boundary; it supersedes only ADR 0111/0112's eager all-Context-adapter/`open_gezhi()` requirement on every preflight-PASS path.
 
-This contract owns public token spelling, arity, option placement, defaults, mutual exclusion, route-to-owning-module selection, launcher parity, and the boundary between entry failures and handled command outcomes. It does not bind a concrete `CliResultEnvelopeV1.command`, result object, diagnostic union, Human result copy, or domain validation for the seven commands that do not already have such a binding; T03 through T06 own those command-specific surfaces.
+This contract owns public token spelling, arity, option placement, defaults, mutual exclusion, route-to-owning-module selection, launcher parity, and the boundary between entry failures and handled command outcomes. It does not itself bind a concrete `CliResultEnvelopeV1.command`, result object, diagnostic union, Human result copy, or domain validation. [Operations v1](./operations-v1.md) now owns those concrete surfaces for `doctor` and `status`; T04 through T06 own the remaining five previously unbound commands, while `knowledge.ask` keeps its existing binding.
 
 ## 2. Public interface
 
@@ -54,7 +54,7 @@ The exact case-sensitive lowercase ASCII paths and their owning modules are:
 | `knowledge show` | Knowledge |
 | `knowledge ask` | Knowledge |
 
-This table freezes routing identity and ownership only. T02 does not create or bind `CliResultEnvelopeV1.command` values for `doctor`, `status`, `literature add/resume/review`, or `knowledge search/show`; their concrete command contracts remain with T03 through T06. `knowledge.ask` is already bound by [Knowledge Ask Result v1](./knowledge-ask-result-v1.md) and its existing diagnostic contracts, and this table neither replaces nor generalizes that binding.
+This table freezes routing identity and ownership only. T02 did not create or bind `CliResultEnvelopeV1.command` values for `doctor`, `status`, `literature add/resume/review`, or `knowledge search/show`. [Operations v1](./operations-v1.md) now binds the first two; the other five remain with T04 through T06. `knowledge.ask` remains bound by [Knowledge Ask Result v1](./knowledge-ask-result-v1.md) and its existing diagnostic contracts, and this table neither replaces nor generalizes any concrete binding.
 
 `literature` and `knowledge` are namespace tokens, not ninth and tenth daily commands. Future Contexts receive new explicit namespace tokens only after their domain language and state ownership are approved; there is no dynamic command discovery.
 
@@ -185,11 +185,11 @@ Consequences include:
 | Valid leaf without `--json` | no | command-owned Human result | command-owned Human contract |
 | Valid leaf with `--json` | yes | exactly one command-owned `CliResultEnvelopeV1` on complete handled presentation | empty on complete handled presentation |
 
-Mode is authoritative only after the complete leaf grammar succeeds. Configuration invalidity, Data Root failure, environment capability failure, and domain validation that occur after that point must respect the selected mode. The command-specific contracts own their concrete command identity, outcome, diagnostic, exit, and Human copy; this contract does not invent the seven unfinished command payloads.
+Mode is authoritative only after the complete leaf grammar succeeds. Configuration invalidity, Data Root failure, environment capability failure, and domain validation that occur after that point must respect the selected mode. The command-specific contracts own their concrete command identity, outcome, diagnostic, exit, and Human copy; [Operations v1](./operations-v1.md) now closes those facts for `doctor` and `status`, while this grammar does not invent the five remaining unfinished payloads.
 
-The exact Human result prose for T03 through T06 is not a prerequisite for implementing or testing a JSON-only slice. Such a slice may assert a concrete `command`, closed envelope, result/diagnostic contract, stdout isolation, and exit mapping only after its command-owning ticket freezes them. Before then, T02 tests for the seven unbound paths stop at the narrow route/raw-value handoff seam and assert the owning module without constructing a speculative envelope. The existing `knowledge.ask` binding continues to use its authoritative contracts.
+Before a command-owning ticket freezes its exact Human prose, a JSON-only slice may assert only the concrete surfaces already authorized for that command. [Operations v1](./operations-v1.md) now freezes both presentations for `doctor` and `status`; T02 tests for the five still-unbound paths continue to stop at the narrow route/raw-value handoff seam without constructing a speculative envelope. The existing `knowledge.ask` binding continues to use its authoritative contracts.
 
-Only `knowledge.ask --json` currently adopts ADR 0107 through ADR 0109 binary fd1 presentation. Other commands and Human mode must not silently reuse that concrete buffer cap, writer, cancellation seal, or hard-fail behavior.
+Only `knowledge.ask --json` adopts the combined ADR 0107 through ADR 0109 candidate/seal/commit presentation package. [Operations v1](./operations-v1.md) separately and explicitly adopts the same numerical cap and ADR 0109 synchronous binary fd1 primitive only after its own read-only resources are settled; it does not inherit the Knowledge cancellation seal, Answer commit semantics, or manifest parity. The other five commands must not silently reuse either binding.
 
 ## 7. Entry ordering
 

@@ -192,7 +192,7 @@ A provable lexical equality, nesting, or project-boundary violation is configura
 
 ### 6.2 Context Data Root gate: namespace and physical proof
 
-After successful configuration, each command may inspect only the root or roots that its current operation actually consumes. It must not open another Context root merely to prove global health. `doctor` is the explicit read-only inspection command and T03 owns its complete check matrix.
+After successful configuration, each command may inspect only the root or roots that its current operation actually consumes. It must not open another Context root merely to prove global health. `doctor` is the explicit read-only inspection command and [Operations v1](./operations-v1.md) owns its complete check matrix; `status` consumes both roots only for its explicitly contracted cross-Context projection and may report one unavailable Context conservatively as partial.
 
 The consuming gate owns:
 

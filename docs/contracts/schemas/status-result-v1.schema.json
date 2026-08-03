@@ -1,0 +1,278 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gezhi.local/schemas/status-result-v1.schema.json",
+  "title": "StatusReportV1",
+  "oneOf": [
+    {"$ref": "#/$defs/overallReport"},
+    {"$ref": "#/$defs/workReport"}
+  ],
+  "$defs": {
+    "count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9223372036854775807
+    },
+    "operationalStatus": {
+      "enum": [
+        "empty",
+        "pending",
+        "running",
+        "succeeded",
+        "blocked",
+        "failed",
+        "interrupted",
+        "partial",
+        "staging",
+        "orphaned",
+        "quarantined",
+        "inconsistent"
+      ]
+    },
+    "workOperationalStatus": {
+      "enum": [
+        "pending",
+        "running",
+        "succeeded",
+        "blocked",
+        "failed",
+        "interrupted",
+        "partial",
+        "staging",
+        "orphaned",
+        "quarantined",
+        "inconsistent"
+      ]
+    },
+    "stageStatus": {
+      "enum": ["pending", "running", "succeeded", "blocked", "failed", "interrupted"]
+    },
+    "nextAction": {
+      "enum": [
+        "none",
+        "add_work",
+        "inspect_work",
+        "resume_work",
+        "review_candidate",
+        "repair_data_root",
+        "inspect_recovery"
+      ]
+    },
+    "recovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["staging_count", "orphaned_count", "quarantined_count", "inconsistent_count"],
+      "properties": {
+        "staging_count": {"$ref": "#/$defs/count"},
+        "orphaned_count": {"$ref": "#/$defs/count"},
+        "quarantined_count": {"$ref": "#/$defs/count"},
+        "inconsistent_count": {"$ref": "#/$defs/count"}
+      }
+    },
+    "statusCount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "count"],
+      "properties": {
+        "status": {"$ref": "#/$defs/workOperationalStatus"},
+        "count": {"$ref": "#/$defs/count"}
+      }
+    },
+    "answerStatusCount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "count"],
+      "properties": {
+        "status": {"enum": ["succeeded", "blocked", "failed", "interrupted"]},
+        "count": {"$ref": "#/$defs/count"}
+      }
+    },
+    "unavailableSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["availability"],
+      "properties": {
+        "availability": {"enum": ["unavailable", "unsafe"]}
+      }
+    },
+    "overallLiteratureReady": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "availability",
+        "work_count",
+        "work_status_counts",
+        "pending_review_count",
+        "pending_handoff_count"
+      ],
+      "properties": {
+        "availability": {"enum": ["ready", "partial"]},
+        "work_count": {"$ref": "#/$defs/count"},
+        "work_status_counts": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/statusCount"},
+          "maxItems": 12,
+          "uniqueItems": true
+        },
+        "pending_review_count": {"$ref": "#/$defs/count"},
+        "pending_handoff_count": {"$ref": "#/$defs/count"}
+      }
+    },
+    "overallKnowledgeReady": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "availability",
+        "active_candidate_count",
+        "withdrawn_candidate_count",
+        "answer_status_counts"
+      ],
+      "properties": {
+        "availability": {"enum": ["ready", "partial"]},
+        "active_candidate_count": {"$ref": "#/$defs/count"},
+        "withdrawn_candidate_count": {"$ref": "#/$defs/count"},
+        "answer_status_counts": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/answerStatusCount"},
+          "maxItems": 4,
+          "uniqueItems": true
+        }
+      }
+    },
+    "stageItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage", "status"],
+      "properties": {
+        "stage": {
+          "enum": ["ingest", "ocr", "canonicalize", "read", "review", "handoff", "knowledge_import"]
+        },
+        "status": {"$ref": "#/$defs/stageStatus"}
+      }
+    },
+    "stageList": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "prefixItems": [
+        {"allOf": [{"$ref": "#/$defs/stageItem"}, {"properties": {"stage": {"const": "ingest"}}}]},
+        {"allOf": [{"$ref": "#/$defs/stageItem"}, {"properties": {"stage": {"const": "ocr"}}}]},
+        {"allOf": [{"$ref": "#/$defs/stageItem"}, {"properties": {"stage": {"const": "canonicalize"}}}]},
+        {"allOf": [{"$ref": "#/$defs/stageItem"}, {"properties": {"stage": {"const": "read"}}}]},
+        {"allOf": [{"$ref": "#/$defs/stageItem"}, {"properties": {"stage": {"const": "review"}}}]},
+        {"allOf": [{"$ref": "#/$defs/stageItem"}, {"properties": {"stage": {"const": "handoff"}}}]},
+        {"allOf": [{"$ref": "#/$defs/stageItem"}, {"properties": {"stage": {"const": "knowledge_import"}}}]}
+      ],
+      "items": false
+    },
+    "reviewCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pending", "accepted", "rejected", "deferred"],
+      "properties": {
+        "pending": {"$ref": "#/$defs/count"},
+        "accepted": {"$ref": "#/$defs/count"},
+        "rejected": {"$ref": "#/$defs/count"},
+        "deferred": {"$ref": "#/$defs/count"}
+      }
+    },
+    "workLiteratureReady": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["availability", "stages", "review_counts", "handoff_status"],
+      "properties": {
+        "availability": {"enum": ["ready", "partial"]},
+        "stages": {"$ref": "#/$defs/stageList"},
+        "review_counts": {"$ref": "#/$defs/reviewCounts"},
+        "handoff_status": {"enum": ["none", "pending", "available", "blocked", "failed", "inconsistent"]}
+      }
+    },
+    "candidateCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["active", "withdrawn"],
+      "properties": {
+        "active": {"$ref": "#/$defs/count"},
+        "withdrawn": {"$ref": "#/$defs/count"}
+      }
+    },
+    "workKnowledgeReady": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["availability", "candidate_counts", "related_answer_status_counts"],
+      "properties": {
+        "availability": {"enum": ["ready", "partial"]},
+        "candidate_counts": {"$ref": "#/$defs/candidateCounts"},
+        "related_answer_status_counts": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/answerStatusCount"},
+          "maxItems": 4,
+          "uniqueItems": true
+        }
+      }
+    },
+    "overallReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "scope",
+        "status",
+        "literature",
+        "knowledge",
+        "recovery",
+        "next_action"
+      ],
+      "properties": {
+        "schema_version": {"const": "gezhi.status_result.v1"},
+        "scope": {"const": "overall"},
+        "status": {"$ref": "#/$defs/operationalStatus"},
+        "literature": {
+          "oneOf": [
+            {"$ref": "#/$defs/overallLiteratureReady"},
+            {"$ref": "#/$defs/unavailableSummary"}
+          ]
+        },
+        "knowledge": {
+          "oneOf": [
+            {"$ref": "#/$defs/overallKnowledgeReady"},
+            {"$ref": "#/$defs/unavailableSummary"}
+          ]
+        },
+        "recovery": {"$ref": "#/$defs/recovery"},
+        "next_action": {"$ref": "#/$defs/nextAction"}
+      }
+    },
+    "workReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "scope",
+        "work_id",
+        "status",
+        "literature",
+        "knowledge",
+        "recovery",
+        "next_action"
+      ],
+      "properties": {
+        "schema_version": {"const": "gezhi.status_result.v1"},
+        "scope": {"const": "work"},
+        "work_id": {
+          "type": "string",
+          "pattern": "^wrk_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "status": {"$ref": "#/$defs/workOperationalStatus"},
+        "literature": {"$ref": "#/$defs/workLiteratureReady"},
+        "knowledge": {
+          "oneOf": [
+            {"$ref": "#/$defs/workKnowledgeReady"},
+            {"$ref": "#/$defs/unavailableSummary"}
+          ]
+        },
+        "recovery": {"$ref": "#/$defs/recovery"},
+        "next_action": {"$ref": "#/$defs/nextAction"}
+      }
+    }
+  }
+}
