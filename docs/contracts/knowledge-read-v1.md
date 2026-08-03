@@ -145,19 +145,19 @@ Parser 已冻结为 `knowledge show CANDIDATE_ID [--json]`。V1 selector 必须�
 {
   "action": "accept|withdraw",
   "candidates_sha256": "<64 位小写十六进制>",
-  "handoff_id": "<Reviewed Handoff ID>",
+  "handoff_id": "hnd_<24 位小写十六进制>",
   "manifest_sha256": "<64 位小写十六进制>",
   "review_revision": 1
 }
 ```
 
-`handoff_id` 必须是 1–128 byte 的 canonical lowercase ASCII safe component，并完整匹配 `[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*`；Reviewed Handoff 合同可以进一步收窄其生成形式，但不能向本 wire 输出不满足该 profile 的值。`review_revision` 是 `1..9223372036854775807` 的 integer，boolean 非法。两个 SHA-256 分别绑定实际 `manifest.json` 与 `candidates.jsonl` 完整 bytes。
+`handoff_id` 必须与 T04 Reviewed Handoff identity 完全相同：恰好 28 个 ASCII byte，并完整匹配 `hnd_[0-9a-f]{24}`；不得接受其他 safe component、大小写变体、完整 SHA-256 或前缀。`review_revision` 是 `1..9223372036854775807` 的 integer，boolean 非法。两个 SHA-256 分别绑定该 Handoff 实际 `manifest.json` 与 `candidates.jsonl` 的完整 bytes。
 
 `content_import.action` 固定为 `accept`，指向提供当前 Candidate/Citation/Descriptor/Evidence 内容的最近合法 accepted revision。`status_import` 指向当前 Registry 状态的 revision：
 
 - active 时，`review_status=accepted`、`status_import.action=accept`，且两个 import object 逐字段相等；
 - withdrawn 时，`review_status` 只能为 `rejected|deferred`、`status_import.action=withdraw`、其 revision 严格大于 `content_import.review_revision`；正文仍来自最后 accepted content import，仅供历史审计；
-- `pending` 审核决定不产生 Reviewed Handoff，因而不创建或更新 Candidate Registry 状态，也永远不能出现在 `KnowledgeShowResultV1`；从未 accepted 的 pending Candidate 即使已有 Literature-side Candidate ID，该 ID 也不在 Knowledge Registry，`knowledge show` 返回 `candidate_not_found`；既有 accepted Candidate 的 pending 新审核不改变其 active 状态，只有后续 `rejected|deferred` revision 才能形成 withdraw Handoff；
+- `pending` 表示该 Candidate payload 尚无 Review Decision，因而没有 Reviewed Handoff 可供 Knowledge Intake 应用；它不创建或更新 Candidate Registry 状态，也永远不能作为 `review_status` 出现在 `KnowledgeShowResultV1`。从未 accepted 的 pending Candidate 即使已有 Literature-side Candidate ID，该 ID 也不在 Knowledge Registry，`knowledge show` 返回 `candidate_not_found`。既有 accepted Candidate 若没有更晚的 Reviewed Handoff，其 Registry row、active 状态、`review_status=accepted` 以及逐字段相等的 content/status import 全部保持不变；若 Literature 产生不同 payload，则它具有不同 Candidate ID，不能借 pending 状态改写或重标记既有 ID。只有后续显式 `rejected|deferred` Decision 形成的合法 withdraw Handoff 才能撤回已导入 Candidate；
 - `promotion_status` 在 V1 始终为 `not_promoted`。
 
 每个 Pointer 必须在 content import 中恰好解析到一个已校验 Evidence snapshot。Knowledge 不因 show 回开 Literature Data Root；这里的可解析性是对 Knowledge 持有的不可变 Reviewed Handoff 证据与 Registry provenance 的验证，不伪称已重新读取 PDF、Canonical Asset 或完整 Reading Result。私有审核备注、reviewer identity、文件路径与未绑定原始内容不得进入 result。

@@ -152,6 +152,36 @@ Knowledge 候选搜索
 注意：该 Candidate 已撤回，不参与 search 或 ask 检索；以下内容仅供历史审计。
 ```
 
+### Redirected success fixture bytes
+
+下列四个 fence 各自是完整 UTF-8 文件 bytes：无 BOM、无 CR，closing fence 前的换行是唯一 final LF。它们只固定本节 exact-output witness 的可复制输入与哈希，不替代未来独立版本化的生产 Reviewed Handoff Schema。Accept Candidate payload/hash、两次 T04 Handoff identity、accept 的 self-contained snapshots、withdraw tombstone、manifest→`candidates.jsonl` 哈希与 revision 关系均须按现有合同复验。
+
+Accept `candidates.jsonl`：
+
+```json
+{"action":"accept","candidate":{"candidate_id":"cand_3a421e895f79e2c167e2ef4b","payload":{"candidate_type":"claim","canonical_content_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","descriptor_refs":[],"schema_version":"gezhi.candidate_payload.v1","source_id":"src_bbbbbbbbbbbbbbbbbbbbbbbb","source_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","statement":{"evidence_pointers":[{"block_id":"block-001","canonical_content_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","schema_version":"gezhi.evidence_pointer.v1"}],"risk_flags":[],"source_terms":["source term"],"support_kind":"direct","text":"示例结论"},"work_id":"wrk_123e4567-e89b-42d3-a456-426614174000"},"payload_sha256":"3a421e895f79e2c167e2ef4b4f42ece44839ca487c11e6659870904f268eabf1","schema_version":"gezhi.candidate_knowledge.v1"},"citation":{"arxiv_id":null,"author_count":1,"doi":null,"primary_authors":["张三"],"source_id":"src_bbbbbbbbbbbbbbbbbbbbbbbb","source_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","title":"示例论文","work_id":"wrk_123e4567-e89b-42d3-a456-426614174000","year":2024},"descriptor_snapshots":[],"evidence_snapshots":[{"excerpt":"Example evidence.","page_index":null,"pointer":{"block_id":"block-001","canonical_content_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","schema_version":"gezhi.evidence_pointer.v1"}}],"review_receipt":{"review_revision":1,"review_status":"accepted","reviewer_kind":"local_human_cli"},"schema_version":"gezhi.reviewed_candidate_action.v1"}
+```
+
+Accept `manifest.json`：
+
+```json
+{"candidates_sha256":"9a9724ea798c15059e06b2bb60aef971ec491af0f43b4a68745b5c0b01e3c507","canonical_content_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","canonical_run_id":"canonical_fixture_001","handoff_id":"hnd_a90bf219d563804b283af452","provenance":{"canonical_run_id":"canonical_fixture_001","semantic_run_id":"semantic_fixture_001"},"record_count":1,"schema_version":"gezhi.reviewed_handoff_manifest.v1","source_id":"src_bbbbbbbbbbbbbbbbbbbbbbbb","source_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","work_id":"wrk_123e4567-e89b-42d3-a456-426614174000"}
+```
+
+Withdraw `candidates.jsonl`：
+
+```json
+{"action":"withdraw","candidate_id":"cand_3a421e895f79e2c167e2ef4b","payload_sha256":"3a421e895f79e2c167e2ef4b4f42ece44839ca487c11e6659870904f268eabf1","review_receipt":{"review_revision":2,"review_status":"rejected","reviewer_kind":"local_human_cli"},"schema_version":"gezhi.reviewed_candidate_action.v1"}
+```
+
+Withdraw `manifest.json`：
+
+```json
+{"candidates_sha256":"0eb7acfdbb5b679171ffa4b898393d2d58fe9300a61f509711b5659dd99f0d9e","canonical_content_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","canonical_run_id":"canonical_fixture_001","handoff_id":"hnd_39cf03ad1f8fd432e3b83a5b","provenance":{"canonical_run_id":"canonical_fixture_001","semantic_run_id":"semantic_fixture_001"},"record_count":1,"schema_version":"gezhi.reviewed_handoff_manifest.v1","source_id":"src_bbbbbbbbbbbbbbbbbbbbbbbb","source_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","work_id":"wrk_123e4567-e89b-42d3-a456-426614174000"}
+```
+
+对应完整文件 SHA-256 固定为：Accept candidates `9a9724ea798c15059e06b2bb60aef971ec491af0f43b4a68745b5c0b01e3c507`、Accept manifest `8f6635fc1f12a442f396c79147c9b454d5237165014b6e4b0039379b0f394930`、Withdraw candidates `0eb7acfdbb5b679171ffa4b898393d2d58fe9300a61f509711b5659dd99f0d9e`、Withdraw manifest `a6c2da28a7e542197222fe646305023178606b1febff6954b3f09f8b9eec5f47`。
+
 ### Redirected success exact-byte witnesses
 
 下列四个 fence 内从首字符到末字符是 redirected stdout 的完整 UTF-8 文本；closing fence 前的换行就是唯一 final LF。四项 stderr 都是 zero bytes、process exit 都是 `0`；stdout 无 BOM、CR、ANSI、console wrapping 或 fence 字符。示例 Candidate 的 `payload_sha256` 是所示 payload 的真实 CanonicalJsonV1 SHA-256，`candidate_id` 与其前 24 位一致。
@@ -250,9 +280,9 @@ Candidate [candidate]:
   年份 [year]: 2024
 内容交接 [content_import]:
   动作 [action]: "accept"
-  candidates.jsonl SHA-256 [candidates_sha256]: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-  Handoff ID [handoff_id]: "handoff_accept_1"
-  manifest.json SHA-256 [manifest_sha256]: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  candidates.jsonl SHA-256 [candidates_sha256]: "9a9724ea798c15059e06b2bb60aef971ec491af0f43b4a68745b5c0b01e3c507"
+  Handoff ID [handoff_id]: "hnd_a90bf219d563804b283af452"
+  manifest.json SHA-256 [manifest_sha256]: "8f6635fc1f12a442f396c79147c9b454d5237165014b6e4b0039379b0f394930"
   审核修订 [review_revision]: 1
 Descriptor 快照 [descriptor_snapshots]: []
 证据快照 [evidence_snapshots]:
@@ -271,9 +301,9 @@ Descriptor 快照 [descriptor_snapshots]: []
 架构版本 [schema_version]: "gezhi.knowledge_show_result.v1"
 当前交接 [status_import]:
   动作 [action]: "accept"
-  candidates.jsonl SHA-256 [candidates_sha256]: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-  Handoff ID [handoff_id]: "handoff_accept_1"
-  manifest.json SHA-256 [manifest_sha256]: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  candidates.jsonl SHA-256 [candidates_sha256]: "9a9724ea798c15059e06b2bb60aef971ec491af0f43b4a68745b5c0b01e3c507"
+  Handoff ID [handoff_id]: "hnd_a90bf219d563804b283af452"
+  manifest.json SHA-256 [manifest_sha256]: "8f6635fc1f12a442f396c79147c9b454d5237165014b6e4b0039379b0f394930"
   审核修订 [review_revision]: 1
 ```
 
@@ -318,9 +348,9 @@ Candidate [candidate]:
   年份 [year]: 2024
 内容交接 [content_import]:
   动作 [action]: "accept"
-  candidates.jsonl SHA-256 [candidates_sha256]: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-  Handoff ID [handoff_id]: "handoff_accept_1"
-  manifest.json SHA-256 [manifest_sha256]: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  candidates.jsonl SHA-256 [candidates_sha256]: "9a9724ea798c15059e06b2bb60aef971ec491af0f43b4a68745b5c0b01e3c507"
+  Handoff ID [handoff_id]: "hnd_a90bf219d563804b283af452"
+  manifest.json SHA-256 [manifest_sha256]: "8f6635fc1f12a442f396c79147c9b454d5237165014b6e4b0039379b0f394930"
   审核修订 [review_revision]: 1
 Descriptor 快照 [descriptor_snapshots]: []
 证据快照 [evidence_snapshots]:
@@ -340,9 +370,9 @@ Descriptor 快照 [descriptor_snapshots]: []
 架构版本 [schema_version]: "gezhi.knowledge_show_result.v1"
 当前交接 [status_import]:
   动作 [action]: "withdraw"
-  candidates.jsonl SHA-256 [candidates_sha256]: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-  Handoff ID [handoff_id]: "handoff_withdraw_2"
-  manifest.json SHA-256 [manifest_sha256]: "9999999999999999999999999999999999999999999999999999999999999999"
+  candidates.jsonl SHA-256 [candidates_sha256]: "0eb7acfdbb5b679171ffa4b898393d2d58fe9300a61f509711b5659dd99f0d9e"
+  Handoff ID [handoff_id]: "hnd_39cf03ad1f8fd432e3b83a5b"
+  manifest.json SHA-256 [manifest_sha256]: "a6c2da28a7e542197222fe646305023178606b1febff6954b3f09f8b9eec5f47"
   审核修订 [review_revision]: 2
 ```
 
@@ -390,7 +420,7 @@ T19 实现至少必须覆盖：
 
 - Query normalization、空/纯符号/单 Han、2000/8192 边界、双路各 128 atom 边界与 FTS syntax injection；
 - 两个 tokenizer 的实际 SQLite probe、每路 48、精确 RRF `k=12`、Candidate ID tie-break、最多 12、单路无 atoms、双路零匹配；
-- accepted/active、rejected/withdrawn 与 deferred/withdrawn 混合数据；从未 accepted 的 pending 不产生 Handoff、不在 Registry 建立状态且 show 为 `candidate_not_found`，既有 active Candidate 的 pending 新审核不改变 show/search；rejected 或 deferred withdraw 后 search 排除，随后 accept 恢复，show withdrawn 仍成功；
+- accepted/active、rejected/withdrawn 与 deferred/withdrawn 混合数据；从未 accepted 的 pending Candidate 不产生 Handoff、不在 Registry 建立状态且 show 为 `candidate_not_found`；既有 active Candidate 在没有后续 Reviewed Handoff 时保持原有 show/search 状态，不同 payload 使用不同 Candidate ID；rejected 或 deferred withdraw 后 search 排除，随后 accept 恢复，show withdrawn 仍成功；
 - search result 只含完整 Candidate/治理/rank，show result 的 Candidate/Citation/Descriptor/Evidence/import 交叉约束；
 - invalid ID、missing ID、unknown Registry generation、缺 FTS、数据库损坏、branch failure、Candidate hash mismatch、import/hash/evidence 缺失与 root identity loss；
 - read-only connection 与副作用断言：Registry logical state、main database pages、immutable imports 与 answer tree 不变且不新增业务文件；已存在 WAL/SHM 中只服务 read snapshot 的 SQLite lock/read-coordination metadata 不算业务 mutation，但不得执行 DML/DDL、checkpoint、migration 或 vacuum；
