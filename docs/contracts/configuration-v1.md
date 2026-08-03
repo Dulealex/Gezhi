@@ -259,7 +259,7 @@ Configuration discovery begins only after a valid leaf grammar selects Human or 
 - raw config values, paths, file contents, environment contents, credentials, and exception text must not be copied into shared diagnostics by this resolver;
 - a command without a complete concrete error contract remains locally blocked on that branch; other commands and JSON happy paths continue.
 
-For `knowledge.ask`, ADR 0094 and Knowledge Ask Diagnostics v1 already map this boundary to the frozen primary diagnostic and gate order. This document changes only the previously open source-specific CLI/environment names.
+For `knowledge.ask`, ADR 0094 and Knowledge Ask Diagnostics v1 already map this boundary to the frozen primary diagnostic and gate order. This document changes only the previously open source-specific CLI/environment names. [Knowledge Read v1](./knowledge-read-v1.md) and [Knowledge Read Diagnostics v1](./knowledge-read-diagnostics-v1.md) now map the same shared resolver and Knowledge-only physical gate for `knowledge.search` and `knowledge.show`; they validate Query/ID first and do not probe Codex or another Context root.
 
 Unsupported TOML generation, unknown fields, invalid types, unreadable files, and final cross-field failure all belong to the configuration boundary. Cross-generation mismatch remains a configuration-boundary forward invariant, but it has no independent V1 witness because V1 supports only one generation. This shared resolver need not expose internal subtypes publicly; a command contract may present only its approved stable diagnostic.
 
