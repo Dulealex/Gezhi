@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gezhi.local/schemas/doctor-result-v1.schema.json",
+  "title": "DoctorReportV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "overall_status", "checks"],
+  "properties": {
+    "schema_version": {"const": "gezhi.doctor_result.v1"},
+    "overall_status": {"enum": ["ready", "blocked", "failed"]},
+    "checks": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "prefixItems": [
+        {"$ref": "#/$defs/configurationCheck"},
+        {"$ref": "#/$defs/corePythonCheck"},
+        {"$ref": "#/$defs/coreDependenciesCheck"},
+        {"$ref": "#/$defs/literatureRootCheck"},
+        {"$ref": "#/$defs/knowledgeRootCheck"},
+        {"$ref": "#/$defs/ocrCheck"},
+        {"$ref": "#/$defs/codexCheck"}
+      ],
+      "items": false
+    }
+  },
+  "$defs": {
+    "regularStatus": {"enum": ["ready", "blocked", "failed"]},
+    "rootStatus": {"enum": ["ready", "blocked", "failed", "not_checked"]},
+    "configurationCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status"],
+      "properties": {
+        "id": {"const": "configuration"},
+        "status": {"$ref": "#/$defs/regularStatus"}
+      }
+    },
+    "corePythonCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status"],
+      "properties": {
+        "id": {"const": "core_python"},
+        "status": {"$ref": "#/$defs/regularStatus"}
+      }
+    },
+    "coreDependenciesCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status"],
+      "properties": {
+        "id": {"const": "core_dependencies"},
+        "status": {"$ref": "#/$defs/regularStatus"}
+      }
+    },
+    "literatureRootCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status"],
+      "properties": {
+        "id": {"const": "literature_data_root"},
+        "status": {"$ref": "#/$defs/rootStatus"}
+      }
+    },
+    "knowledgeRootCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status"],
+      "properties": {
+        "id": {"const": "knowledge_data_root"},
+        "status": {"$ref": "#/$defs/rootStatus"}
+      }
+    },
+    "ocrCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status"],
+      "properties": {
+        "id": {"const": "ocr_runtime"},
+        "status": {"$ref": "#/$defs/regularStatus"}
+      }
+    },
+    "codexCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status"],
+      "properties": {
+        "id": {"const": "codex_runtime"},
+        "status": {"$ref": "#/$defs/regularStatus"}
+      }
+    }
+  }
+}
