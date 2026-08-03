@@ -1,5 +1,7 @@
 # 冻结未提交 knowledge.ask 的 blocked 主诊断
 
+> Supersession note: [ADR 0117](./0117-freeze-context-scoped-data-root-cli-overrides.md) 只替换本文尚待 source-specific contract 冻结的 provisional `--data-root` / `--timeout` token witnesses：V1 的规范 root options 是 `--literature-data-root` / `--knowledge-data-root`，而 `--data-root` / `--timeout` 均为 parser-unknown。本文保留为历史决策记录；其 Question → Configuration gate 顺序、cause、diagnostic、exit 与其余边界不受替换。
+
 本次新 Answer 的 final checkpoint 已通过、Root trust 仍成立且 expected target 不存在时，non-replacing same-volume directory rename 返回非 target-conflict 失败；随后又能证明 staging 仍未提交、target 不是本次 commit、全部操作已安全停止，才使用 `{"code":"knowledge.ask.answer_commit_failed.v1","context":{}}` 返回 no-commit `failed`、`result=null` 与正常 JSON exit `1`。不得自动重试；包含完整 terminal manifest 的 staging 原地保留，只能由后续 orphan recovery 独立复验后补交。Target-exists 使用 `answer_target_conflict`，root trust loss 使用 `data_root_integrity_lost`。若无法证明 rename 是否已提交，不得声称 `result=null` 或使用本码，路径位于正常 JSON 矩阵外。
 
 本次新 Answer 的 expected `answers/<answer_id>/` target 在最终 checkpoint 已存在，或 non-replacing directory rename 明确报告 target-exists，且 Root trust 仍成立时，唯一 primary 为 `{"code":"knowledge.ask.answer_target_conflict.v1","context":{}}`，配 no-commit `failed`、`result=null` 与正常 JSON exit `1`。不得覆盖、合并、删除、比较后复用既有 target，也不得生成替代 `answer_id` 自动重试；本次 staging 原地隔离。既有 target 即使完整有效且内容相同，也不能冒充本次 commit。历史 orphan candidate 的 target conflict 仍只作 supplemental；root trust loss 由 `data_root_integrity_lost` 优先，其他 rename failure 另行分类。

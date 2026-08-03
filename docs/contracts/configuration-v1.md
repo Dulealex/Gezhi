@@ -4,10 +4,11 @@
 
 This document freezes the concrete source names and resolution behavior of `gezhi.config.v1` for [Parent Spec #1](https://github.com/Dulealex/Gezhi/issues/1) and [T02 / Issue #3](https://github.com/Dulealex/Gezhi/issues/3). It is consumed only after [Gezhi CLI Command Contract v1](./cli-command-v1.md) has recognized a valid daily command.
 
-The contract refines, without reopening:
+The contract refines the following authorities without reopening their unaffected decisions:
 
 - [ADR 0001](../adr/0001-isolate-core-and-ocr-runtimes.md), [ADR 0003](../adr/0003-use-codex-cli-as-the-only-semantic-provider.md), [ADR 0004](../adr/0004-pin-codex-cli-in-the-project.md), and [ADR 0007](../adr/0007-isolate-codex-development-and-runtime-planes.md);
 - [ADR 0029](../adr/0029-use-versioned-toml-and-environment-only-secrets.md), which owns versioned TOML, closed fields, source precedence, and Data Root isolation;
+- [ADR 0117](../adr/0117-freeze-context-scoped-data-root-cli-overrides.md), the explicit replacing decision that supersedes only ADR 0094's provisional CLI token witnesses and leaves Question-before-Configuration ordering intact;
 - [Environment Contract](../environment-contract.md), which owns the frozen uv, Python, OCR, Codex, model, and build-tool baseline;
 - the command-specific outcome and diagnostic contracts, including [Knowledge Ask Diagnostics v1](./knowledge-ask-diagnostics-v1.md).
 
@@ -118,7 +119,7 @@ The resolver reads the actual invocation environment once. It does not load `.en
 
 ### 4.3 CLI rules
 
-The CLI source contains only recognized root options after grammar succeeds. Missing option operands, duplicate options, late root options, and unknown options are CLI argument failures, not configuration failures. A supplied empty-string operand is a present raw configuration value and reaches final validation.
+The CLI source contains only the two ADR 0117 root-scoped options after grammar succeeds. Missing option operands, duplicate options, late root options, and unknown options are CLI argument failures, not configuration failures. A supplied empty-string operand is a present raw configuration value and reaches final validation. Generic `--data-root` and role-policy `--timeout` are parser-unknown and never become Configuration source fields.
 
 CLI and environment cannot set `config_version`. Attempts through unknown tokens or unknown `GEZHI_*` names fail in their respective parser/configuration boundary rather than being ignored.
 
@@ -130,13 +131,15 @@ The resolver examines active sources in the priority order from Section 4. It st
 
 1. source availability/readability and TOML syntax/root-object structure, where applicable;
 2. `config_version` presence, strict type, and grammar for active TOML;
-3. supported generation and active TOML generation compatibility;
-4. unknown field/table/leaf rejection;
-5. strict supplied-leaf type validation.
+3. whether that grammar-valid generation is supported by the current program; an unsupported generation selects configuration incompatibility and stops before its fields are interpreted;
+4. unknown field/table/leaf rejection for a supported generation;
+5. strict supplied-leaf type validation for a supported generation.
 
 CLI and environment are unversioned current-generation partial patches. Their unknown-name and supplied-value checks occur in the equivalent positions. The built-in source is a program invariant; inability to prove its complete valid shape is an implementation failure, not user configuration invalidity.
 
 Every active source must be valid even when all of its leaves lose to a higher-priority source. Therefore a valid CLI override does not mask an unknown local key, a malformed default file, or an unsupported TOML generation.
+
+Only after every active source passes its own grammar/support/field validation may a resolver evaluate the cross-source invariant that active TOML generations are equal. In the current V1 executable contract this predicate is not independently reachable: the only supported generation is `gezhi.config.v1`, so every source that reaches the cross-source point already has that generation. Cross-generation mismatch remains a forward invariant for a future contract that explicitly supports more than one generation; it is not a V1 executable classification row and cannot compete with the first unsupported source.
 
 ### 5.2 Leafwise merge
 
@@ -216,6 +219,8 @@ A Data Root is never created automatically. Missing, inaccessible, non-directory
 | Codex credentials | Codex CLI credential store and live login state | none | none |
 | Native Ctrl+C bridge build baseline | frozen MSVC/SDK metadata in the Environment Contract | none | none |
 
+For entry classification, the [CLI Command Contract v1](./cli-command-v1.md) defines one closed bootstrap-essential subset of the Core baseline: the live CPython `3.11.15` identity plus the Typer `0.27.0` and Rich `15.0.0` top-level module/distribution facts. That stdlib-only probe is not configuration and does not import those packages. Every other root runtime package is Context-only and must stay outside the static routing graph import closure until a valid command selects the owning handled adapter; no dependency has both classifications.
+
 Model name, reasoning effort, Codex version/path, provider, role limits, attempt count, timeout, retry/backoff, retrieval limit, capture cap, schema path, prompt path, OCR device, OCR model source, and model cache are not `gezhi.config.v1` fields. A TOML or `GEZHI_*` attempt to set one is unknown configuration; a CLI attempt is an unknown option.
 
 `tools\uv.ps1` and `tools\codex.ps1` are installation/acceptance and human project tools, not hidden runtime configuration sources. Daily commands do not invoke `uv`, `npm ci`, PowerShell wrappers, global Codex, the desktop-app Codex, Ollama, Docker, Conda, or WSL as a fallback.
@@ -227,15 +232,17 @@ Model name, reasoning effort, Codex version/path, provider, role limits, attempt
 | Required `config\default.toml` | handled configuration gate | selected command mode; command-specific configuration-invalid result | meta help/version and raw preflight |
 | Optional `config\local.toml` | source discovery | skip only this source | all work |
 | Consumed Data Root directory | Context Data Root gate | block/fail exactly as the command contract states; never create it | commands that do not consume that root |
-| Bootstrap-essential Core package such as Typer/Rich | pre-parser bootstrap | CLI contract fixed bootstrap receipt; no JSON envelope and no auto-repair | raw preflight and external frozen-environment repair procedure |
-| Context-only Core dependency | consuming Context adapter | handled capability/operation failure defined by that command; no install | unrelated Context commands |
+| Windows launcher, CPython startup, `site`, entry stub, or project target resolution before `gezhi.bootstrap:main` starts | pre-bootstrap OS/runtime | no Gezhi receipt, envelope, fixed stderr, or application exit guarantee | none; repair is external |
+| Post-preflight bootstrap-essential fact is explicitly absent or mismatched | CLI typed prerequisite probe | only explicit `ESSENTIAL_UNAVAILABLE` receives the fixed bootstrap receipt; no JSON and no auto-repair | raw preflight and external frozen-environment repair procedure |
+| Typer/Rich actual import, graph descriptor provider, validator, factory, or construction directly throws after its typed checks | unexpected entry fault | exception is not relabeled as a bootstrap receipt or handled result | frozen environment remains unchanged |
+| Context-only Core dependency outside Typer/Rich | selected consuming Context adapter, after valid command selection | command-owned handled capability/operation failure only when that command contract defines it; never a global bootstrap receipt and never install | meta/parser paths and unrelated Context commands |
 | OCR Python, package, CUDA, config, or local model | Literature OCR stage | block that OCR-consuming stage; no CPU/online/other-OCR fallback | completed deterministic stages and non-OCR commands |
 | Project Codex package, native executable, lock identity, supported version, or login | first Codex-consuming semantic launch gate | block the semantic stage before launch; no global/desktop/WSL/provider fallback | deterministic commands and semantic branches that do not need a launch |
 | Online service rejects the frozen Codex version | Codex-consuming semantic gate | block and require a separate approved dependency window; never auto-upgrade | non-Codex work |
 | npm or user-level uv during daily operation | not a runtime prerequisite once environments are installed | do not invoke or install | already runnable frozen environments |
 | MSVC build-only tools | bridge build/test only | block bridge build/test; never install or upgrade during an implementation ticket | Python/OCR/Codex work not building the bridge |
 
-The public `doctor` command reports the frozen environment read-only when enough Core bootstrap exists to run it; it never repairs anything. If the Python executable or a bootstrap-essential package is broken so early that `doctor` cannot be constructed, the bootstrap receipt is the only Gezhi CLI result and repair remains an explicit external environment operation.
+The public `doctor` command reports the frozen environment read-only when enough Core bootstrap exists to run it; it never repairs anything. If Windows or CPython fails before `gezhi.bootstrap:main` starts, there is no Gezhi CLI receipt at all. Once `main` has started and raw preflight has passed, only the closed typed probe's explicit `ESSENTIAL_UNAVAILABLE` verdict produces the fixed bootstrap receipt. An actual Typer/Rich import or graph implementation exception after a ready/valid verdict is not relabeled; repair remains an explicit external environment operation in every case.
 
 A semantic command must resolve capability only at its approved consumption gate. For example, deterministic zero-result Knowledge handling must not probe or launch Codex merely because Codex exists in the project, and a Literature command must not initialize OCR before reaching an OCR stage.
 
@@ -251,7 +258,7 @@ Configuration discovery begins only after a valid leaf grammar selects Human or 
 
 For `knowledge.ask`, ADR 0094 and Knowledge Ask Diagnostics v1 already map this boundary to the frozen primary diagnostic and gate order. This document changes only the previously open source-specific CLI/environment names.
 
-Unsupported TOML generation, mismatched active TOML generations, unknown fields, invalid types, unreadable files, and final cross-field failure all belong to the configuration boundary. This shared resolver need not expose their internal subtype publicly; a command contract may present only its approved stable diagnostic.
+Unsupported TOML generation, unknown fields, invalid types, unreadable files, and final cross-field failure all belong to the configuration boundary. Cross-generation mismatch remains a configuration-boundary forward invariant, but it has no independent V1 witness because V1 supports only one generation. This shared resolver need not expose internal subtypes publicly; a command contract may present only its approved stable diagnostic.
 
 ## 9. Executable acceptance matrices
 
@@ -281,8 +288,9 @@ Unsupported TOML generation, mismatched active TOML generations, unknown fields,
 | active TOML omits `config_version` | configuration invalid |
 | `config_version=1` | configuration invalid type |
 | `gezhi.config.v0`, `gezhi.config.v01`, uppercase, whitespace, or suffix text | configuration invalid grammar |
-| grammar-valid `gezhi.config.v2` | unsupported generation |
-| active default/local generations differ | incompatible generations |
+| grammar-valid `gezhi.config.v2` | unsupported generation; configuration incompatible at that source and stop |
+| local declares `gezhi.config.v2`, default declares V1 | local is the first unsupported source; configuration incompatible and default is not examined |
+| local declares V1, default declares `gezhi.config.v2` | local passes; default is unsupported; configuration incompatible at default |
 | `[literature] data_root=1` | configuration invalid type |
 | `[literature] data_root=""` | source valid, final configuration invalid |
 | `[literature] extra="x"` | unknown field |
@@ -324,7 +332,13 @@ Unsupported TOML generation, mismatched active TOML generations, unknown fields,
 | `knowledge ask` has no citable candidates and its contract chooses deterministic insufficiency | Codex absent | no Codex launch merely to report zero evidence |
 | `knowledge ask` requires synthesis | Codex absent/drifted/not logged in | semantic launch gate blocks; no fallback |
 | any valid leaf | default TOML malformed | selected handled mode receives configuration failure before Data Root/capability probe |
-| help/version | any config/runtime missing | metadata succeeds if bootstrap itself is available |
+| help/version | any configuration or Context-only runtime missing | metadata succeeds if the closed bootstrap-essential probe is ready and graph descriptor is valid |
+| launcher/CPython startup before `bootstrap.main` | startup unavailable | no Gezhi receipt is asserted |
+| any valid-looking suffix after preflight | typed probe returns `ESSENTIAL_UNAVAILABLE` | fixed bootstrap receipt; no config or Context probe |
+| any suffix after typed ready/valid verdicts | Typer/Rich import or graph implementation directly throws | no fixed bootstrap receipt; exception is not relabeled |
+| valid selected leaf | Context-only Core dependency absent | only its owning command branch is affected; meta/parser and unrelated commands do not import it |
+
+There is deliberately no V1 executable row for “active supported TOML generations differ”: with only `gezhi.config.v1` supported, the first non-V1 document has already selected unsupported-generation incompatibility and stopped. A future multi-generation resolver must add its own witness and priority contract before the forward mismatch invariant becomes executable.
 
 Tests use fixed source mappings and temporary trusted project roots for resolution logic, then isolated Windows subprocesses for public CLI mode and missing-capability boundaries. Tests must not install, sync, update, authenticate, download, create Data Roots, or mutate the production configuration.
 
@@ -334,9 +348,10 @@ Tests use fixed source mappings and temporary trusted project roots for resoluti
 |---|---|
 | Spec stories 7, 9, 10, 19, 20 | read-only checks, scoped capability blocking, no dependency/model fallback |
 | Spec implementation decisions | two Context roots, versioned TOML, unknown rejection, environment-only credentials, fixed providers |
-| T02 acceptance | canonical key/source names, priority, missing behavior, unknown fields, parser versus handled boundary |
-| ADR 0029 | exact concrete CLI/env names and existing leafwise/source validation semantics |
-| Environment Contract | Core/OCR/Codex identities remain deployment capability rather than user settings |
-| ADR 0094 | Knowledge Ask configuration and Data Root gate ordering remains unchanged |
+| T02 acceptance | canonical key/source names, source-priority first-error behavior, missing behavior, unknown fields, parser versus handled boundary, and pre-main versus typed-bootstrap distinction |
+| ADR 0029 | existing leafwise/source validation and Data Root semantics remain authoritative; this contract supplies concrete names |
+| ADR 0117 | exact root-scoped CLI names replace only ADR 0094's provisional token witnesses; `--data-root`/`--timeout` are parser-unknown |
+| Environment Contract | Core/OCR/Codex identities remain deployment capability rather than user settings; only CPython plus Typer/Rich facts are bootstrap-essential |
+| ADR 0094 | Knowledge Ask Question-before-Configuration and Data Root ordering remain unchanged apart from ADR 0117's explicitly replaced token witnesses |
 
 Adding a configuration leaf, accepting another `GEZHI_*` name, introducing `--config`, changing a source location or priority, making project/runtime/model policy configurable, auto-creating a Data Root, or allowing an unknown field changes `gezhi.config.v1` and requires a new configuration generation or an explicit replacing decision. Changing only a frozen runtime version follows the Environment Contract dependency-window process and does not silently alter this schema.
