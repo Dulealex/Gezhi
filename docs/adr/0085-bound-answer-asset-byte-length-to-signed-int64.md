@@ -6,4 +6,4 @@
 
 `0..9223372036854775807` 只是所有 asset item 的通用表示域，不是单文件读取预算、`assets` 合计 quota 或整个 Answer 的容量承诺。任何已冻结或以后随版本冻结的路径专属较小 byte cap 都与该范围取交集，并由较小上限优先；尤其 `attempts/NN/events.jsonl` 的 `0..16777216` 与 `attempts/NN/final_message.txt` 的 `0..1048576` 不被本决策扩宽，既有包含端点、`cap + 1` witness、exact-prefix retention、usage 与终态分类语义全部不变。
 
-`manifest.json` 不列入 `assets`，因此没有自身的 `byte_length` item；ADR 0084 对 manifest 完整 raw bytes 的 `65_536` cap 与本字段范围彼此独立。以后改变 `byte_length` 的类型、上下界或包含边界必须演进 Answer manifest Schema。有界 parser profile 已由 ADR 0086 冻结，direct exclusive-create leaf formation 已由 ADR 0087 冻结，V1 不承诺断电 durability 的边界已由 ADR 0088 冻结；本决策仍不冻结尚无路径专属 cap 的资产读取额度或外部诊断，不增加 manifest 字段、asset、sidecar、配置项、错误码或第三方依赖。
+`manifest.json` 不列入 `assets`，因此没有自身的 `byte_length` item；ADR 0084 对 manifest 完整 raw bytes 的 `65_536` cap 与本字段范围彼此独立。以后改变 `byte_length` 的类型、上下界或包含边界必须演进 Answer manifest Schema。有界 parser profile 已由 ADR 0086 冻结，direct exclusive-create leaf formation 已由 ADR 0087 冻结，V1 不承诺断电 durability 的边界已由 ADR 0088 冻结；Answer 资产逐路径与整目录读取额度已由 [Answer Terminal v1](../contracts/answer-terminal-v1.md) 冻结，外部诊断仍由其所属命令合同决定。本决策不增加 manifest 字段、asset、sidecar、配置项、错误码或第三方依赖。

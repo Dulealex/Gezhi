@@ -116,13 +116,13 @@ Manifest metadata、`GetFileSizeEx`、目录项 size、一次短 read 或已知 
 
 ## `publish_current` 的唯一高层发布行为
 
-`publish_current` 是当前 writer 发布本次新 Answer 的唯一 seam。Caller 只能移交上述 `owned_terminal_candidate`，不能要求“只验证”“只写 manifest”“跳过 readback”“直接 rename”或把内部 checkpoint 拆成可单独调用的浅 interface。Module 取得该单次能力后独占并串行完成：
+`publish_current` 是当前 writer 发布本次新 Answer 的唯一 seam。Caller 只能移交上述 `owned_terminal_candidate`，不能要求“只验证”“只写 manifest”“跳过 readback”“直接 rename”或把内部 checkpoint 拆成可单独调用的浅 interface。Module 一旦接受调用并取得该单次能力，能力立即从 caller 永久消费并失效；成功、前置条件失败、确定 no-commit、target conflict、uncertain observation、异常或任何其他退出都不得返还、重建或再次使用它。Module 随后独占并串行完成：
 
 1. 确认能力仍属于本 invocation、当前线程仍 depth-one 持有与 frozen root identity 绑定的 writer ownership，expected target 与 active staging identity 未漂移，全部最终非 manifest 资产已经形成、验证、关闭且私有 entry 已撤销。
 2. 恰好一次形成 immutable canonical manifest buffer，先执行 manifest 实际 raw length cap，再从该实际长度开始对全部最终 asset 实际 raw byte length checked-add 并执行 aggregate cap；失败不得形成 manifest leaf。
 3. 对字面 `manifest.json` 恰好一次 direct exclusive-create，把同一 buffer 完整 write / completion / close；随后由共享 terminal validator 对最终 leaf、整个 staging 与同一 buffer identity 完成 writer readback。不得二次序列化、另建 manifest、重开写入、修补或跳过 readback。
 4. 关闭 root anchor 以外的 operation-specific handles，紧邻 publish 重新证明 root identity / canonical path、staging 与 target 两条父链 no-reparse、same-volume、expected target absent 以及 current staging identity。
-5. 对当前 staging 到 expected target 恰好尝试一次 non-replacing same-volume directory rename。只有明确成功 observation 才消费能力并返回本 invocation 可用的等价 committed proof；该 proof 绑定前述完整 staging validation、紧邻 checkpoint 与本次明确成功 rename，不能被保存给后续 invocation，也不要求当前 invocation 立即从 target 再做一次全量读取。
+5. 对当前 staging 到 expected target 恰好尝试一次 non-replacing same-volume directory rename。只有明确成功 observation 才返回本 invocation 可用的等价 committed proof；无论 observation 如何，能力都已在 seam 接受调用时永久失效。该 proof 绑定前述完整 staging validation、紧邻 checkpoint 与本次明确成功 rename，不能被保存给后续 invocation，也不要求当前 invocation 立即从 target 再做一次全量读取。
 
 失败与不确定结果继续由既有边界拥有，`publish_current` 不增加 Schema、diagnostic、outcome、receipt 字段或公开异常文本：
 
@@ -243,6 +243,7 @@ Target 的存在性判断使用字面 expected path 与安全 namespace 规则�
 - 双件矩阵每个 cell 至少一个测试；无 ownership 时 staging 只能 staged，持锁后才可 orphan/quarantine。
 - 有效 orphan 的 rename 明确成功、target-exists、其他确定失败与 uncertain completion 四分支全部覆盖。
 - `publish_current` 必须从不可伪造且单次使用的 current-writer capability 覆盖完整 manifest/readback/checkpoint/rename 生命周期，并分别验证明确成功、target conflict、其他可证明 no-commit failure 与 uncertain completion；caller 不能逐步调用、跳过门禁或从返回字段伪造 committed proof。
+- `publish_current` 一旦接受 capability，明确成功、所有确定失败、target conflict、uncertain completion 与异常退出都必须永久消费它；只有明确成功返回等价 committed proof，任何其他路径都不得返还可重试能力。
 - 当前 active staging 传入 `inspect_orphan` / `complete_orphan` 必须拒绝；当前 invocation 在明确 commit 前 crash 后，下一 invocation 必须丢弃全部旧能力与证据，从重新取得 ownership、`inspect_orphan` 全量复验开始。
 - 验证明确定 rename 的同一持锁 invocation 可复用紧邻 rename 的完整 staging evidence 作为等价 committed proof，无需立即重复全量读取；后续独立 invocation 不得复用旧证据，必须 `read_committed`。
 - 验证 failure、cap overflow、坏 target 与 target conflict 不得被解释为 succeeded，不得返回 partial Answer 或 non-null Ask receipt。
