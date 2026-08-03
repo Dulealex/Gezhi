@@ -1385,7 +1385,7 @@ Final spool 使用前文冻结的 fresh、唯一私有路径。活跃期只做 b
 
 每个 Codex attempt 必须按 ADR 0106 建立唯一启动计划：项目 resolver 已证明的绝对 native Codex CLI root 使用 suspended/no-window/extended-startup/Unicode-environment flags 与三项 stdio handle allowlist 直接创建，加入该 attempt 独占、non-breakaway、`KILL_ON_JOB_CLOSE` 的 Windows Job Object，父进程关闭 child-side duplicates，并且只有 `ResumeThread` 精确返回 previous suspend count `1` 才承认 provider 已开始。所有 stop facts 只交给唯一编排器；确认任一 overflow 时，若整个 Job 尚未证明为空就请求终止整个 Job，若 root 已 signaled 且 Job active-process count 为零则不请求。Root 退出或终止 API 返回成功都不单独证明 Job 静止；自然退出/调用竞态以最终 root signaled 加 Job active-process count 为零收敛。调用失败但随后证明 Job 已空不单独决定分类。
 
-Stop request 后 Job teardown 与 mechanical drain 并行：父进程停止写入并关闭 stdin-write，stdout collector 从运行期持续读到 EOF；stderr 已预先导向 `NUL`，不存在 stderr pipe 或 drain branch。Drain 不执行 semantic parse、validation、retry 或新模型调用。只有 Job 已空、stdout EOF、final 关闭后复验、双 sink 安全关闭/读取/哈希/成对安装、spool/tail/私有临时文件撤销，以及 stdin writer、stdout collector 与全部 monitor join 完成且不可能再产生 latch，才能到达 capture-finalization boundary；任何条件无法证明时只留 staging。边界成立后对两个不可逆 latch 做 OR，任一为 true 就固定 `failure_class=process_error`，压过所有 timeout/interrupt/provider/runtime/exit/lifecycle 事实且不重试；随后按 ADR 0081 从已复验正式 events 长度冻结 usage，并以 `failed: codex_process_failed`、`stage=synthesis` 终结 Answer。终止 API 调用失败但最终 Job 已空且边界成立不改变该映射；调用成功但边界无法证明仍只留 staging。`TerminateJobObject` 内部退出 DWORD 与外部诊断继续待定。
+Stop request 后 Job teardown 与 mechanical drain 并行：父进程停止写入并关闭 stdin-write，stdout collector 从运行期持续读到 EOF；stderr 已预先导向 `NUL`，不存在 stderr pipe 或 drain branch。Drain 不执行 semantic parse、validation、retry 或新模型调用。只有 Job 已空、stdout EOF、final 关闭后复验、双 sink 安全关闭/读取/哈希/成对安装、spool/tail/私有临时文件撤销，以及 stdin writer、stdout collector 与全部 monitor join 完成且不可能再产生 latch，才能到达 capture-finalization boundary；任何条件无法证明时只留 staging。边界成立后对两个不可逆 latch 做 OR，任一为 true 就固定 `failure_class=process_error`，压过所有 timeout/interrupt/provider/runtime/exit/lifecycle 事实且不重试；随后按 ADR 0081 从已复验正式 events 长度冻结 usage，并以 `failed: codex_process_failed`、`stage=synthesis` 终结 Answer。终止 API 调用失败但最终 Job 已空且边界成立不改变该映射；调用成功但边界无法证明仍只留 staging。[Codex Child Process v1](./codex-child-process-v1.md) 已冻结内部 Job stop DWORD 为 `0x475A0001`；外部 capture-overflow supplemental diagnostic 仍待定。
 
 ### Attempt 捕获的严格 UTF-8 语义门禁
 
@@ -1412,7 +1412,7 @@ Framing 或任一 record 失败在两个 capture 已安全关闭、读取、哈�
 
 零 Candidate 的确定性成功固定为 `attempts=[]`，非零 Candidate 成功必须有 1–3 项。一次或两次允许的瞬时失败后成功时，数组按实际创建顺序含 2 或 3 项；在 backoff 中中断只保留已完成项。瞬时耗尽通常有 3 项，但 95-minute window 若更早终止，只能保留实际 commitment 的 1–3 项，不得补造。Confirmed overflow 终态必须有 1–3 项，overflow `process_error` item 是最后一项且之后没有 backoff、retry 或新 commitment；它之前只能有已经合法触发 retry 的瞬时失败项。`interrupted` 可有 0–3 项；受控中断发生在 commitment 与 OS 返回之间时仍包含当前 item。完整 terminal manifest 形成前的进程崩溃只有未完成 staging，恢复器不得根据残留目录猜测或补写 attempts；若字面 manifest 已存在，其完整性仍只由共享 reader 与恢复合同裁决。
 
-完整合法组合最终必须联合 `status`、`error.code`、Candidate 数量、每个 attempt item、根级资产矩阵与固定双文件集合验证；不得仅凭数组长度反推终态。每个 item 的封闭字段、时间、exit/failure 与 usage 规则由下一节冻结，跨 item 的 usage totals 已由前文冻结；双文件的 retention 保证范围由 ADR 0076 冻结，逐文件 cap 与包含边界由 ADR 0077 冻结，overflow 的 exact-prefix retention 由 ADR 0078 冻结，witness、Job stop 与 mechanical drain 由 ADR 0079 冻结，分类、优先级、不重试与顶层映射由 ADR 0080 冻结，正式 events 的 usage 长度门禁由 ADR 0081 冻结；`TerminateJobObject` 内部退出 DWORD 与外部诊断继续后续冻结。
+完整合法组合最终必须联合 `status`、`error.code`、Candidate 数量、每个 attempt item、根级资产矩阵与固定双文件集合验证；不得仅凭数组长度反推终态。每个 item 的封闭字段、时间、exit/failure 与 usage 规则由下一节冻结，跨 item 的 usage totals 已由前文冻结；双文件的 retention 保证范围由 ADR 0076 冻结，逐文件 cap 与包含边界由 ADR 0077 冻结，overflow 的 exact-prefix retention 由 ADR 0078 冻结，witness、Job stop 与 mechanical drain 由 ADR 0079 冻结，分类、优先级、不重试与顶层映射由 ADR 0080 冻结，正式 events 的 usage 长度门禁由 ADR 0081 冻结；[Codex Child Process v1](./codex-child-process-v1.md) 已冻结内部 Job stop DWORD 为 `0x475A0001`；外部 capture-overflow supplemental diagnostic 继续后续冻结。
 
 ## Attempt 十字段记录
 
@@ -1487,4 +1487,4 @@ Item 十字段一经冻结，后续 user interrupt、deadline、validation、ren
 
 ## 尚待冻结
 
-- `knowledge.ask --json` 的 supplemental code/context union、Human 中文文案/exit、其余 parser/bootstrap/internal/argument exit、ADR 0108 排除的 JSON failure 与其他 Human presentation failure exit；尚无路径专属 cap 的 Answer 资产读取额度；根级纯文本/Schema 快照的精确 media identity，`TerminateJobObject` 内部退出 DWORD 与 capture overflow 专属 supplemental diagnostic，`retrieval_view_too_large` 诊断的精确 audit 字段与其规范序列化，以及孤立 staging 的显式维护。
+- `knowledge.ask --json` 的 supplemental code/context union、Human 中文文案/exit、其余 parser/bootstrap/internal/argument exit、ADR 0108 排除的 JSON failure 与其他 Human presentation failure exit；尚无路径专属 cap 的 Answer 资产读取额度；根级纯文本/Schema 快照的精确 media identity，capture overflow 专属 supplemental diagnostic，`retrieval_view_too_large` 诊断的精确 audit 字段与其规范序列化，以及孤立 staging 的显式维护；内部 Job stop DWORD 已由 [Codex Child Process v1](./codex-child-process-v1.md) 冻结为 `0x475A0001`。
