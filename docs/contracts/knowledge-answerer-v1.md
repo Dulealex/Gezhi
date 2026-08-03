@@ -100,6 +100,8 @@ Orchestrator-owned Codex attempt root 的 console/process-group、stdio/handle �
 
 Python 只从 Candidate Registry 中 `intake_status=active` 的 Candidate Knowledge 生成一次不可变 Retrieval View。每个问题最多选择 12 条 Candidate；选择与排序必须完全由 SQLite/Python 确定，Codex 不参与召回、过滤、重排或补充检索。零条 Candidate 时直接返回 `insufficient_evidence`，不创建 Codex attempt。
 
+普通 `knowledge search` 复用相同的私有 deterministic selector，但只返回 [Knowledge Read v1](./knowledge-read-v1.md) 的 Candidate Search Result；它不创建或缓存 Retrieval View/Ranking Audit。`knowledge ask` 必须从本次 Question 与本次 Registry snapshot 重新选择和物化，不能消费先前 search/show 输出。
+
 Retrieval View 只携带回答和引用所需的信息：
 
 - 固定的 rank，以及 `candidate_id`、`payload_sha256` 和 Candidate 类型；

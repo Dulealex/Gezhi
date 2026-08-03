@@ -20,6 +20,14 @@ _Avoid_: Review Status, Promotion Status
 由较新的审核决定使既有 Candidate 停止参与检索、但不删除其导入历史和证据的动作。
 _Avoid_: Delete, Demotion
 
+**Candidate Search Result**:
+为一次搜索返回的、按当前治理资格排序且保留 Candidate 内容身份与 Evidence Pointer 的发现结果；它不包含证据摘录，也不授予 Candidate 长期知识地位。
+_Avoid_: Retrieval View, Search Index, Promoted Knowledge
+
+**Candidate Detail**:
+一个 Candidate 的内容、来源证据、交接 provenance 与当前治理状态的只读审计视图；withdrawn Candidate 仍可有 Detail。
+_Avoid_: Promoted Knowledge, Retrieval View, Mutable Record
+
 **Retrieval View**:
 为一次查询确定性选择、过滤和排序合规 Candidate Knowledge 的可重建视图。
 _Avoid_: Source of Truth, Vector Store
