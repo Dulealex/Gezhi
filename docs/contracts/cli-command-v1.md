@@ -4,7 +4,7 @@
 
 This document freezes `GezhiCliGrammarV1`, the public Windows command grammar shared by the eight V1 daily commands. It is the executable contract for [Parent Spec #1](https://github.com/Dulealex/Gezhi/issues/1) and [T02 / Issue #3](https://github.com/Dulealex/Gezhi/issues/3).
 
-The following sources remain authoritative except where the two explicitly scoped replacing decisions below say otherwise:
+The following sources remain authoritative except where the three explicitly scoped replacing decisions below say otherwise:
 
 - [ADR 0023](../adr/0023-ship-one-windows-cli-before-any-gui.md): one Windows CLI, Human and JSON presentation.
 - [ADR 0024](../adr/0024-limit-the-daily-cli-to-eight-commands.md): the eight-command public surface without premature concrete result bindings.
@@ -13,6 +13,7 @@ The following sources remain authoritative except where the two explicitly scope
 - [ADR 0110](../adr/0110-run-a-decoded-argv-resource-preflight-before-typer.md) through [ADR 0116](../adr/0116-return-2-with-one-fixed-stderr-line-for-raw-argv-resource-violation.md): bootstrap, immutable argv, completion shutdown, resource ceilings, and the fixed resource-failure presenter.
 - [ADR 0117](../adr/0117-freeze-context-scoped-data-root-cli-overrides.md): the two Context-scoped root override tokens; it supersedes only ADR 0094's provisional CLI token witnesses.
 - [ADR 0118](../adr/0118-limit-v1-candidate-review-to-one-candidate-and-action.md): one Candidate plus one action in V1; it supersedes only ADR 0008's public-batch permission and leaves ADR 0019 append-only semantics intact.
+- [ADR 0119](../adr/0119-lazy-load-only-the-selected-context-command-adapter.md): the inert full routing grammar/graph and selected-adapter late-load boundary; it supersedes only ADR 0111/0112's eager all-Context-adapter/`open_gezhi()` requirement on every preflight-PASS path.
 
 This contract owns public token spelling, arity, option placement, defaults, mutual exclusion, route-to-owning-module selection, launcher parity, and the boundary between entry failures and handled command outcomes. It does not bind a concrete `CliResultEnvelopeV1.command`, result object, diagnostic union, Human result copy, or domain validation for the seven commands that do not already have such a binding; T03 through T06 own those command-specific surfaces.
 
@@ -223,7 +224,7 @@ Context-only in this contract means business direct dependencies outside that bo
 
 The static graph descriptor is inert project-owned data containing only the eight route paths, namespace/option/arity facts, and symbolic owning-module selection required by Sections 2 through 5. It contains no imported callback, Context object, dependency probe, configuration value, or domain validator. Its validator performs deterministic, I/O-free shape, closed-token, uniqueness, ownership, arity, option-scope, and mutual-exclusion checks. A representable mismatch returns only `GRAPH_DESCRIPTOR_INVALID`; exact conformance returns `GRAPH_DESCRIPTOR_VALID`. Descriptor retrieval/import, validator implementation, bootstrap runtime import-closure import, graph-factory import, or graph construction that throws is not converted into either verdict.
 
-No configuration file, environment configuration patch, Data Root, Context store, Context-only business dependency, OCR runtime, Codex runtime, model, child process, cancellation bridge, or durable asset may be touched before Step 12. Meta and grammar-failure paths never lazy-load a Context adapter. A command-owned contract may impose stricter ordering after Step 12; in particular, ADR 0117 preserves the existing `knowledge.ask` Question-before-Configuration order.
+No configuration file, environment configuration patch, Data Root, Context store, Context-only business dependency, OCR runtime, Codex runtime, model, child process, cancellation bridge, or durable asset may be touched before Step 12. Meta and grammar-failure paths never lazy-load a Context adapter. Any subsequent ADR 0032 `open_gezhi()` composition preserves static ownership and deep-module interfaces but must not eager-import or probe unrelated Context-only business dependencies. A command-owned contract may impose stricter ordering after Step 12; in particular, ADR 0117 preserves the existing `knowledge.ask` Question-before-Configuration order.
 
 ## 8. Parser and bootstrap failure contract
 
@@ -335,5 +336,6 @@ Tests also prove that parser/meta paths create no files, start no child, open no
 | ADR 0110–ADR 0116 | immutable input, preflight-first ordering, no completion, fixed raw-resource behavior |
 | ADR 0117 | exact Context-scoped root tokens and preserved Question-before-Configuration witnesses |
 | ADR 0118 / ADR 0019 | one-Candidate/one-action/no-note V1 surface; future batch still expands to append-only decisions |
+| ADR 0119 / ADR 0032 | inert full routing grammar/graph contains only static route facts; valid daily-command selection precedes exact owning-adapter import, and static composition does not eager-load unrelated Context dependencies |
 
 Adding a ninth daily command, an alias, a short option, a repeatable option, a new root configuration option, a different review-action shape, shell completion, or a third launcher changes `GezhiCliGrammarV1` and requires an explicit contract revision. Changing only non-normative help prose or a command-owned Human result does not revise this grammar.
