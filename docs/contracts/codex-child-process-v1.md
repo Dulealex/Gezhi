@@ -445,7 +445,7 @@ Literature Reader v1现有合同要求`events.jsonl`保留实际原始bytes，�
 - 若stop已因deadline/overflow发出，后来root自然退出或`TerminateJobObject`返回不能创建第二个终因；
 - child exit、descendant exit、internal stop DWORD、数值130都不能写parent latch。
 
-这使每个attempt只有一个`RUNNING -> DRAINING -> READY_TO_FREEZE -> TERMINAL`轨迹；没有cancel callback与completion callback互相覆盖的双写窗口。
+每个 successfully-started attempt 只有一条 `RUNNING -> DRAINING -> READY_TO_FREEZE -> TERMINAL` 轨迹。commitment 后但尚未 successfully started 的分支不虚构 `RUNNING`：CreateProcess failure 从 `CREATE_PENDING`、assignment failure 从 `CREATED_SUSPENDED`、post-create gate 赢得或 resume anomaly 从 `JOB_ASSIGNED` 直接进入 `DRAINING`，再共用 `DRAINING -> READY_TO_FREEZE -> TERMINAL` 收敛段。每条分支都只有一个串行轨迹；没有 cancel callback 与 completion callback 互相覆盖的双写窗口。
 
 ## 13. pre-attempt 与 attempted矩阵
 
@@ -506,11 +506,13 @@ double通过固定scenario参数控制行为，但其stdout/final仍是普通byt
 
 Win32 API本身的失败（CreateProcess、Assign、Resume、Wait、Query、Terminate、Close）以及同步 `ReadFile` / `WriteFile` 的 result、error 与 transferred-count 组合，由test-only syscall fault adapter在原调用边界注入；它只控制该次kernel-call observation，真实状态机、ledger、两个worker与executable double仍照常运行。adapter不得把worker换成mock、直接写内部fact、伪造EOF/Job-empty或跳过drain。`DeleteProcThreadAttributeList` 返回 `VOID`，不属于可注入“返回失败”的调用。
 
+D01 另行冻结 test-only `CodexPipeCapacityObserverV1`。只在测试构建中，它在两次 `CreatePipe` 成功后、任何 endpoint ownership 移动、worker 启动或 commitment 之前，以 borrowed handle 对本 attempt 的 `stdin-read` 与 `stdout-read` 各恰好调用一次 `GetNamedPipeInfo(handle, &flags, NULL, &in_buffer_size, NULL)`；两次调用都必须证明 byte-pipe mode 且 `in_buffer_size > 0`，并分别锁存为 `measured_stdin_pipe_capacity_bytes` 与 `measured_stdout_pipe_capacity_bytes`。observer 不 duplicate/close handle、不改变 inheritance、不执行 pipe I/O，也不把测量值写入 production plan、evidence、状态或 correctness decision；production build 不含该 observer。任一 probe 失败或返回零只令 D01 test setup 失败，且发生在 commitment 前，不触发产品 fallback。两个值来自本次将实际交给 writer/collector 的两个不同 pipe instance，禁止假定二者相等，也禁止以 `CODEX_PIPE_BUFFER_HINT_BYTES_V1` 代替任一测量值。
+
 ### 15.1 必过矩阵
 
 | ID | setup / double行为 | 必须观察到的结果 |
 |---|---|---|
-| D01 | prompt与double在读取任何stdin前同步写出的stdout payload都为`4 * actual_pipe_capacity + 17`；test-only barrier/event记录writer已进入写、collector已进入read与stdout完成，join observer在任何writer join前要求collector-read event已置位 | stdin SHA/length完全相等、stdout完全捕获、双向backpressure无deadlock、ledger=0；错误的“先join writer再启动collector”在join observer处立即确定失败，不用sleep或概率timeout |
+| D01 | `CodexPipeCapacityObserverV1` 分别取得本次两个实际 pipe 的 `measured_stdin_pipe_capacity_bytes` 与 `measured_stdout_pipe_capacity_bytes`；prompt length 恰为 `4 * measured_stdin_pipe_capacity_bytes + 17`，double 在读取任何 stdin 前同步写出的 stdout payload length 恰为 `4 * measured_stdout_pipe_capacity_bytes + 17`。test-only barriers 先保持 collector 的首个 read call 尚未进入 kernel，并用 call-boundary begin/return events 在同一确定性检查点证明 parent stdin `WriteFile` 与 child stdout `WriteFile` 各至少有一次已经开始但尚未返回；检查只用 zero-time event observation。随后释放 collector read gate，stdout 完成后 double 才打开 stdin read gate；join observer 在任何 writer join 前要求 collector-read event 已置位 | 两个 payload 分别严格大于各自独立测得的 pipe capacity，且不得假定两值相等；两个 pending-call observation 分别证明 stdin 与 stdout backpressure；最终 stdin SHA/length 完全相等、stdout 完全捕获、无 deadlock、ledger=0。错误的“先 join writer 再启动 collector”在 barrier/join observer 处立即确定失败，不用 sleep 或概率 timeout |
 | D02 | stdout以1、65,535、65,536、65,537-byte边界分块 | events byte-for-byte相等，chunk boundary不改变内容 |
 | D03 | double执行zero-byte stdout write再写数据 | zero write不是EOF，后续数据完整捕获 |
 | D04 | root退出，descendant继续持有/写stdout后退出 | root signal后不完成；直到Job active=0与stdout EOF才ready |
@@ -542,8 +544,8 @@ Win32 API本身的失败（CreateProcess、Assign、Resume、Wait、Query、Term
 | D30 | parent有多个额外inheritable handles并并发launch两个attempt | 每个child只得到自己的三项stdio；cross-attempt无继承、capture不串线 |
 | D31 | real CreateProcess/Assign调用边界分别由barrier跨过cancel或既存shared deadline；另含cancel时间恰等于deadline | root始终suspended、writer只ABORT、Resume调用数为0、唯一Job stop后完整收敛；attempt保留且无started anchor，cancel同刻赢 |
 | D32 | command-line adapter在CreateProcess内原地改写最后一个参数及NUL前字符 | 传入buffer可写且NUL-terminated、生命周期覆盖调用；frozen argv/quoted value/hash/audit identity逐byte不变，返回后buffer settled |
-| D33 | WriteFile依次注入full、short、success+0、success+大于requested、pre-stop ERROR_BROKEN_PIPE与另一任意error | full/short只推进实际count并最终交付完整remaining suffix；各非法/失败均锁存delivery failure、至多一次stop、worker join与ledger=0，不把失败伪装EOF |
-| D34 | ReadFile依次覆盖zero、short、success+大于requested、非ERROR_BROKEN_PIPE failure，随后由真实/注入read直到broken-pipe EOF | zero不是EOF、short bytes按序完整保留、invalid/failure锁存collector failure并stop；collector保持drain直到EOF/安全endpoint结清，terminal边界与ledger=0 |
+| D33 | fresh-attempt 参数化组，每个子例创建新 attempt，且每个 terminal/invalid 子例只注入一个目标 observation：`W-progress` 在同一正常 attempt 依次注入 success+full、success+short，再以合法 success 完成交付；`W-zero` 注入 success+0；`W-over` 注入 success+`requested+1`；`W-broken` 注入 pre-stop `FALSE/ERROR_BROKEN_PIPE`；`W-no-data` 注入 pre-stop `FALSE/ERROR_NO_DATA`；`W-other` 注入 pre-stop `FALSE/ERROR_GEN_FAILURE` | `W-progress` 只按实际 count 推进 remaining suffix、最终逐 byte 完整交付且不 stop。其余每个 fresh attempt 都独立证明该唯一目标 observation 锁存 `stdin_delivery_failure` 并请求至多一次 stop；stop 后 writer 不开始下一次 write，不在同一 attempt 继续注入其他 terminal observation；stdout 按真实 lifecycle 排空，worker 全部 join，terminal boundary 完整且 ledger=0，任何 failure 都不伪装成 EOF |
+| D34 | fresh-attempt 参数化组：`R-progress` 在同一正常 attempt 依次覆盖 success+0、success+short、合法正数 progress，最后取得真实 `FALSE/ERROR_BROKEN_PIPE`；`R-over` 在新 attempt 注入唯一 terminal observation success+`requested+1`；`R-other` 在另一新 attempt 注入唯一 terminal observation `FALSE/ERROR_GEN_FAILURE`。`R-over` 与 `R-other` 首次锁存后，后续 read 可使用真实 observation 或只注入合法的非 EOF progress 来 mechanical drain，最终必须取得真实 `ERROR_BROKEN_PIPE`，或在 Job 已空且所有 child-side writer 已证明消失后由唯一 owner 安全结清 endpoint | `R-progress` 证明 zero 不是 EOF、short bytes 按序完整保留且正常 EOF 不产生 failure。`R-over` 与 `R-other` 各自独立锁存 `stdout_collector_failure` 并请求至多一次 stop；目标 invalid/failure 本身不当作 EOF，collector 不跳过 drain，并在各自 fresh attempt 达到完整 terminal boundary、worker join 与 ledger=0；同一 attempt 不串联第二个 terminal/invalid observation |
 
 矩阵编号可随已冻结mechanics继续增加，不存在“最多30项”的上限。并发与竞态case必须用barrier/event控制先后，不用概率性sleep断言。每个case除业务断言外都必须断言：单次CreateProcess、单次commit、stop transition至多一次、root/Job/capture terminal边界、worker全部join、private source按合同撤销、ledger恰为零。
 
@@ -563,7 +565,7 @@ Win32 API本身的失败（CreateProcess、Assign、Resume、Wait、Query、Term
 
 实现与测试应以Microsoft文档的以下语义为基线：
 
-- [CreatePipe](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createpipe)：`nSize`仅为suggestion；满buffer可阻塞writer；last write handle关闭后reader取得broken-pipe EOF。
+- [CreatePipe](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createpipe)：`nSize`仅为suggestion；满buffer可阻塞writer；last write handle关闭后reader取得broken-pipe EOF。[GetNamedPipeInfo](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-getnamedpipeinfo) 可接受anonymous-pipe handle，并分别报告incoming/outgoing buffer size。
 - [ReadFile](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-readfile) 与 [WriteFile](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-writefile)：同步I/O、pipe阻塞、zero-byte与`ERROR_BROKEN_PIPE`规则。
 - [CreateProcessW](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw)：`lpCommandLine` 必须指向可写buffer且该函数可以修改其内容；[InitializeProcThreadAttributeList](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-initializeprocthreadattributelist) 与 [DeleteProcThreadAttributeList](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-deleteprocthreadattributelist)：初始化后生命周期与返回 `VOID` 的一次销毁。
 - [Handle inheritance](https://learn.microsoft.com/en-us/windows/win32/procthread/inheritance) 与 [UpdateProcThreadAttribute](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute)：`bInheritHandles`、`STARTF_USESTDHANDLES`与`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`。
