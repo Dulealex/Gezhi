@@ -1,0 +1,199 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gezhi.local/schemas/retrieval-audit-v1.schema.json",
+  "title": "RetrievalAuditV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "algorithm_version",
+    "branch_results",
+    "final_selection",
+    "query_atoms",
+    "question_asset_sha256",
+    "registry_snapshot_sha256",
+    "retrieval_query_asset_sha256",
+    "retrieval_view_measurement",
+    "schema_version"
+  ],
+  "properties": {
+    "algorithm_version": {"const": "gezhi.fts5_dual_rrf_k12.v1"},
+    "branch_results": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trigram", "unicode61"],
+      "properties": {
+        "trigram": {"$ref": "#/$defs/branchResultList"},
+        "unicode61": {"$ref": "#/$defs/branchResultList"}
+      }
+    },
+    "final_selection": {
+      "type": "array",
+      "maxItems": 12,
+      "items": {"$ref": "#/$defs/finalSelectionItem"}
+    },
+    "query_atoms": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trigram", "unicode61"],
+      "properties": {
+        "trigram": {"$ref": "#/$defs/queryAtomList"},
+        "unicode61": {"$ref": "#/$defs/queryAtomList"}
+      }
+    },
+    "question_asset_sha256": {"$ref": "#/$defs/sha256"},
+    "registry_snapshot_sha256": {"$ref": "#/$defs/sha256"},
+    "retrieval_query_asset_sha256": {"$ref": "#/$defs/sha256"},
+    "retrieval_view_measurement": {"$ref": "#/$defs/retrievalViewMeasurement"},
+    "schema_version": {"const": "gezhi.retrieval_audit.v1"}
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "candidateId": {
+      "type": "string",
+      "pattern": "^cand_[0-9a-f]{24}$"
+    },
+    "positiveInt64": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854775807
+    },
+    "queryAtomList": {
+      "type": "array",
+      "maxItems": 128,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "$comment": "Items also obey SearchTextV1 and strict ascending UTF-8 byte order."
+    },
+    "branchResultList": {
+      "type": "array",
+      "maxItems": 48,
+      "items": {"$ref": "#/$defs/branchResultItem"},
+      "$comment": "Ranks are contiguous from 1 and items are ordered by numeric BM25 ascending, then candidate_id ASCII ascending; candidate_id is unique within the list."
+    },
+    "branchResultItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bm25_float64_hex",
+        "candidate_id",
+        "payload_sha256",
+        "rank",
+        "review_revision",
+        "search_projection_sha256"
+      ],
+      "properties": {
+        "bm25_float64_hex": {
+          "type": "string",
+          "pattern": "^-?0x(?:0\\.0|[01]\\.[0-9a-f]{13})p[+-](?:0|[1-9][0-9]{0,3})$",
+          "$comment": "The value must additionally round-trip byte-for-byte through Python 3.11 float.fromhex(value).hex()."
+        },
+        "candidate_id": {"$ref": "#/$defs/candidateId"},
+        "payload_sha256": {"$ref": "#/$defs/sha256"},
+        "rank": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 48
+        },
+        "review_revision": {"$ref": "#/$defs/positiveInt64"},
+        "search_projection_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "nullableBranchRank": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "maximum": 48
+    },
+    "finalSelectionItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_id",
+        "final_rank",
+        "payload_sha256",
+        "review_revision",
+        "rrf_denominator",
+        "rrf_numerator",
+        "search_projection_sha256",
+        "trigram_rank",
+        "unicode61_rank"
+      ],
+      "properties": {
+        "candidate_id": {"$ref": "#/$defs/candidateId"},
+        "final_rank": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 12
+        },
+        "payload_sha256": {"$ref": "#/$defs/sha256"},
+        "review_revision": {"$ref": "#/$defs/positiveInt64"},
+        "rrf_denominator": {"$ref": "#/$defs/positiveInt64"},
+        "rrf_numerator": {"$ref": "#/$defs/positiveInt64"},
+        "search_projection_sha256": {"$ref": "#/$defs/sha256"},
+        "trigram_rank": {"$ref": "#/$defs/nullableBranchRank"},
+        "unicode61_rank": {"$ref": "#/$defs/nullableBranchRank"}
+      },
+      "anyOf": [
+        {
+          "properties": {
+            "trigram_rank": {"type": "integer"}
+          },
+          "required": ["trigram_rank"]
+        },
+        {
+          "properties": {
+            "unicode61_rank": {"type": "integer"}
+          },
+          "required": ["unicode61_rank"]
+        }
+      ],
+      "$comment": "The two ranks bind the same candidate in their branch lists. The reduced RRF fraction, contiguous final_rank, exact ordering and top-12 union rule are defined by the prose contract."
+    },
+    "retrievalViewMeasurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["byte_length", "limit_bytes", "sha256", "status"],
+      "properties": {
+        "byte_length": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "limit_bytes": {"const": 262144},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "status": {"enum": ["within_limit", "too_large"]}
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"status": {"const": "within_limit"}},
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "byte_length": {"maximum": 262144}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"status": {"const": "too_large"}},
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "byte_length": {"minimum": 262145}
+            }
+          }
+        }
+      ],
+      "$comment": "The measured value is one fully validated canonical RetrievalViewV1 bytes object including its final LF. within_limit requires that exact immutable object to be the only source written as retrieval_view.json; its manifest byte_length/sha256 and actual file bytes must equal this measurement. Terminal validation and recovery cross-check all three identities. too_large forbids installing retrieval_view.json."
+    }
+  },
+  "$comment": "Cross-array snapshot identity, O(1)-memory canonical streaming equivalence, base-search-projection derivation, uniqueness, ordering, exact RRF arithmetic, canonical bytes, same-measured-buffer installation and terminal/recovery asset-binding invariants are defined by Knowledge Ask Observable v1 and must be validated in addition to this structural schema."
+}

@@ -1,6 +1,6 @@
 # Answer Terminal v1 合同
 
-状态：冻结 Knowledge Answer v1 的根级资产 identity、逐路径与整目录读取预算、terminal authority、无 current pointer 约束、正式 target / 同身份 staging 双件矩阵、orphan 补交、原地逻辑隔离与 rename 不确定结果边界。本合同不改变 Answer manifest Schema、`KnowledgeAskResultV1`、CLI outcome/diagnostics，也不新增公开命令、依赖、配置、持久文件或模型调用。
+状态：冻结 Knowledge Answer v1 的根级资产 identity、逐路径与整目录读取预算、terminal authority、无 current pointer 约束、正式 target / 同身份 staging 双件矩阵、orphan 补交、原地逻辑隔离与 rename 不确定结果边界。本合同不改变 Answer manifest Schema、`KnowledgeAskResultV1`、CLI outcome/diagnostics，也不新增公开命令、依赖、配置、持久文件或模型调用；[Knowledge Ask Observable v1](./knowledge-ask-observable-v1.md) 与 [ADR 0122](../adr/0122-keep-knowledge-ask-observability-outside-the-domain-result.md) 只消费本模块已完整验证的 terminal facts。
 
 ## 适用范围与权威来源
 
@@ -23,6 +23,8 @@ V1 威胁边界仍是服从同一 writer mutex 的协作进程与 crash / power-
 2. `inspect_orphan(staging_entry)`：只允许在当前线程持有该 Knowledge 数据根 writer ownership 时检查 `.staging/` 的一个直接子项。
 3. `complete_orphan(inspected_orphan)`：只消费同一次完整检查得到的不可变证据，最多执行一次 non-replacing same-volume directory rename。
 4. `publish_current(current_terminal_request)`：只接受本次 invocation 当前 writer 的声明式终态请求；module 不信任 caller 提供的路径或验证证据，而是从 writer ownership、frozen root 与 expected `answer_id` 安全派生 current staging，在内部建立并消费不可伪造的单次 terminal candidate，并独占新 Answer 从唯一 canonical manifest buffer 到明确 commit / no-commit / uncertain observation 的完整发布生命周期；详见后文专节。
+
+T06 Human preparation 需要的 `TERMINAL_ANSWER_BYTES_READY | TERMINAL_ANSWER_BYTES_REJECTED` 是现有 `read_committed(answer_id)` 整体接受/拒绝行为的 typed projection，不是第五个 public seam。Ready 只能随同一次完整 committed Answer 验证返回，并绑定该次 committed proof、manifest 中 `answer.md` 的 length/hash、正式 asset identity、exact raw bytes 与 strict UTF-8 text；Rejected 只表示整体 reader 已按本合同拒绝，不能暴露 partial Answer、fallback Markdown 或未经绑定的 bytes。Human renderer 不得绕过 `read_committed` 单独打开 `answer.md`。
 
 这四个名称描述概念行为合同，不冻结 Python module path、class、函数签名、exception 或返回对象。CLI adapter、Human renderer、diagnostic constructor、Knowledge Answer writer 与未来 Context 都不得绕过该 module 直接解释、验证或发布 Answer 文件。`current_terminal_request` 只携带既有 Knowledge Answerer 合同已经冻结、形成 terminal manifest 所需的 caller-owned 值；它不是 path、handle、filesystem identity、capability、validator evidence 或 committed proof，也不能授权 caller 选择 staging。`publish_current` 必须自己把当前 invocation、depth-one writer ownership、frozen Knowledge root physical identity、expected `answer_id`、安全派生的 active staging identity、已锁存 terminal cause 与已经形成、验证并关闭的最终非 manifest 资产绑定为 module-private、invocation-local 的 opaque `owned_terminal_candidate`；该 candidate 永不跨越行为 seam。
 
@@ -196,7 +198,7 @@ Target 的存在性判断使用字面 expected path 与安全 namespace 规则�
 |---|---|
 | 明确成功 | 本 invocation 以“共享 validator 对 staging 当前 bytes 的完整证据 + 紧邻 rename checkpoint + 明确成功的 non-replacing same-volume rename”作为等价 committed proof；该历史 Answer 成为 `committed`，不要求立即从 formal target 重复全量读取，也不重跑阶段、不改 manifest、不生成本次 Ask receipt。Rename 明确成功仍是 process-level commit point；后续独立 invocation 只能通过 `read_committed` 接受 target。 |
 | 明确 target-exists | 不覆盖；按双件矩阵完整检查 target，staging 作为 target-conflict `quarantined`。 |
-| 明确为其他 candidate-local failure，且 root trust 与“target 未由本操作提交”均可证明 | 本轮把 staging 归为 `quarantined`，原地保留，只形成待冻结的 supplemental fact，并继续下一个候选。不得在同一 invocation 重试。 |
+| 明确为其他 candidate-local failure，且 root trust 与“target 未由本操作提交”均可证明 | 本轮把 staging 归为 `quarantined`，原地保留，只形成 [Knowledge Ask Observable v1](./knowledge-ask-observable-v1.md) 已冻结的 `orphan_recovery_failed` supplemental fact，并继续下一个候选。不得在同一 invocation 重试。 |
 | completion / commit outcome 无法确定 | 立即 stop-new-work；不得重试、回滚、删除、补 pointer、生成 receipt、选择 normal no-commit outcome或继续扫描。只有后续独立 invocation 重新取得 ownership、重新 safe-open 当前 namespace 并从零应用双件矩阵。 |
 
 后续独立 invocation 不是根据旧异常猜测：target valid 则接受 committed；target 缺失且 staging valid 才重新成为 orphaned；target 存在但无效则阻止补交；两侧都缺失则当前没有该 Answer。它永远不为旧 invocation 追造 CLI receipt。
@@ -219,7 +221,7 @@ Target 的存在性判断使用字面 expected path 与安全 namespace 规则�
 - 一个 candidate 的 identity、cap、hash、Schema、target conflict 或确定 recovery failure 只隔离该 candidate；持锁 scan 继续处理下一 candidate，并允许当前 Ask 使用新 `answer_id`。
 - `.staging/` 无法安全枚举、invocation-wide scan protocol 不能完成、root trust 丢失或本次 Answer terminalization/commit 失败，继续使用 Knowledge Ask Diagnostics v1 已冻结的 primary/outcome 边界；本合同不新增或重排 code。
 - 一个 formal target 无效只使 explicit-ID reader 整体拒绝该 Answer；不得回退到同身份 staging、另一个 Answer、current pointer、raw `answer.md` 或 manifest 片段。
-- `retrieval_audit.json` 的 closed semantic fields、orphan/capture/maintenance supplemental variants、Human 文案与其他命令 result 仍由各自来源合同拥有。缺失时只阻塞相应 Answer semantic adapter 或外部报告，不阻塞 Registry/search、Literature、未来 Context 或不消费该信息的开发任务。
+- `retrieval_audit.json` 的 closed semantic fields、orphan/capture supplemental variants 与 Human 文案已由 [Knowledge Ask Observable v1](./knowledge-ask-observable-v1.md) 拥有；maintenance action set 仍由本合同保持为空，其他命令 result 继续由各自来源合同拥有。这些可观察投影不得改变 terminal authority、recovery 或其他 Context。
 
 ## 验收矩阵
 
@@ -259,8 +261,8 @@ Target 的存在性判断使用字面 expected path 与安全 namespace 规则�
 ## 非目标与残余风险
 
 - 不提供 power-loss durability、flush 顺序、恶意本机并发防护或历史 Answer 总存储 quota；ADR 0088 的边界不变。
-- 不冻结 `retrieval_audit.json` 尚未由其来源合同闭合的字段，也不借 terminal cap 发明字段。
-- 不冻结 orphan/capture/maintenance supplemental diagnostic code/context、Human 文案或 `status` payload；实现不得使用通用 fallback、异常文本或任意 dict 填补。
+- `retrieval_audit.json` 字段与 View measurement 已由 [Knowledge Ask Observable v1](./knowledge-ask-observable-v1.md) 闭合；本合同只执行其 asset identity、cap、hash、跨资产与 recovery 复验，不借 terminal cap 重解释或发明字段。
+- Orphan/capture supplemental diagnostic code/context 与 Human 文案由 [Knowledge Ask Observable v1](./knowledge-ask-observable-v1.md) 闭合；V1 maintenance mutation 与持久 diagnostic 仍未获授权，`status` payload 继续由其自身合同拥有。实现不得使用通用 fallback、异常文本或任意 dict 扩展这些边界。
 - 不提供 physical quarantine、archive、purge、repair 或 current/latest selection。未来增加任一持久路径、marker、pointer 或 mutation action，都必须显式演进相应合同；不能静默扩展 Answer V1。
 
 该设计把复杂 filesystem 与恢复规则压入一个 deep module，以一个整体 reader、一个 current-writer 高层 publish seam 与一个历史 orphan 单次 rename seam 服务 writer readback、正式发布、历史读取与 crash recovery；代价是异常现场会原地积累，但正常命令 interface 保持小、局部、可验证，且不会把损坏现场升级为正式 Answer。

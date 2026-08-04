@@ -554,7 +554,7 @@ D01 另行冻结 test-only `CodexPipeCapacityObserverV1`。只在测试构建中
 以下内容是明确边界，不允许实现静默填空：
 
 - Literature Reader v1尚未冻结capture retention cap与overflow策略；本合同只保证固定chunk流式I/O，不把Knowledge常量跨上下文传播。这是后续若要限制Reader磁盘增长时需要单独ADR/角色版本的真实缺口。
-- Knowledge capture-overflow的外部supplemental diagnostic仍由既有合同标为待定；本文只冻结内部latch、stop与既有primary mapping，不新增diagnostic字段或code。
+- Knowledge capture-overflow 的外部 supplemental diagnostic 已由 [Knowledge Ask Observable v1](./knowledge-ask-observable-v1.md) 冻结为 `knowledge.ask.capture_overflow.v1`；本文仍只冻结内部 latch、stop 与既有 primary mapping，不拥有或扩展 diagnostic/Human 字段与 code。
 - `CreatePipe.nSize`不保证实际buffer大小；验收必须覆盖更小实际capacity。
 - final active probe是best-effort，sharing policy可使物理spool在Job退出前超过1 MiB；ADR 0076/0079本就不承诺spool物理硬上限。
 - runtime subtree或private staging被同权限外部进程恶意替换不在supported baseline；generation checks用于防内部竞态，不构成对抗性sandbox。
