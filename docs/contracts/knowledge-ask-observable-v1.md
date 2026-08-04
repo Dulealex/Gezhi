@@ -2,7 +2,7 @@
 
 状态：已冻结。本文只关闭 `knowledge ask` 尚未冻结的四个可观察边界：`RetrievalAuditV1` 的精确结构与 View 超限测量、command-owned supplemental diagnostics、Human 中文 presentation，以及 JSON/Human presentation failure 的公开结果边界；可观察投影不得反向成为领域事实源，见 [ADR 0122](../adr/0122-keep-knowledge-ask-observability-outside-the-domain-result.md)。既有 [Knowledge Answerer v1](./knowledge-answerer-v1.md)、[Knowledge Ask Result v1](./knowledge-ask-result-v1.md)、[Knowledge Ask Diagnostics v1](./knowledge-ask-diagnostics-v1.md)、[CLI JSON v1](./cli-json-v1.md)、[CLI Diagnostics v1](./cli-diagnostics-v1.md) 与 [Answer Terminal v1](./answer-terminal-v1.md) 继续拥有正常路径、primary、result、Answer 终态与 terminal/recovery 行为。
 
-本文不改变 pre-ID gate、`answer_id` cutover、Answer manifest 三元组、primary union、`result` presence、JSON normal exit、Codex child 分类、Retrieval View 语义、writer ownership 或原子提交点。若本文与上述权威来源冲突，停止 T06 分支，不得以本文重解释既有事实。
+本文不改变 pre-ID gate、`answer_id` cutover、Answer manifest 三元组、primary union、`result` presence、JSON normal exit、Codex child 分类、Retrieval View 语义、writer ownership 或原子提交点。唯一局部替换是 [ADR 0122](../adr/0122-keep-knowledge-ask-observability-outside-the-domain-result.md) 明确批准的进程内形成顺序：先冻结尚未安装的 measured View buffer，再安装 Audit/P3，最后仅在 `within_limit` 时安装同一 buffer 为 View/P4；这不改变持久 P3/P4 顺序。除该替换外，若本文与上述权威来源冲突，停止 T06 分支，不得以本文重解释既有事实。
 
 ## 1. 模块边界与顺序
 
@@ -13,7 +13,7 @@ Knowledge adapter 只通过以下四个窄接口越过可观察 seam；名称描
 3. `prepare_knowledge_human(final_command_state, terminal_answer_verdict)`：消费与 JSON 相同的 final command facts；只有 `succeeded` 且本次 Answer 已 committed 时才消费 terminal reader 返回的 typed、manifest-bound `answer.md` verdict。
 4. `present_knowledge_human(prepared_human)`：只呈现已经完整形成、验证且有界的 Human candidate；不重读 Answer、Registry、staging、配置或 cancellation state。
 
-`RetrievalAuditV1` 必须在 `retrieval_view.json` 是否可发布之前完整形成。Supplemental constructor 在 command-state seal 前运行。正常 JSON/Human candidate 与 `outcome/result/diagnostics` 在同一个 [ADR 0100](../adr/0100-seal-the-handled-cancellation-window-before-presentation.md) generation 中共同锁存；若 typed pre-I/O projection/presentation failure 使完整公开 surface 不可形成，则同一 generation 改为锁存第 5 节的 no-output failure candidate。两种 candidate 都必须先完成全部适用 command-owned resource settle、cancellation zero-in-flight 与 source release；所选 cancellation profile 到达 `RELEASED` 后才允许 presentation 或 terminal fail-stop。
+同一 SQLite snapshot 下的顺序固定为：先完整形成、验证并恰好一次序列化 `RetrievalViewV1`，冻结尚未安装的 immutable measured View buffer；再从该 measurement 构造并安装 `RetrievalAuditV1`，形成持久 P3；最后只有 `within_limit` 才把同一 buffer 安装为 `retrieval_view.json` 并推进到 P4，`too_large` 不调用 View installer。内存 buffer 的形成不等于 View 资产安装或 P4，持久资产顺序仍严格为 Audit/P3 后 View/P4。Supplemental constructor 在 command-state seal 前运行。正常 JSON/Human candidate 与 `outcome/result/diagnostics` 在同一个 [ADR 0100](../adr/0100-seal-the-handled-cancellation-window-before-presentation.md) generation 中共同锁存；若 typed pre-I/O projection/presentation failure 使完整公开 surface 不可形成，则同一 generation 改为锁存第 5 节的 no-output failure candidate。两种 candidate 都必须先完成全部适用 command-owned resource settle、cancellation zero-in-flight 与 source release；所选 cancellation profile 到达 `RELEASED` 后才允许 presentation 或 terminal fail-stop。
 
 ## 2. `RetrievalAuditV1`
 
@@ -134,7 +134,7 @@ Base projection object 以上述 canonical JSON 参数编码、不追加 LF并�
 
 ### 2.6 View measurement 与超限分支
 
-View materializer 必须先完成全部 `RetrievalViewV1` Schema、identity、排序、材料与跨字段验证，再对该完整 value **恰好一次**执行 canonical JSON serialization 并追加一个 LF，得到单一 immutable `bytes` object。`MeasuredRetrievalViewV1` 只绑定该 object identity、`len(buffer)`、覆盖同一 buffer 全部 bytes 的 SHA-256 与下列 cap verdict；后续不得重新序列化“等值”View、替换 bytes object、只 hash prefix 或从临时文件反推 measurement。
+View materializer 必须先完成全部 `RetrievalViewV1` Schema、identity、排序、材料与跨字段验证，再对该完整 value **恰好一次**执行 canonical JSON serialization 并追加一个 LF，得到单一 immutable `bytes` object。该步骤是 [ADR 0122](../adr/0122-keep-knowledge-ask-observability-outside-the-domain-result.md) 局部替换后位于 Audit 之前的进程内形成顺序；此时不得安装 `retrieval_view.json`，也不得把 buffer 的存在当作 P4。`MeasuredRetrievalViewV1` 只绑定该 object identity、`len(buffer)`、覆盖同一 buffer 全部 bytes 的 SHA-256 与下列 cap verdict；后续不得重新序列化“等值”View、替换 bytes object、只 hash prefix 或从临时文件反推 measurement。
 
 `retrieval_view_measurement` 必须且只能含：
 
@@ -147,7 +147,7 @@ View materializer 必须先完成全部 `RetrievalViewV1` Schema、identity、�
 
 Measured buffer 无 BOM、raw CR 或第二个 value。`status=within_limit` 当且仅当 `byte_length <= 262144`；`status=too_large` 当且仅当 `byte_length > 262144`。262144 合法，262145 必须超限。Hash 总是覆盖包含 LF 的完整 buffer。
 
-`within_limit` 时，Audit 必须先使用该 measurement 完整形成并安装为 P3；随后 View asset installer 只能接收并写出 **同一 `MeasuredRetrievalViewV1.buffer` object**，不得接受重新编码、内容相等的副本或从文件回读构造的替代值。`retrieval_view.json` manifest asset 的 `byte_length` 与 `sha256` 必须逐值等于 Audit measurement，实际文件 bytes 必须逐 byte 等于该 buffer。Writer readback、terminal validator 与 orphan recovery 都必须交叉验证以下四者完全相等：Audit measurement、View manifest asset pair、View 实际 length/hash、View canonical bytes；任一不等整体拒绝。View 形成、写入、关闭、安装、hash/readback、manifest binding 或交叉复验失败时，撤销未完成 View、保持最后合法 P3，并使用既有 `failed: retrieval_materialization_failed`，不能改写 measurement 为 `too_large`。
+`within_limit` 时，Audit 必须先使用该 measurement 完整形成并安装为 P3；只有 P3 安装完成后，View asset installer 才能接收并写出 **同一 `MeasuredRetrievalViewV1.buffer` object**，推进到 P4，不得接受重新编码、内容相等的副本或从文件回读构造的替代值。`retrieval_view.json` manifest asset 的 `byte_length` 与 `sha256` 必须逐值等于 Audit measurement，实际文件 bytes 必须逐 byte 等于该 buffer。Writer readback、terminal validator 与 orphan recovery 都必须交叉验证以下四者完全相等：Audit measurement、View manifest asset pair、View 实际 length/hash、View canonical bytes；任一不等整体拒绝。View 写入、关闭、安装、hash/readback、manifest binding 或交叉复验失败时，撤销未完成 View、保持最后合法 P3，并使用既有 `failed: retrieval_materialization_failed`，不能改写 measurement 为 `too_large`。
 
 `too_large` 时必须同时成立：
 
@@ -451,8 +451,8 @@ Human presentation 开始后的 write/console failure不得重写前缀、切换
 - 两路 0/1/48 与 49、final 0/1/12 与 13、rank gap/duplicate、identity drift、非 finite/非 canonical float hex、错误最简分数均覆盖。
 - Registry snapshot 只来自同一 transaction；withdrawn Candidate不进入 entries、branch或 final selection。测试用 materialized reference object 对比 exact prefix/entry/comma/suffix streaming hash，覆盖空/单项/多项、乱序、重复、identity mismatch，并用大 N fixture证明实现不建立 O(N) entries/object/set。
 - 四个 base search field 逐一覆盖 exact source sequence、每个 scalar 独立 SearchTextV1、empty fragment 丢弃、ASCII-space join 与 all-empty；Descriptor method `value.text`、其他 kind `value.label`、各自 source terms、null Work title 与 canonical order均有反例。Trigram 输入逐值等于 base strings；unicode61 从同一 base按冻结二字/非 Han规则派生；algorithm version + base 必须唯一重建两路输入，hash只覆盖 base projection canonical bytes。
-- 零 View 标准库复算必须得到 109 bytes 与 `51aebe839e0caa991344efe4c0a19518b93a1d59aaa9bccbd1c6220a367641ec`。Executable builder 产生 262143、262144 与 262145 exact buffers；前两者为 within，最后一者为 too_large；测量/hash都覆盖同一完整 buffer与 LF。
-- Within-limit 分支断言 Audit measurement、同一 buffer object、View manifest pair 与实际 View bytes 四向相等；替换等值 bytes object、重序列化、manifest drift、readback drift 与 recovery drift全部拒绝为 `retrieval_materialization_failed`。Too-large 分支断言 View installer调用次数为零。
+- 零 View 标准库复算必须得到 109 bytes 与 `51aebe839e0caa991344efe4c0a19518b93a1d59aaa9bccbd1c6220a367641ec`。Executable builder 产生 262143、262144 与 262145 exact buffers；前两者为 within，最后一者为 too_large；测量/hash都覆盖同一完整 buffer与 LF。三者都先冻结未安装的 measured buffer，再构造 Audit。
+- Within-limit 分支断言顺序严格为“冻结 measured buffer → 安装 Audit/P3 → 安装同一 buffer 为 View/P4”，并验证 Audit measurement、同一 buffer object、View manifest pair 与实际 View bytes 四向相等；替换等值 bytes object、重序列化、P3 前安装 View、manifest drift、readback drift 与 recovery drift全部拒绝为 `retrieval_materialization_failed`。Too-large 分支断言 Audit/P3 已安装且 View installer调用次数为零。
 - too_large committed Answer恰到 P3，Audit在、View/C/attempt/O均不在，primary context仍为空；Audit自身失败不得冒充 too_large。
 
 ### Supplemental

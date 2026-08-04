@@ -32,6 +32,14 @@ _Avoid_: Promoted Knowledge, Retrieval View, Mutable Record
 为一次查询确定性选择、过滤和排序合规 Candidate Knowledge 的可重建视图。
 _Avoid_: Source of Truth, Vector Store
 
+**Retrieval Audit**:
+解释一次确定性检索如何形成最终选择，并记录 Retrieval View 测量结果的只读审计投影；它不是模型输入、领域事实源或 Answer 结果。
+_Avoid_: Retrieval View, Model Context, Answer Result
+
+**Answer Observation**:
+面向调用者说明既有 Answer 与检索事实的人用表示、补充诊断和审计投影；它不能改变 Answer 身份、领域结果、提交或恢复决定。
+_Avoid_: Domain Result, Recovery Decision, Persistent Diagnostic
+
 **Promotion Gate**:
 决定 Candidate Knowledge 是否可以成为 Promoted Knowledge 的显式治理边界。
 _Avoid_: Import
