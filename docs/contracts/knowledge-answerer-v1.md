@@ -1090,7 +1090,7 @@ P3 = P2 ∪ {retrieval_audit.json}
 P4 = P3 ∪ {retrieval_view.json}
 ```
 
-每个 terminal Answer 至少且必须达到 P0；P1–P4 只能按顺序推进，不得跳过前项、倒序安装或组合任意已验证文件。`effective_config.json` 无法形成终态资产时没有合法最小前缀，因此不能提交 terminal Answer。`retrieval_audit.json` 在逻辑与进程内资产形成顺序上先于 View 冻结；`retrieval_view.json` 只有在完整 Schema、快照复验和 262144-byte 上限全部通过后才能推进到 P4。`retrieval_view_too_large` 固定停在 P3，超限的 would-be View 不得出现在 terminal `assets` 或最终根级路径中。
+每个 terminal Answer 至少且必须达到 P0；P1–P4 只能按顺序推进，不得跳过前项、倒序安装或组合任意已验证文件。`effective_config.json` 无法形成终态资产时没有合法最小前缀，因此不能提交 terminal Answer。在逻辑与进程内形成顺序上，必须先冻结并测量 would-be View buffer，才能据此形成并安装 `retrieval_audit.json`；这一步不等于安装 View。持久资产仍严格按 P3 后 P4 推进：`retrieval_view.json` 只有在完整 Schema、快照复验和 262144-byte 上限全部通过后，才可把同一份已冻结 buffer 安装为 P4。`retrieval_view_too_large` 固定停在 P3，超限的 would-be View 不得出现在 terminal `assets` 或最终根级路径中。
 
 每个文件只有在规范值形成、确定性序列化、实现私有临时文件写入并关闭、实际 byte length 与 SHA-256 取得、Schema/media identity 和全部文件后置条件通过后，才可安装到最终根级名称并推进前缀。当前文件在任一步失败时不得进入 terminal `assets`，writer 只可提交最后一个完整前缀；crash recovery 不根据时间、残留 bytes 或文件名猜测进度，也不补齐前缀。若临时、部分、备份或其他未批准文件或目录无法在采集 `finished_at` 与写 terminal manifest 前安全关闭并从本次活跃 staging 撤销，实际目录就不能满足封闭资产清单，因此只能留下 staging。
 
