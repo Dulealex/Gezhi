@@ -4,6 +4,7 @@ import ctypes
 import hashlib
 import ntpath
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Literal, Self, TypeAlias
 
@@ -301,6 +302,13 @@ class ValidatedFileV1:
             digest.update(chunk)
         self._revalidate(handle)
         return digest.hexdigest()
+
+    def iter_verified_chunks_v1(self) -> Iterator[bytes]:
+        """Stream the held file once and revalidate the same handle at EOF."""
+
+        handle = self.borrowed_handle()
+        yield from _read_handle_chunks(handle, self.size)
+        self._revalidate(handle)
 
     def _revalidate(self, handle: int) -> None:
         facts = _handle_facts(handle, directory=False)
@@ -1036,6 +1044,80 @@ def open_validated_data_root_v1(value: str) -> ValidatedDataRootV1:
         )
         return ValidatedDataRootV1(
             inspection=inspection,
+            handles=tuple(handles),
+        )
+    except BaseException as error:
+        try:
+            _close_handles(tuple(handles))
+        except Exception as close_error:
+            raise close_error from error
+        raise
+
+
+def open_validated_local_file_v1(value: str) -> ValidatedFileV1:
+    """Open one local ordinary file through a held no-follow ancestor chain."""
+
+    path = _normal_path(value)
+    if path is None:
+        raise DataRootOpenErrorV1("unsafe")
+    volume_status = _volume_is_supported(path)
+    if volume_status is not None:
+        raise DataRootOpenErrorV1(volume_status)
+
+    handles: list[int] = []
+    identities: list[FileIdentity] = []
+    chain = _parent_chain(path)
+    if len(chain) < 2:
+        raise DataRootOpenErrorV1("unavailable")
+    last_index = len(chain) - 1
+    try:
+        for index, expected_path in enumerate(chain):
+            directory = index != last_index
+            if index == 0:
+                handle = _open_drive_root(expected_path)
+            else:
+                parent = handles[-1]
+                component = ntpath.basename(expected_path)
+                handle = _open_relative_handle(
+                    parent,
+                    component,
+                    directory=directory,
+                )
+            handles.append(handle)
+            facts = _handle_facts(handle, directory=directory)
+            if index == 0:
+                volume_serial = facts.identity[0]
+            _validate_expected_facts(facts, expected_path, volume_serial)
+            if index != 0:
+                _reject_hidden_short_alias(parent, component)
+            if facts.identity in identities:
+                raise DataRootOpenErrorV1("unsafe")
+            identities.append(facts.identity)
+
+        final_facts: _HandleFacts | None = None
+        for index, (expected_path, handle, identity) in enumerate(
+            zip(chain, handles, identities, strict=True)
+        ):
+            directory = index != last_index
+            facts = _handle_facts(handle, directory=directory)
+            _validate_expected_facts(facts, expected_path, identities[0][0])
+            if index != 0:
+                _reject_hidden_short_alias(
+                    handles[index - 1],
+                    ntpath.basename(expected_path),
+                )
+            if facts.identity != identity:
+                raise DataRootOpenErrorV1("unavailable")
+            final_facts = facts
+        volume_status = _volume_is_supported(path)
+        if volume_status is not None:
+            raise DataRootOpenErrorV1(volume_status)
+        if final_facts is None:
+            raise DataRootOpenErrorV1("unavailable")
+        return ValidatedFileV1(
+            canonical_path=final_facts.canonical_path,
+            identity=final_facts.identity,
+            size=_file_size(handles[-1]),
             handles=tuple(handles),
         )
     except BaseException as error:
