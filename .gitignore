@@ -9,6 +9,8 @@ node_modules/
 
 # Local runtime state and downloaded models
 .local/
+/data/
+/config/local.toml
 
 # Test and analysis caches
 .pytest_cache/
