@@ -6,7 +6,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import BinaryIO, cast
 
@@ -106,6 +106,17 @@ _NT_RESUME_PROCESS.restype = ctypes.c_long
 
 class ProbeOutputLimitExceeded(RuntimeError):
     """A read-only capability probe exceeded its capture budget."""
+
+    def __init__(
+        self,
+        message: str = "probe output exceeded its byte limit",
+        *,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+    ) -> None:
+        super().__init__(message)
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 class ProbeLifecycleError(RuntimeError):
@@ -227,6 +238,7 @@ def _wait_for_probe_completion(
     job: int,
     deadline: float,
     stop_signals: tuple[threading.Event, ...],
+    progress_guard: Callable[[], None] | None,
 ) -> bool:
     root_exited = False
     while True:
@@ -235,6 +247,8 @@ def _wait_for_probe_completion(
         remaining = _remaining_seconds(deadline)
         if remaining <= 0:
             return False
+        if progress_guard is not None:
+            progress_guard()
         if not root_exited:
             try:
                 process.wait(timeout=min(_WAIT_SLICE_SECONDS, remaining))
@@ -278,6 +292,7 @@ def run_bounded_probe_v1(
     timeout_seconds: float,
     output_limit: int,
     creation_flags: int = 0,
+    progress_guard: Callable[[], None] | None = None,
 ) -> BoundedProbeResultV1:
     frozen_command = tuple(command)
     if not frozen_command or any(type(item) is not str for item in frozen_command):
@@ -338,11 +353,11 @@ def run_bounded_probe_v1(
                     if not chunk:
                         return
                     with lock:
-                        remaining = max(0, output_limit + 1 - captured)
+                        remaining = max(0, output_limit - captured)
                         retained = chunk[:remaining]
                         destination.extend(retained)
                         captured += len(retained)
-                        exceeded = len(chunk) > remaining or captured > output_limit
+                        exceeded = len(chunk) > remaining
                         if exceeded:
                             overflow.set()
                     if overflow.is_set():
@@ -374,6 +389,7 @@ def run_bounded_probe_v1(
             job,
             deadline,
             (overflow, reader_failed),
+            progress_guard,
         )
         timed_out = not completed and not overflow.is_set() and not reader_failed.is_set()
         if not completed:
@@ -388,7 +404,12 @@ def run_bounded_probe_v1(
         stderr_stream = None
 
         if timed_out:
-            raise subprocess.TimeoutExpired(frozen_command, timeout_seconds)
+            raise subprocess.TimeoutExpired(
+                frozen_command,
+                timeout_seconds,
+                output=bytes(stdout_buffer),
+                stderr=bytes(stderr_buffer),
+            )
         reader_failure = next(
             (failure for failure in reader_failures if failure is not None),
             None,
@@ -396,7 +417,10 @@ def run_bounded_probe_v1(
         if reader_failure is not None:
             raise ProbeLifecycleError("probe pipe read failed") from reader_failure
         if overflow.is_set():
-            raise ProbeOutputLimitExceeded("probe output exceeded its byte limit")
+            raise ProbeOutputLimitExceeded(
+                stdout=bytes(stdout_buffer),
+                stderr=bytes(stderr_buffer),
+            )
         returncode = process.returncode
         if type(returncode) is not int:
             raise RuntimeError("probe return code is unavailable")

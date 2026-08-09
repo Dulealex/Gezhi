@@ -17,6 +17,12 @@ from gezhi._bounded_probe import (
 )
 
 
+def test_output_limit_exception_defaults_to_empty_capture() -> None:
+    error = ProbeOutputLimitExceeded()
+
+    assert (error.stdout, error.stderr) == (b"", b"")
+
+
 def test_probe_capture_accepts_the_exact_combined_limit() -> None:
     result = run_bounded_probe_v1(
         (
@@ -39,19 +45,24 @@ def test_probe_capture_accepts_the_exact_combined_limit() -> None:
 
 
 def test_probe_capture_kills_a_child_at_limit_plus_one() -> None:
-    with pytest.raises(ProbeOutputLimitExceeded):
+    with pytest.raises(ProbeOutputLimitExceeded) as caught:
         run_bounded_probe_v1(
             (
                 sys.executable,
                 "-I",
                 "-B",
                 "-c",
-                "import os; os.write(1, b'x' * 65536)",
+                "import os; os.write(1, b'a' * 2048); os.write(2, b'b' * 2049)",
             ),
             timeout_seconds=10,
             output_limit=4_096,
             creation_flags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+
+    error = caught.value
+    assert error.stdout and (b"a" * 2_048).startswith(error.stdout)
+    assert error.stderr and (b"b" * 2_049).startswith(error.stderr)
+    assert len(error.stdout) + len(error.stderr) == 4_096
 
 
 def test_probe_timeout_settles_a_descendant_that_inherits_the_pipes(
@@ -66,11 +77,12 @@ def test_probe_timeout_settles_a_descendant_that_inherits_the_pipes(
     root = (
         "import os,subprocess,sys;"
         f"subprocess.Popen([sys.executable,'-I','-B','-c',{grandchild!r}]);"
-        "os.write(1,b'ready')"
+        "os.write(1,b'ready');"
+        "os.write(2,b'warning')"
     )
     started = time.monotonic()
 
-    with pytest.raises(subprocess.TimeoutExpired):
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
         run_bounded_probe_v1(
             (sys.executable, "-I", "-B", "-c", root),
             timeout_seconds=0.75,
@@ -78,6 +90,8 @@ def test_probe_timeout_settles_a_descendant_that_inherits_the_pipes(
             creation_flags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
 
+    assert caught.value.stdout == b"ready"
+    assert caught.value.stderr == b"warning"
     assert time.monotonic() - started < 1.5
     time.sleep(2.1)
     assert not marker.exists()
@@ -313,3 +327,78 @@ def test_reader_settlement_failure_is_not_hidden_by_an_earlier_fault(
             timeout_seconds=5,
             output_limit=4_096,
         )
+
+
+def test_progress_guard_failure_settles_the_job_and_pipes_before_reraising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class WaitingProcess:
+        stdout = BytesIO(b"stdout")
+        stderr = BytesIO(b"stderr")
+        returncode = None
+
+        def wait(self, *, timeout: float) -> int:
+            raise subprocess.TimeoutExpired(("probe.exe",), timeout)
+
+    process = WaitingProcess()
+    failure = RuntimeError("resource budget exceeded")
+    guard_calls = 0
+    settled: list[object] = []
+    real_join_readers = bounded_probe._join_readers
+
+    def guard() -> None:
+        nonlocal guard_calls
+        guard_calls += 1
+        if guard_calls == 3:
+            raise failure
+
+    def join_readers(
+        readers: tuple[bounded_probe.threading.Thread, bounded_probe.threading.Thread],
+        streams: tuple[bounded_probe.BinaryIO, bounded_probe.BinaryIO],
+    ) -> None:
+        real_join_readers(readers, streams)
+        settled.append("pipes")
+
+    monkeypatch.setattr(bounded_probe, "_create_kill_on_close_job", lambda: 7)
+    monkeypatch.setattr(
+        bounded_probe.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: process,
+    )
+    monkeypatch.setattr(bounded_probe, "_process_handle", lambda _process: 11)
+    monkeypatch.setattr(
+        bounded_probe,
+        "_ASSIGN_PROCESS_TO_JOB_OBJECT",
+        lambda _job, _process: 1,
+    )
+    monkeypatch.setattr(bounded_probe, "_NT_RESUME_PROCESS", lambda _process: 0)
+    monkeypatch.setattr(
+        bounded_probe,
+        "_terminate_job_best_effort",
+        lambda job: settled.append(("terminated", job)),
+    )
+    monkeypatch.setattr(
+        bounded_probe,
+        "_settle_process_tree",
+        lambda observed, job: settled.append(("settled", observed, job)),
+    )
+    monkeypatch.setattr(bounded_probe, "_join_readers", join_readers)
+    monkeypatch.setattr(bounded_probe, "_CLOSE_HANDLE", lambda _job: 1)
+
+    with pytest.raises(RuntimeError, match="resource budget exceeded") as caught:
+        run_bounded_probe_v1(
+            ("probe.exe",),
+            timeout_seconds=5,
+            output_limit=4_096,
+            progress_guard=guard,
+        )
+
+    assert caught.value is failure
+    assert guard_calls == 3
+    assert settled == [
+        ("terminated", 7),
+        ("settled", process, 7),
+        "pipes",
+    ]
+    assert process.stdout.closed
+    assert process.stderr.closed

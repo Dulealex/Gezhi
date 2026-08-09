@@ -71,7 +71,7 @@ SQLite、JSON、TOML、日志、哈希、路径、子进程和原子文件操作
 - `MODELSCOPE_CACHE` 仅在下载子进程中指向 `E:\Gezhi\.local\mineru`。
 - 固定模板为 `runtimes/ocr/mineru.template.json`，来源是 MinerU `3.4.4` 发布标签。
 - 实际配置生成到 `E:\Gezhi\.local\mineru\mineru.json`，不纳入 Git。
-- 运行 OCR 时向子进程注入 `MINERU_TOOLS_CONFIG_JSON=E:\Gezhi\.local\mineru\mineru.json`、`MINERU_MODEL_SOURCE=local`、`MINERU_DEVICE_MODE=cuda`、`HF_HUB_OFFLINE=1`、`TRANSFORMERS_OFFLINE=1` 和 `NO_PROXY=127.0.0.1,localhost`；最后一项只允许 MinerU client 直连其同一子进程树内的本机 API，外部代理配置保持不变。完整 profile 与 ModelScope 本地门见 [ADR 0123](./adr/0123-freeze-the-ocr-offline-profile-and-model-manifest.md)。
+- 运行 OCR 时先按 Windows 不区分大小写规则移除全部继承的 `PYTHON*`、`MINERU_*`、`MODELSCOPE_*`、`HF_*`、`HUGGINGFACE_*` 和 `TRANSFORMERS_*`，再向子进程注入 `MINERU_TOOLS_CONFIG_JSON=E:\Gezhi\.local\mineru\mineru.json`、`MINERU_MODEL_SOURCE=local`、`MINERU_DEVICE_MODE=cuda`、`HF_HUB_OFFLINE=1`、`TRANSFORMERS_OFFLINE=1`、`PYTHONDONTWRITEBYTECODE=1` 和 `NO_PROXY=127.0.0.1,localhost`；最后一项只允许 MinerU client 直连其同一子进程树内的本机 API，其他外部代理配置保持不变。完整 profile 与 ModelScope 本地门见 [ADR 0123](./adr/0123-freeze-the-ocr-offline-profile-and-model-manifest.md)，OCR stage 的 capture、磁盘与 provider 输出验收上限见 [ADR 0125](./adr/0125-publish-explicit-native-or-mineru-ocr-runs.md)。
 - 已验收的 pipeline 模型内容由 `runtimes/ocr/model-manifest.v1.json` 的 40 项相对 path、size 与 SHA-256 固定；运行期不得下载模型，Doctor 不得用目录存在或总大小替代逐文件身份复验。
 - 不设置用户级或系统级 MinerU/ModelScope 环境变量。
 

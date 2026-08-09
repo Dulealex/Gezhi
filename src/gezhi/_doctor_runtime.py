@@ -502,6 +502,7 @@ _OCR_POLICY_PREFIXES = (
     "hf_",
     "huggingface_",
     "transformers_",
+    "python",
 )
 
 
