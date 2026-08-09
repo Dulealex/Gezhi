@@ -152,6 +152,7 @@ def test_ocr_probe_environment_is_closed_over_provider_policy(
     monkeypatch.setenv("MODELSCOPE_OFFLINE", "invented")
     monkeypatch.setenv("HF_HOME", r"D:\hf")
     monkeypatch.setenv("TRANSFORMERS_CACHE", r"D:\transformers")
+    monkeypatch.setenv("NO_PROXY", "example.invalid")
     monkeypatch.setenv("UNRELATED", "preserved")
     config_path = Path(r"E:\Gezhi\.local\mineru\mineru.json")
 
@@ -166,6 +167,7 @@ def test_ocr_probe_environment_is_closed_over_provider_policy(
             "MINERU_DEVICE_MODE",
             "HF_HUB_OFFLINE",
             "TRANSFORMERS_OFFLINE",
+            "NO_PROXY",
             "MODELSCOPE_CACHE",
             "MODELSCOPE_OFFLINE",
             "HF_HOME",
@@ -177,11 +179,55 @@ def test_ocr_probe_environment_is_closed_over_provider_policy(
         "MINERU_DEVICE_MODE": "cuda",
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",
+        "NO_PROXY": "127.0.0.1,localhost",
         "MODELSCOPE_CACHE": None,
         "MODELSCOPE_OFFLINE": None,
         "HF_HOME": None,
         "TRANSFORMERS_CACHE": None,
     }
+
+
+def test_ocr_child_environment_rejects_python_startup_import_injection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    injected_python_environment = {
+        "PYTHONHOME": r"D:\shadow-python",
+        "PYTHONPATH": r"D:\shadow-imports",
+        "PYTHONSTARTUP": r"D:\startup.py",
+        "PYTHONINSPECT": "1",
+        "PYTHONUSERBASE": r"D:\shadow-user-site",
+        "PYTHONNOUSERSITE": "0",
+        "PYTHONSAFEPATH": "0",
+        "PYTHONPLATLIBDIR": "shadow-lib",
+        "PYTHONCASEOK": "1",
+        "PYTHONBREAKPOINT": "shadow.breakpoint",
+        "PYTHONEXECUTABLE": r"D:\shadow-python.exe",
+    }
+    for name, value in injected_python_environment.items():
+        monkeypatch.setenv(name, value)
+    approved_proxies = {
+        "HTTP_PROXY": "http://proxy.invalid:8080",
+        "HTTPS_PROXY": "http://proxy.invalid:8443",
+        "ALL_PROXY": "socks5://proxy.invalid:1080",
+    }
+    for name, value in approved_proxies.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("NO_PROXY", "example.invalid")
+
+    environment = runtime._ocr_probe_environment(
+        Path(r"E:\Gezhi\.local\mineru\mineru.json")
+    )
+
+    assert {
+        name.casefold()
+        for name in environment
+        if name.casefold().startswith("python")
+    } == {"pythondontwritebytecode"}
+    assert environment["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert {
+        name: environment.get(name) for name in approved_proxies
+    } == approved_proxies
+    assert environment["NO_PROXY"] == "127.0.0.1,localhost"
 
 
 def test_doctor_observer_composes_ready_checks_without_mutating_roots(

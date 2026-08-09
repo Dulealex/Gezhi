@@ -45,6 +45,14 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_INT64 = 9_223_372_036_854_775_807
 
 AddStopOutcome: TypeAlias = Literal["blocked", "failed"]
+ActiveSourceAuthorityStopReason: TypeAlias = Literal[
+    "active_source_invalid",
+    "active_source_unavailable",
+    "data_root_integrity_lost",
+    "identity_review_required",
+    "recovery_failed",
+    "work_not_found",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +165,27 @@ class _ActiveSourcePointerV1:
     source_id: str
     source_sha256: str
     work_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveSourceAuthorityV1:
+    """One target Work's validated Source authority for continuation."""
+
+    work_id: str
+    source_id: str
+    source_sha256: str
+    source_byte_length: int
+    source_manifest_sha256: str
+    work_directory: Path
+    source_directory: Path
+    original_pdf_path: Path
+    ingest_identity_ready: bool
+
+
+class ActiveSourceAuthorityStoppedV1(RuntimeError):
+    def __init__(self, reason: ActiveSourceAuthorityStopReason) -> None:
+        super().__init__(f"Active Source authority stopped: {reason}")
+        self.reason = reason
 
 
 def _valid_pdf_path(value: object) -> bool:
@@ -660,6 +689,140 @@ def _load_active_source(
         source_id=cast(str, value["source_id"]),
         source_sha256=cast(str, value["source_sha256"]),
         work_id=work_id,
+    )
+
+
+def _entry_names(parent: Path) -> frozenset[str]:
+    try:
+        with open_validated_data_root_v1(str(parent)):
+            return frozenset(entry.name for entry in parent.iterdir())
+    except (DataRootOpenErrorV1, OSError) as error:
+        raise ActiveSourceAuthorityStoppedV1("recovery_failed") from error
+
+
+def load_active_source_authority_v1(
+    work_id: str,
+    *,
+    root: ValidatedDataRootV1,
+) -> ActiveSourceAuthorityV1:
+    """Validate only the requested Work and its Active Source.
+
+    Resume must not let an unrelated damaged Work contaminate this target's
+    continuation point, so this deliberately avoids the root-wide catalog
+    projection scan used by add.
+    """
+
+    if type(work_id) is not str or _WORK_ID.fullmatch(work_id) is None:
+        raise TypeError("a validated Work ID is required")
+    root_path_text = root.inspection.canonical_path
+    if root_path_text is None:
+        raise RuntimeError("validated Literature root is incomplete")
+    try:
+        _root_checkpoint(root)
+    except AddStoppedV1 as error:
+        raise ActiveSourceAuthorityStoppedV1(
+            "data_root_integrity_lost"
+        ) from error
+
+    root_path = Path(root_path_text)
+    works_path = root_path / "works"
+    try:
+        work_names = _entry_names(works_path)
+    except ActiveSourceAuthorityStoppedV1 as error:
+        if not works_path.exists():
+            raise ActiveSourceAuthorityStoppedV1("work_not_found") from error
+        raise
+    if work_id not in work_names:
+        raise ActiveSourceAuthorityStoppedV1("work_not_found")
+    work_dir = works_path / work_id
+    if not _is_plain_directory(work_dir):
+        raise ActiveSourceAuthorityStoppedV1("recovery_failed")
+
+    try:
+        work, _work_bytes = _read_canonical_document(work_dir / "work.json")
+    except (OSError, ValueError) as error:
+        raise ActiveSourceAuthorityStoppedV1("recovery_failed") from error
+    if work != {
+        "schema_version": "gezhi.literature_work.v1",
+        "work_id": work_id,
+    }:
+        raise ActiveSourceAuthorityStoppedV1("recovery_failed")
+
+    try:
+        _aliases, _identity_sha256 = _load_work_identity(work_dir, work_id)
+    except (OSError, ValueError):
+        ingest_identity_ready = False
+    else:
+        ingest_identity_ready = True
+
+    work_entries = _entry_names(work_dir)
+    if "active_source.json" not in work_entries:
+        raise ActiveSourceAuthorityStoppedV1("active_source_unavailable")
+    try:
+        pointer = _load_active_source(work_dir, work_id)
+    except ValueError as error:
+        cause = error.__cause__
+        reason: ActiveSourceAuthorityStopReason = (
+            "active_source_unavailable"
+            if isinstance(cause, DataRootOpenErrorV1)
+            and cause.status == "unavailable"
+            else "active_source_invalid"
+        )
+        raise ActiveSourceAuthorityStoppedV1(reason) from error
+    if pointer is None:
+        raise ActiveSourceAuthorityStoppedV1("active_source_unavailable")
+
+    sources_path = work_dir / "sources"
+    try:
+        source_names = _entry_names(sources_path)
+    except ActiveSourceAuthorityStoppedV1 as error:
+        if not sources_path.exists():
+            raise ActiveSourceAuthorityStoppedV1(
+                "active_source_unavailable"
+            ) from error
+        raise
+    if pointer.source_id not in source_names:
+        raise ActiveSourceAuthorityStoppedV1("active_source_unavailable")
+    source_dir = sources_path / pointer.source_id
+    if not _is_plain_directory(source_dir):
+        raise ActiveSourceAuthorityStoppedV1("active_source_invalid")
+    try:
+        source_entries = _entry_names(source_dir)
+    except ActiveSourceAuthorityStoppedV1 as error:
+        raise ActiveSourceAuthorityStoppedV1("active_source_invalid") from error
+    if not {"manifest.json", "original.pdf", "source.json"}.issubset(
+        source_entries
+    ):
+        raise ActiveSourceAuthorityStoppedV1("active_source_unavailable")
+    try:
+        source = _load_source(
+            source_dir,
+            work_id=work_id,
+            source_id=pointer.source_id,
+        )
+    except (OSError, ValueError) as error:
+        raise ActiveSourceAuthorityStoppedV1("active_source_invalid") from error
+    if (
+        source.source_sha256 != pointer.source_sha256
+        or source.manifest_sha256 != pointer.manifest_sha256
+    ):
+        raise ActiveSourceAuthorityStoppedV1("active_source_invalid")
+    try:
+        _root_checkpoint(root)
+    except AddStoppedV1 as error:
+        raise ActiveSourceAuthorityStoppedV1(
+            "data_root_integrity_lost"
+        ) from error
+    return ActiveSourceAuthorityV1(
+        work_id=work_id,
+        source_id=source.source_id,
+        source_sha256=source.source_sha256,
+        source_byte_length=source.byte_length,
+        source_manifest_sha256=source.manifest_sha256,
+        work_directory=work_dir,
+        source_directory=source.directory,
+        original_pdf_path=source.directory / "original.pdf",
+        ingest_identity_ready=ingest_identity_ready,
     )
 
 
