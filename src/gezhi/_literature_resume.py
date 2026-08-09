@@ -18,9 +18,11 @@ from pathlib import Path
 from typing import BinaryIO, Literal, NoReturn, TypeAlias, cast
 
 from pypdf import PageObject, PdfReader
+from pypdf.generic import NullObject
 
 from gezhi._bounded_probe import (
     ProbeOutputLimitExceeded,
+    ProbeProgressGuardError,
     ProbeUnavailableError,
     run_bounded_probe_v1,
 )
@@ -46,6 +48,7 @@ _SOURCE_ID = re.compile(r"^src_[0-9a-f]{24}$")
 _RUN_ID = re.compile(
     r"^ocrrun_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
+_CURRENT_TEMP_NAME = re.compile(r"^\.current\.json\.[0-9a-f]{32}\.tmp$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_INT64 = 9_223_372_036_854_775_807
 _SELECTOR_PROFILE = "native_text_every_page_32_v1"
@@ -56,11 +59,13 @@ _OCR_RETRY_BACKOFF_SECONDS = 10.0
 _OCR_ARTIFACT_FILE_LIMIT = 536_870_912
 _OCR_ARTIFACT_AGGREGATE_LIMIT = 2_147_483_648
 _OCR_ARTIFACT_FILE_COUNT_LIMIT = 4_096
+_OCR_ARTIFACT_NAMESPACE_ENTRY_LIMIT = 8_192
 _OCR_AUDIT_FREE_SPACE_RESERVE = 16_777_216
 _OCR_JSON_FILE_LIMIT = 67_108_864
 _OCR_MARKDOWN_FILE_LIMIT = 67_108_864
 _OCR_IMAGE_FILE_LIMIT = 67_108_864
 _OCR_PDF_FILE_LIMIT = 134_217_728
+_PDF_FORM_BBOX_DECIMAL_PLACES = 4
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
 _STAGES = (
     "ingest",
@@ -209,7 +214,7 @@ class _RecoveryCertaintyLostV1(RuntimeError):
     """A namespace mutation cannot be represented by a handled receipt."""
 
 
-class _OcrArtifactBudgetExceededV1(RuntimeError):
+class _OcrArtifactBudgetExceededV1(ProbeProgressGuardError):
     """Provider output cannot remain inside the frozen audit budget."""
 
 
@@ -234,13 +239,25 @@ class _SelectionV1:
 
 
 @dataclass(frozen=True, slots=True)
+class _PdfXObjectEvidenceV1:
+    path: str
+    subtype: str
+    bbox: tuple[float, float, float, float] | None
+    matrix: tuple[float, float, float, float, float, float] | None
+    form_type: int | None
+    width: int | None
+    height: int | None
+    stream_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class _PdfPageEvidenceV1:
     media_box: tuple[float, float, float, float]
     crop_box: tuple[float, float, float, float]
     rotation: int
     user_unit: float
     content_stream_sha256: tuple[str, ...]
-    xobjects: tuple[tuple[str, str, int | None, int | None, str], ...]
+    xobjects: tuple[_PdfXObjectEvidenceV1, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,12 +298,39 @@ def _ensure_plain_directory(path: Path) -> None:
         raise _CommitFailedV1("OCR directory commit failed") from error
 
 
+def _ensure_recovery_directory(path: Path) -> None:
+    try:
+        with open_validated_data_root_v1(str(path.parent)):
+            try:
+                path.mkdir()
+            except FileExistsError:
+                pass
+    except (DataRootOpenErrorV1, OSError) as error:
+        raise _CommitFailedV1("OCR recovery directory creation failed") from error
+    try:
+        with open_validated_data_root_v1(str(path)):
+            pass
+    except DataRootOpenErrorV1 as error:
+        raise _RecoveryCertaintyLostV1(
+            "OCR recovery directory cannot be proven"
+        ) from error
+
+
 def _safe_entry_names(path: Path) -> frozenset[str]:
     try:
         with open_validated_data_root_v1(str(path)):
             return frozenset(item.name for item in path.iterdir())
     except (DataRootOpenErrorV1, OSError) as error:
         raise _RunInvalidV1("OCR directory inventory is invalid") from error
+
+
+def _recovery_entry_names(path: Path) -> frozenset[str]:
+    try:
+        return _safe_entry_names(path)
+    except _RunInvalidV1 as error:
+        raise _RecoveryCertaintyLostV1(
+            "OCR recovery namespace cannot be proven"
+        ) from error
 
 
 def _read_safe_bytes(path: Path, *, limit: int = _MAX_INT64) -> bytes:
@@ -302,7 +346,7 @@ def _read_canonical_document(path: Path) -> tuple[dict[str, object], bytes]:
     try:
         value = json.loads(payload)
         canonical = _canonical_json_bytes(value)
-    except (TypeError, ValueError) as error:
+    except (OverflowError, RecursionError, TypeError, ValueError) as error:
         raise _RunInvalidV1("OCR document is invalid") from error
     if type(value) is not dict or payload != canonical:
         raise _RunInvalidV1("OCR document is not canonical")
@@ -460,6 +504,22 @@ def _resolve_ocr_runtime_v1() -> OcrRuntimeProfileV1:
     )
 
 
+def _valid_ocr_runtime_profile_v1(profile: object) -> bool:
+    return (
+        type(profile) is OcrRuntimeProfileV1
+        and type(profile.executable_path) is str
+        and type(profile.environment) is tuple
+        and all(
+            type(item) is tuple
+            and len(item) == 2
+            and type(item[0]) is str
+            and type(item[1]) is str
+            for item in profile.environment
+        )
+        and profile.profile_identity_sha256 == _MINERU_PROFILE_IDENTITY
+    )
+
+
 def _stage_for_provider_output(output_root: Path) -> Path | None:
     if (
         output_root.name != "provider_output"
@@ -489,6 +549,7 @@ def _scan_ocr_artifact_tree(root: Path) -> tuple[int, int]:
         ) from error
     count = 0
     total = 0
+    namespace_entries = 0
     directories = [root]
     seen: set[tuple[int, int]] = set()
     while directories:
@@ -507,45 +568,64 @@ def _scan_ocr_artifact_tree(root: Path) -> tuple[int, int]:
                     "OCR artifact namespace is unsafe"
                 )
             seen.add(identity)
-            entries = tuple(os.scandir(directory))
         except _OcrArtifactBudgetExceededV1:
             raise
         except OSError as error:
             raise _OcrArtifactBudgetExceededV1(
                 "OCR artifact namespace is unavailable"
             ) from error
-        for entry in entries:
-            try:
-                facts = entry.stat(follow_symlinks=False)
-            except OSError as error:
-                raise _OcrArtifactBudgetExceededV1(
-                    "OCR artifact cannot be measured"
-                ) from error
-            if (
-                entry.is_symlink()
-                or getattr(facts, "st_file_attributes", 0)
-                & _FILE_ATTRIBUTE_REPARSE_POINT
-            ):
-                raise _OcrArtifactBudgetExceededV1(
-                    "OCR artifact reparse point is forbidden"
-                )
-            if stat.S_ISDIR(facts.st_mode):
-                directories.append(Path(entry.path))
-                continue
-            if not stat.S_ISREG(facts.st_mode) or facts.st_size < 0:
-                raise _OcrArtifactBudgetExceededV1(
-                    "OCR artifact file type is forbidden"
-                )
-            count += 1
-            total += facts.st_size
-            if (
-                facts.st_size > _OCR_ARTIFACT_FILE_LIMIT
-                or count > _OCR_ARTIFACT_FILE_COUNT_LIMIT
-                or total > _OCR_ARTIFACT_AGGREGATE_LIMIT
-            ):
-                raise _OcrArtifactBudgetExceededV1(
-                    "OCR artifact budget was exceeded"
-                )
+        try:
+            entries = os.scandir(directory)
+        except OSError as error:
+            raise _OcrArtifactBudgetExceededV1(
+                "OCR artifact namespace is unavailable"
+            ) from error
+        try:
+            for entry in entries:
+                namespace_entries += 1
+                if namespace_entries > _OCR_ARTIFACT_NAMESPACE_ENTRY_LIMIT:
+                    raise _OcrArtifactBudgetExceededV1(
+                        "OCR artifact namespace exceeds its limit"
+                    )
+                try:
+                    facts = entry.stat(follow_symlinks=False)
+                except OSError as error:
+                    raise _OcrArtifactBudgetExceededV1(
+                        "OCR artifact cannot be measured"
+                    ) from error
+                if (
+                    entry.is_symlink()
+                    or getattr(facts, "st_file_attributes", 0)
+                    & _FILE_ATTRIBUTE_REPARSE_POINT
+                ):
+                    raise _OcrArtifactBudgetExceededV1(
+                        "OCR artifact reparse point is forbidden"
+                    )
+                if stat.S_ISDIR(facts.st_mode):
+                    directories.append(Path(entry.path))
+                    continue
+                if not stat.S_ISREG(facts.st_mode) or facts.st_size < 0:
+                    raise _OcrArtifactBudgetExceededV1(
+                        "OCR artifact file type is forbidden"
+                    )
+                count += 1
+                total += facts.st_size
+                if (
+                    facts.st_size > _OCR_ARTIFACT_FILE_LIMIT
+                    or count > _OCR_ARTIFACT_FILE_COUNT_LIMIT
+                    or total > _OCR_ARTIFACT_AGGREGATE_LIMIT
+                ):
+                    raise _OcrArtifactBudgetExceededV1(
+                        "OCR artifact budget was exceeded"
+                    )
+        except _OcrArtifactBudgetExceededV1:
+            raise
+        except OSError as error:
+            raise _OcrArtifactBudgetExceededV1(
+                "OCR artifact namespace is unavailable"
+            ) from error
+        finally:
+            entries.close()
     return count, total
 
 
@@ -573,6 +653,26 @@ def _enforce_ocr_artifact_budget_v1(stage: Path) -> None:
             raise _OcrArtifactBudgetExceededV1(
                 "OCR artifact aggregate budget was exceeded"
             )
+
+
+def _enforce_ocr_input_budget_v1(authority: ActiveSourceAuthorityV1) -> None:
+    if (
+        type(authority.source_byte_length) is not int
+        or not 0 <= authority.source_byte_length <= _OCR_PDF_FILE_LIMIT
+    ):
+        raise _OcrArtifactBudgetExceededV1(
+            "OCR source PDF exceeds its semantic input limit"
+        )
+    try:
+        free = shutil.disk_usage(authority.source_directory).free
+    except OSError as error:
+        raise _OcrArtifactBudgetExceededV1(
+            "OCR input free space cannot be measured"
+        ) from error
+    if free < authority.source_byte_length + _OCR_AUDIT_FREE_SPACE_RESERVE:
+        raise _OcrArtifactBudgetExceededV1(
+            "OCR input copy cannot preserve the audit reserve"
+        )
 
 
 def _run_ocr_attempt_v1(
@@ -670,17 +770,377 @@ _CONTENT_LIST_V2_TYPES = frozenset(
         "title",
     }
 )
+_CONTENT_LIST_TEXT_TYPES = frozenset(
+    {
+        "aside_text",
+        "footer",
+        "header",
+        "index",
+        "page_footnote",
+        "page_number",
+        "text",
+    }
+)
+_CONTENT_LIST_V2_SPAN_TYPES = frozenset(
+    {"code_inline", "equation_inline", "md", "phonetic", "text"}
+)
+_MIDDLE_BLOCK_TYPES = frozenset(
+    {
+        "abstract",
+        "algorithm",
+        "algorithm_caption",
+        "aside_text",
+        "caption",
+        "chart",
+        "chart_body",
+        "chart_caption",
+        "chart_footnote",
+        "code",
+        "code_body",
+        "code_caption",
+        "code_footnote",
+        "discarded",
+        "doc_title",
+        "equation",
+        "footer",
+        "footer_image",
+        "footnote",
+        "formula_number",
+        "header",
+        "header_image",
+        "image",
+        "image_body",
+        "image_caption",
+        "image_footnote",
+        "index",
+        "interline_equation",
+        "list",
+        "page_footnote",
+        "page_number",
+        "paragraph_title",
+        "phonetic",
+        "ref_text",
+        "table",
+        "table_body",
+        "table_caption",
+        "table_footnote",
+        "text",
+        "title",
+        "vertical_text",
+    }
+)
+_MIDDLE_GROUP_BLOCK_TYPES = frozenset({"chart", "code", "image", "table"})
+_MIDDLE_TEXT_SPAN_TYPES = frozenset(
+    {"equation", "inline_equation", "interline_equation", "text"}
+)
+_MIDDLE_IMAGE_SPAN_TYPES = frozenset({"chart", "image", "table"})
 
 
 def _valid_positive_dimension(value: object) -> bool:
+    if type(value) not in {int, float}:
+        return False
+    try:
+        numeric = float(cast(int | float, value))
+    except (OverflowError, ValueError):
+        return False
+    return math.isfinite(numeric) and numeric > 0
+
+
+def _valid_provider_bbox(value: object) -> bool:
+    if type(value) is not list or len(value) != 4:
+        return False
+    if any(type(item) not in {int, float} for item in value):
+        return False
+    try:
+        coordinates = tuple(float(cast(int | float, item)) for item in value)
+    except (OverflowError, TypeError, ValueError):
+        return False
     return (
-        type(value) in {int, float}
-        and math.isfinite(cast(float, value))
-        and cast(float, value) > 0
+        all(math.isfinite(item) for item in coordinates)
+        and coordinates[2] > coordinates[0]
+        and coordinates[3] > coordinates[1]
     )
 
 
-def _validate_middle_document(value: object) -> int:
+def _valid_unit_score(value: object) -> bool:
+    if type(value) not in {int, float}:
+        return False
+    try:
+        numeric = float(cast(int | float, value))
+    except (OverflowError, ValueError):
+        return False
+    return math.isfinite(numeric) and 0 <= numeric <= 1
+
+
+def _valid_string_list(value: object) -> bool:
+    return type(value) is list and all(type(item) is str for item in value)
+
+
+def _valid_v2_span_list(value: object) -> bool:
+    return type(value) is list and all(
+        type(item) is dict
+        and set(item) == {"content", "type"}
+        and item.get("type") in _CONTENT_LIST_V2_SPAN_TYPES
+        and type(item.get("content")) is str
+        for item in value
+    )
+
+
+def _valid_provider_image_path(
+    value: object,
+    provider_paths: Collection[str],
+) -> bool:
+    return (
+        type(value) is str
+        and value in provider_paths
+        and re.fullmatch(
+            r"images/[^/]+\.(?:jpeg|jpg|png)",
+            value,
+            flags=re.IGNORECASE,
+        )
+        is not None
+    )
+
+
+def _valid_middle_image_path_v1(
+    value: object,
+    provider_paths: Collection[str],
+) -> bool:
+    return (
+        type(value) is str
+        and re.fullmatch(
+            r"[^/]+\.(?:jpeg|jpg|png)",
+            value,
+            flags=re.IGNORECASE,
+        )
+        is not None
+        and f"images/{value}" in provider_paths
+    )
+
+
+def _valid_image_source(
+    value: object,
+    provider_paths: Collection[str],
+) -> bool:
+    return (
+        type(value) is dict
+        and set(value) == {"path"}
+        and _valid_provider_image_path(value.get("path"), provider_paths)
+    )
+
+
+def _valid_v1_content_payload(
+    item: dict[str, object],
+    item_type: str,
+    provider_paths: Collection[str],
+) -> bool:
+    if item_type in _CONTENT_LIST_TEXT_TYPES:
+        return type(item.get("text")) is str
+    if item_type == "list":
+        return (
+            type(item.get("sub_type")) is str
+            and _valid_string_list(item.get("list_items"))
+        )
+    if item_type == "equation":
+        return _valid_provider_image_path(item.get("img_path"), provider_paths) and (
+            "text" not in item or type(item["text"]) is str
+        )
+    if item_type in {"image", "table", "chart"}:
+        return (
+            _valid_provider_image_path(item.get("img_path"), provider_paths)
+            and _valid_string_list(item.get(f"{item_type}_caption"))
+            and _valid_string_list(item.get(f"{item_type}_footnote"))
+        )
+    if item_type == "code":
+        return (
+            type(item.get("sub_type")) is str
+            and _valid_string_list(item.get("code_caption"))
+            and _valid_string_list(item.get("code_footnote"))
+            and (
+                "code_body" not in item or type(item.get("code_body")) is str
+            )
+        )
+    return False
+
+
+def _valid_v2_list_items(value: object) -> bool:
+    return type(value) is list and all(
+        type(item) is dict
+        and set(item) == {"item_content", "item_type"}
+        and item.get("item_type") == "text"
+        and _valid_v2_span_list(item.get("item_content"))
+        for item in value
+    )
+
+
+def _valid_v2_content_payload(
+    item_type: str,
+    value: object,
+    provider_paths: Collection[str],
+) -> bool:
+    if type(value) is not dict:
+        return False
+    content = cast(dict[str, object], value)
+    if item_type == "paragraph":
+        return _valid_v2_span_list(content.get("paragraph_content"))
+    if item_type == "title":
+        return (
+            _valid_v2_span_list(content.get("title_content"))
+            and type(content.get("level")) is int
+            and cast(int, content["level"]) > 0
+        )
+    if item_type in {
+        "page_aside_text",
+        "page_footer",
+        "page_footnote",
+        "page_header",
+        "page_number",
+    }:
+        return _valid_v2_span_list(content.get(f"{item_type}_content"))
+    if item_type == "equation_interline":
+        return (
+            type(content.get("math_content")) is str
+            and content.get("math_type") == "latex"
+            and _valid_image_source(content.get("image_source"), provider_paths)
+        )
+    if item_type in {"image", "chart"}:
+        return (
+            _valid_image_source(content.get("image_source"), provider_paths)
+            and _valid_v2_span_list(content.get(f"{item_type}_caption"))
+            and _valid_v2_span_list(content.get(f"{item_type}_footnote"))
+        )
+    if item_type == "table":
+        return (
+            _valid_image_source(content.get("image_source"), provider_paths)
+            and _valid_v2_span_list(content.get("table_caption"))
+            and _valid_v2_span_list(content.get("table_footnote"))
+            and type(content.get("html")) is str
+            and content.get("table_type") in {"complex_table", "simple_table"}
+            and type(content.get("table_nest_level")) is int
+            and cast(int, content["table_nest_level"]) > 0
+        )
+    if item_type in {"code", "algorithm"}:
+        return (
+            _valid_v2_span_list(content.get(f"{item_type}_caption"))
+            and _valid_v2_span_list(content.get(f"{item_type}_content"))
+            and _valid_v2_span_list(content.get(f"{item_type}_footnote"))
+            and (
+                item_type != "code"
+                or type(content.get("code_language")) is str
+            )
+        )
+    if item_type in {"list", "index"}:
+        return (
+            content.get("list_type") in {"reference_list", "text_list"}
+            and _valid_v2_list_items(content.get("list_items"))
+            and (
+                "attribute" not in content
+                or type(content.get("attribute")) is str
+            )
+        )
+    return False
+
+
+def _valid_middle_span_v1(
+    value: object,
+    provider_paths: Collection[str],
+) -> bool:
+    if (
+        type(value) is not dict
+        or value.get("type")
+        not in _MIDDLE_TEXT_SPAN_TYPES | _MIDDLE_IMAGE_SPAN_TYPES
+        or not _valid_provider_bbox(value.get("bbox"))
+    ):
+        return False
+    span = cast(dict[str, object], value)
+    span_type = cast(str, span["type"])
+    if span_type in _MIDDLE_IMAGE_SPAN_TYPES:
+        if not _valid_middle_image_path_v1(span.get("image_path"), provider_paths):
+            return False
+    elif type(span.get("content")) is not str or not _valid_unit_score(
+        span.get("score")
+    ):
+        return False
+    if "cross_page" in span and type(span["cross_page"]) is not bool:
+        return False
+    if "width" not in span and "height" not in span:
+        return True
+    return (
+        _valid_positive_dimension(span.get("width"))
+        and _valid_positive_dimension(span.get("height"))
+    )
+
+
+def _valid_middle_line_v1(
+    value: object,
+    provider_paths: Collection[str],
+) -> bool:
+    return (
+        type(value) is dict
+        and set(value) == {"bbox", "spans"}
+        and _valid_provider_bbox(value.get("bbox"))
+        and type(value.get("spans")) is list
+        and all(
+            _valid_middle_span_v1(span, provider_paths)
+            for span in cast(list[object], value["spans"])
+        )
+    )
+
+
+def _valid_middle_blocks_v1(
+    values: object,
+    provider_paths: Collection[str],
+) -> bool:
+    if type(values) is not list:
+        return False
+    pending = list(cast(list[object], values))
+    while pending:
+        value = pending.pop()
+        if type(value) is not dict:
+            return False
+        block = cast(dict[str, object], value)
+        block_type = block.get("type")
+        if (
+            type(block_type) is not str
+            or block_type not in _MIDDLE_BLOCK_TYPES
+            or not _valid_provider_bbox(block.get("bbox"))
+            or type(block.get("index")) is not int
+            or not 0 <= cast(int, block["index"]) <= _MAX_INT64
+            or not _valid_unit_score(block.get("score"))
+        ):
+            return False
+        grouped = block_type in _MIDDLE_GROUP_BLOCK_TYPES
+        if grouped:
+            if type(block.get("blocks")) is not list or "lines" in block:
+                return False
+            pending.extend(cast(list[object], block["blocks"]))
+        else:
+            lines = block.get("lines")
+            if (
+                type(lines) is not list
+                or "blocks" in block
+                or not all(
+                    _valid_middle_line_v1(line, provider_paths)
+                    for line in cast(list[object], lines)
+                )
+            ):
+                return False
+        if "bbox_fs" in block and not _valid_provider_bbox(block["bbox_fs"]):
+            return False
+        if "lines_deleted" in block and type(block["lines_deleted"]) is not bool:
+            return False
+        if "level" in block and (
+            type(block["level"]) is not int or cast(int, block["level"]) <= 0
+        ):
+            return False
+    return True
+
+
+def _validate_middle_document(
+    value: object,
+    *,
+    provider_paths: Collection[str] = (),
+) -> int:
     if (
         type(value) is not dict
         or value.get("_backend") != "pipeline"
@@ -696,12 +1156,15 @@ def _validate_middle_document(value: object) -> int:
             raise _OcrOutputInvalidV1("MinerU middle page is invalid")
         size = page.get("page_size")
         if (
-            page.get("page_idx") != index
+            type(page.get("page_idx")) is not int
+            or page.get("page_idx") != index
             or type(size) is not list
             or len(size) != 2
             or not all(_valid_positive_dimension(item) for item in size)
-            or type(page.get("para_blocks")) is not list
-            or type(page.get("discarded_blocks")) is not list
+            or not _valid_middle_blocks_v1(page.get("para_blocks"), provider_paths)
+            or not _valid_middle_blocks_v1(
+                page.get("discarded_blocks"), provider_paths
+            )
         ):
             raise _OcrOutputInvalidV1("MinerU middle page is invalid")
     return len(pages)
@@ -712,6 +1175,7 @@ def _validate_content_documents(
     content_list_v2: object,
     *,
     page_count: int,
+    provider_paths: Collection[str],
 ) -> None:
     if type(content_list) is not list or type(content_list_v2) is not list:
         raise _OcrOutputInvalidV1("MinerU content list is invalid")
@@ -722,6 +1186,12 @@ def _validate_content_documents(
             or item.get("type") not in _CONTENT_LIST_TYPES
             or type(item.get("page_idx")) is not int
             or not 0 <= cast(int, item["page_idx"]) < page_count
+            or not _valid_provider_bbox(item.get("bbox"))
+            or not _valid_v1_content_payload(
+                cast(dict[str, object], item),
+                cast(str, item["type"]),
+                provider_paths,
+            )
         ):
             raise _OcrOutputInvalidV1("MinerU content item is invalid")
     if len(content_list_v2) != page_count:
@@ -734,8 +1204,12 @@ def _validate_content_documents(
                 type(item) is not dict
                 or type(item.get("type")) is not str
                 or item.get("type") not in _CONTENT_LIST_V2_TYPES
-                or type(item.get("content")) is not dict
-                or not item["content"]
+                or not _valid_provider_bbox(item.get("bbox"))
+                or not _valid_v2_content_payload(
+                    cast(str, item["type"]),
+                    item.get("content"),
+                    provider_paths,
+                )
             ):
                 raise _OcrOutputInvalidV1("MinerU v2 content item is invalid")
 
@@ -749,11 +1223,20 @@ def _validate_model_document(value: object, *, page_count: int) -> None:
         page = item.get("page_info")
         if (
             type(page) is not dict
+            or type(page.get("page_no")) is not int
             or page.get("page_no") != index
             or not _valid_positive_dimension(page.get("width"))
             or not _valid_positive_dimension(page.get("height"))
         ):
             raise _OcrOutputInvalidV1("MinerU model page is invalid")
+        for detection in cast(list[object], item["layout_dets"]):
+            if (
+                type(detection) is not dict
+                or type(detection.get("label")) is not str
+                or not _valid_provider_bbox(detection.get("bbox"))
+                or not _valid_unit_score(detection.get("score"))
+            ):
+                raise _OcrOutputInvalidV1("MinerU model item is invalid")
 
 
 def _pdf_rectangle_v1(value: object) -> tuple[float, float, float, float]:
@@ -773,9 +1256,58 @@ def _pdf_rectangle_v1(value: object) -> tuple[float, float, float, float]:
     return cast(tuple[float, float, float, float], coordinates)
 
 
+def _pdf_form_bbox_v1(value: object) -> tuple[float, float, float, float]:
+    try:
+        coordinates = tuple(
+            float(cast(float, item)) for item in cast(Iterable[object], value)
+        )
+    except (TypeError, ValueError) as error:
+        raise _OcrOutputInvalidV1("MinerU PDF Form BBox is invalid") from error
+    if (
+        len(coordinates) != 4
+        or not all(math.isfinite(item) for item in coordinates)
+        or coordinates[2] == coordinates[0]
+        or coordinates[3] == coordinates[1]
+    ):
+        raise _OcrOutputInvalidV1("MinerU PDF Form BBox is invalid")
+    canonical = tuple(
+        round(item, _PDF_FORM_BBOX_DECIMAL_PLACES) for item in coordinates
+    )
+    if canonical[2] == canonical[0] or canonical[3] == canonical[1]:
+        raise _OcrOutputInvalidV1("MinerU PDF Form BBox is invalid")
+    return cast(tuple[float, float, float, float], canonical)
+
+
+def _pdf_matrix_v1(
+    value: object,
+) -> tuple[float, float, float, float, float, float]:
+    try:
+        coordinates = tuple(
+            float(cast(float, item)) for item in cast(Iterable[object], value)
+        )
+    except (TypeError, ValueError) as error:
+        raise _OcrOutputInvalidV1("MinerU PDF Form matrix is invalid") from error
+    if len(coordinates) != 6 or not all(
+        math.isfinite(item) for item in coordinates
+    ):
+        raise _OcrOutputInvalidV1("MinerU PDF Form matrix is invalid")
+    return cast(tuple[float, float, float, float, float, float], coordinates)
+
+
 def _resolved_pdf_object_v1(value: object) -> object:
     resolver = getattr(value, "get_object", None)
     return resolver() if callable(resolver) else value
+
+
+def _single_pdf_filter_value_v1(value: object) -> object:
+    resolved = _resolved_pdf_object_v1(value)
+    if isinstance(resolved, list):
+        if len(resolved) != 1:
+            raise _OcrOutputInvalidV1("MinerU PDF filter array is invalid")
+        resolved = _resolved_pdf_object_v1(resolved[0])
+    if isinstance(resolved, NullObject):
+        return None
+    return resolved
 
 
 def _bounded_flate_decode_v1(payload: bytes, *, limit: int) -> bytes:
@@ -816,9 +1348,13 @@ def _decoded_pdf_stream_hashes_v1(
     payload = getattr(resolved, "_data", None)
     if type(payload) is not bytes:
         raise _OcrOutputInvalidV1("MinerU PDF content stream is invalid")
-    filter_value = _resolved_pdf_object_v1(resolved.get("/Filter"))
-    decode_parameters = _resolved_pdf_object_v1(resolved.get("/DecodeParms"))
+    filter_value = _single_pdf_filter_value_v1(resolved.get("/Filter"))
+    decode_parameters = _single_pdf_filter_value_v1(
+        resolved.get("/DecodeParms")
+    )
     if filter_value is None:
+        if decode_parameters is not None:
+            raise _OcrOutputInvalidV1("MinerU PDF decode parameters are invalid")
         decoded = payload
     elif str(filter_value) in {"/Fl", "/FlateDecode"} and (
         decode_parameters is None
@@ -841,10 +1377,12 @@ def _decoded_pdf_stream_hashes_v1(
     return (hashlib.sha256(decoded).hexdigest(),)
 
 
-def _pdf_xobject_evidence_v1(page: PageObject) -> tuple[
-    tuple[str, str, int | None, int | None, str], ...
-]:
-    records: list[tuple[str, str, int | None, int | None, str]] = []
+def _pdf_xobject_evidence_v1(
+    page: PageObject,
+    *,
+    decode_budget: list[int],
+) -> tuple[_PdfXObjectEvidenceV1, ...]:
+    records: list[_PdfXObjectEvidenceV1] = []
 
     def collect(
         resources_value: object,
@@ -875,18 +1413,62 @@ def _pdf_xobject_evidence_v1(page: PageObject) -> tuple[
             payload = getattr(xobject, "_data", None)
             if type(payload) is not bytes:
                 raise _OcrOutputInvalidV1("MinerU PDF XObject stream is invalid")
-            width_value = xobject.get("/Width")
-            height_value = xobject.get("/Height")
-            width = width_value if type(width_value) is int else None
-            height = height_value if type(height_value) is int else None
+            subtype = str(xobject.get("/Subtype"))
+            if subtype == "/Form":
+                decoded = _decoded_pdf_stream_hashes_v1(
+                    xobject,
+                    budget=decode_budget,
+                )
+                if len(decoded) != 1:
+                    raise _OcrOutputInvalidV1("MinerU PDF Form is invalid")
+                stream_sha256 = decoded[0]
+                bbox = _pdf_form_bbox_v1(xobject.get("/BBox"))
+                matrix = _pdf_matrix_v1(
+                    xobject.get("/Matrix", [1, 0, 0, 1, 0, 0])
+                )
+                form_type_value = xobject.get("/FormType", 1)
+                if (
+                    not isinstance(form_type_value, int)
+                    or type(form_type_value) is bool
+                    or int(form_type_value) != 1
+                ):
+                    raise _OcrOutputInvalidV1("MinerU PDF Form type is invalid")
+                form_type = 1
+                width = None
+                height = None
+            elif subtype == "/Image":
+                stream_sha256 = hashlib.sha256(payload).hexdigest()
+                bbox = None
+                matrix = None
+                form_type = None
+                width_value = xobject.get("/Width")
+                height_value = xobject.get("/Height")
+                if (
+                    not isinstance(width_value, int)
+                    or type(width_value) is bool
+                    or int(width_value) <= 0
+                    or not isinstance(height_value, int)
+                    or type(height_value) is bool
+                    or int(height_value) <= 0
+                ):
+                    raise _OcrOutputInvalidV1(
+                        "MinerU PDF Image dimensions are invalid"
+                    )
+                width = int(width_value)
+                height = int(height_value)
+            else:
+                raise _OcrOutputInvalidV1("MinerU PDF XObject subtype is invalid")
             path = f"{prefix}{name}"
             records.append(
-                (
-                    path,
-                    str(xobject.get("/Subtype")),
-                    width,
-                    height,
-                    hashlib.sha256(payload).hexdigest(),
+                _PdfXObjectEvidenceV1(
+                    path=path,
+                    subtype=subtype,
+                    bbox=bbox,
+                    matrix=matrix,
+                    form_type=form_type,
+                    width=width,
+                    height=height,
+                    stream_sha256=stream_sha256,
                 )
             )
             if len(records) > _OCR_ARTIFACT_FILE_COUNT_LIMIT:
@@ -931,7 +1513,10 @@ def _pdf_page_evidence_v1(
             page.get("/Contents"),
             budget=decode_budget,
         ),
-        xobjects=_pdf_xobject_evidence_v1(page),
+        xobjects=_pdf_xobject_evidence_v1(
+            page,
+            decode_budget=decode_budget,
+        ),
     )
 
 
@@ -1044,11 +1629,12 @@ def _validate_provider_output(
                 limit=_OCR_JSON_FILE_LIMIT,
             )
         )
-        page_count = _validate_middle_document(middle)
+        page_count = _validate_middle_document(middle, provider_paths=paths)
         _validate_content_documents(
             content_list,
             content_list_v2,
             page_count=page_count,
+            provider_paths=paths,
         )
         _validate_model_document(model, page_count=page_count)
         _validate_pdf_output(leaf / "source_layout.pdf", page_count=page_count)
@@ -1070,7 +1656,10 @@ def _validate_provider_output(
         DataRootOpenErrorV1,
         DataRootLifecycleErrorV1,
         OSError,
+        OverflowError,
+        RecursionError,
         UnicodeDecodeError,
+        ValueError,
         json.JSONDecodeError,
         _RunInvalidV1,
         _OcrOutputInvalidV1,
@@ -1179,6 +1768,12 @@ def _write_attempt_assets(
     stderr: bytes,
     document: dict[str, object],
 ) -> None:
+    if type(stdout) is not bytes or type(stderr) is not bytes:
+        raise TypeError("OCR attempt capture is invalid")
+    if len(stdout) + len(stderr) > _OCR_OUTPUT_LIMIT:
+        raise _OcrArtifactBudgetExceededV1(
+            "OCR attempt capture exceeds its audit limit"
+        )
     _write_new_verified(attempt_dir / "stdout.bin", stdout)
     _write_new_verified(attempt_dir / "stderr.bin", stderr)
     _write_new_verified(
@@ -1368,6 +1963,21 @@ def _validate_attempts(
             raise _RunInvalidV1("OCR attempt evidence is incomplete")
         if names - {"provider_output", "receipt.json", "stderr.bin", "stdout.bin"}:
             raise _RunInvalidV1("OCR attempt inventory is invalid")
+        capture_size = 0
+        try:
+            with (
+                open_validated_local_file_v1(
+                    str(attempt_dir / "stdout.bin")
+                ) as stdout_file,
+                open_validated_local_file_v1(
+                    str(attempt_dir / "stderr.bin")
+                ) as stderr_file,
+            ):
+                capture_size = stdout_file.size + stderr_file.size
+                if capture_size > _OCR_OUTPUT_LIMIT:
+                    raise _RunInvalidV1("OCR attempt capture exceeds its limit")
+        except (DataRootOpenErrorV1, OSError) as error:
+            raise _RunInvalidV1("OCR attempt capture is unsafe") from error
         if "provider_output" in names:
             try:
                 with open_validated_data_root_v1(
@@ -1383,6 +1993,7 @@ def _validate_attempts(
         returncode = document.get("returncode")
         if (
             set(document) != {"attempt", "outcome", "returncode", "schema_version"}
+            or type(document.get("attempt")) is not int
             or document.get("attempt") != attempt
             or type(outcome) is not str
             or outcome
@@ -1412,6 +2023,10 @@ def _validate_attempts(
             or (outcome == "succeeded" and returncode != 0)
             or (outcome == "output_invalid" and returncode != 0)
             or (outcome == "process_failed" and returncode == 0)
+            or (
+                outcome == "output_limit_exceeded"
+                and capture_size != _OCR_OUTPUT_LIMIT
+            )
         ):
             raise _RunInvalidV1("OCR attempt receipt is invalid")
         outcomes.append(cast(str, outcome))
@@ -1543,6 +2158,7 @@ def _load_run(
                 if (
                     type(page) is not dict
                     or set(page) != {"page_index", "text"}
+                    or type(page.get("page_index")) is not int
                     or page.get("page_index") != index
                     or type(page.get("text")) is not str
                     or sum(
@@ -1613,35 +2229,53 @@ def _current_document(
     }
 
 
+def _write_current_staging_v1(path: Path, payload: bytes) -> None:
+    try:
+        with (
+            open_validated_data_root_v1(str(path.parent)),
+            path.open("xb", buffering=0) as destination,
+        ):
+            _write_all(destination, payload)
+    except FileExistsError as error:
+        raise _RecoveryCertaintyLostV1(
+            "OCR current staging target conflicts"
+        ) from error
+    except (DataRootOpenErrorV1, OSError) as error:
+        raise _CommitFailedV1("OCR current staging write failed") from error
+    try:
+        if _read_safe_bytes(path, limit=len(payload)) != payload:
+            raise OSError("OCR current staging readback differs")
+    except (_RunInvalidV1, OSError) as error:
+        raise _CommitFailedV1("OCR current staging readback failed") from error
+
+
 def _atomic_replace_current(
     ocr_dir: Path,
     authority: ActiveSourceAuthorityV1,
     run: _ValidatedRunV1,
+    root: ValidatedDataRootV1,
 ) -> None:
     payload = _canonical_json_bytes(_current_document(authority, run))
     temporary = ocr_dir / f".current.json.{uuid.uuid4().hex}.tmp"
+    _fresh_authority_or_stop(authority, root)
+    _write_current_staging_v1(temporary, payload)
+    _fresh_authority_or_stop(authority, root)
     try:
-        _write_new_verified(temporary, payload)
         os.replace(temporary, ocr_dir / "current.json")
         if _read_safe_bytes(ocr_dir / "current.json", limit=len(payload)) != payload:
             raise OSError("OCR current readback differs")
-    except (_CommitFailedV1, _RunInvalidV1, OSError) as error:
-        try:
-            if temporary.exists():
-                temporary.unlink()
-        except OSError:
-            pass
-        raise _CommitFailedV1("OCR current commit failed") from error
+    except (_RunInvalidV1, OSError) as error:
+        raise _RecoveryCertaintyLostV1(
+            "OCR current replacement is uncertain"
+        ) from error
 
 
-def _load_current_run(
-    ocr_dir: Path,
+def _load_current_document_run_v1(
+    path: Path,
     runs_dir: Path,
     authority: ActiveSourceAuthorityV1,
-) -> _ValidatedRunV1 | None:
-    if "current.json" not in _safe_entry_names(ocr_dir):
-        return None
-    current, _current_bytes = _read_canonical_document(ocr_dir / "current.json")
+) -> tuple[_ValidatedRunV1, bytes]:
+    current, current_bytes = _read_canonical_document(path)
     if (
         set(current)
         != {
@@ -1670,16 +2304,110 @@ def _load_current_run(
         or run.status != "succeeded"
     ):
         raise _RunInvalidV1("OCR current binding is invalid")
-    return run
+    return run, current_bytes
+
+
+def _load_current_run(
+    ocr_dir: Path,
+    runs_dir: Path,
+    authority: ActiveSourceAuthorityV1,
+    root: ValidatedDataRootV1,
+    *,
+    matching_successes: tuple[_ValidatedRunV1, ...] | None,
+) -> tuple[_ValidatedRunV1 | None, bool]:
+    names = _recovery_entry_names(ocr_dir)
+    unexpected = names - {"current.json", "runs"}
+    if (
+        any(_CURRENT_TEMP_NAME.fullmatch(name) is None for name in unexpected)
+        or len(unexpected) > 1
+    ):
+        raise _RecoveryCertaintyLostV1("OCR current namespace is ambiguous")
+    temporary_name = next(iter(unexpected), None)
+    if temporary_name is None:
+        if "current.json" not in names:
+            return None, False
+        run, _current_bytes = _load_current_document_run_v1(
+            ocr_dir / "current.json",
+            runs_dir,
+            authority,
+        )
+        if _recovery_entry_names(ocr_dir) != names:
+            raise _RecoveryCertaintyLostV1("OCR current namespace changed")
+        return run, False
+
+    temporary = ocr_dir / temporary_name
+    try:
+        temporary_run, temporary_bytes = _load_current_document_run_v1(
+            temporary,
+            runs_dir,
+            authority,
+        )
+    except _RunInvalidV1 as error:
+        raise _RecoveryCertaintyLostV1(
+            "OCR current staging evidence is invalid"
+        ) from error
+    if (
+        matching_successes is None
+        or len(matching_successes) != 1
+        or matching_successes[0].run_id != temporary_run.run_id
+        or matching_successes[0].manifest_sha256 != temporary_run.manifest_sha256
+    ):
+        raise _RecoveryCertaintyLostV1(
+            "OCR current staging success is not unique"
+        )
+    if "current.json" in names:
+        try:
+            current_run, current_bytes = _load_current_document_run_v1(
+                ocr_dir / "current.json",
+                runs_dir,
+                authority,
+            )
+        except _RunInvalidV1 as error:
+            raise _RecoveryCertaintyLostV1(
+                "OCR current and staging evidence conflict"
+            ) from error
+        if (
+            current_bytes != temporary_bytes
+            or current_run.run_id != temporary_run.run_id
+            or current_run.manifest_sha256 != temporary_run.manifest_sha256
+        ):
+            raise _RecoveryCertaintyLostV1(
+                "OCR current and staging evidence conflict"
+            )
+    if _recovery_entry_names(ocr_dir) != names:
+        raise _RecoveryCertaintyLostV1("OCR current namespace changed")
+    _fresh_authority_or_stop(authority, root)
+    if _recovery_entry_names(ocr_dir) != names:
+        raise _RecoveryCertaintyLostV1("OCR current namespace changed")
+    try:
+        os.replace(temporary, ocr_dir / "current.json")
+        if (
+            _read_safe_bytes(
+                ocr_dir / "current.json",
+                limit=len(temporary_bytes),
+            )
+            != temporary_bytes
+        ):
+            raise OSError("OCR recovered current readback differs")
+    except (_RunInvalidV1, OSError) as error:
+        raise _RecoveryCertaintyLostV1(
+            "OCR current staging recovery is uncertain"
+        ) from error
+    expected_names = (names - {temporary_name}) | {"current.json"}
+    if _recovery_entry_names(ocr_dir) != expected_names:
+        raise _RecoveryCertaintyLostV1("OCR recovered current namespace differs")
+    return temporary_run, True
 
 
 def _matching_staged_success_runs(
     staging_dir: Path,
     authority: ActiveSourceAuthorityV1,
+    *,
+    names: frozenset[str],
 ) -> tuple[_ValidatedRunV1, ...]:
     runs: list[_ValidatedRunV1] = []
     for name in sorted(
-        _safe_entry_names(staging_dir),
+        names,
         key=lambda item: item.encode("utf-8"),
     ):
         if _RUN_ID.fullmatch(name) is None:
@@ -1696,33 +2424,59 @@ def _matching_staged_success_runs(
 def _matching_success_runs(
     runs_dir: Path,
     authority: ActiveSourceAuthorityV1,
+    *,
+    names: frozenset[str],
 ) -> tuple[_ValidatedRunV1, ...]:
     runs: list[_ValidatedRunV1] = []
-    try:
-        entries = tuple(runs_dir.iterdir())
-    except OSError as error:
-        raise _RunInvalidV1("OCR runs cannot be inspected") from error
-    for entry in entries:
-        if entry.name == ".staging":
-            continue
-        if _RUN_ID.fullmatch(entry.name) is None:
-            raise _RunInvalidV1("OCR run namespace is invalid")
-        run = _load_run(entry, entry.name, authority)
+    for name in sorted(names, key=lambda item: item.encode("utf-8")):
+        run = _load_run(runs_dir / name, name, authority)
         if _run_matches_current_profile(run):
             runs.append(run)
     return tuple(runs)
 
 
-def _inventory_matching_successes(
+def _inventory_staging_namespace(
     staging_dir: Path,
     runs_dir: Path,
     authority: ActiveSourceAuthorityV1,
-) -> tuple[_ValidatedRunV1, ...]:
-    staged = _matching_staged_success_runs(staging_dir, authority)
-    formal_names = _safe_entry_names(runs_dir) - {".staging"}
-    if any(run.run_id in formal_names for run in staged):
+) -> tuple[tuple[_ValidatedRunV1, ...], frozenset[str]]:
+    staging_names = _recovery_entry_names(staging_dir)
+    formal_names = _recovery_entry_names(runs_dir) - {".staging"}
+    if any(_RUN_ID.fullmatch(name) is None for name in formal_names):
+        raise _RecoveryCertaintyLostV1("OCR formal namespace is invalid")
+    if staging_names & formal_names:
         raise _RecoveryCertaintyLostV1("OCR recovery target conflicts")
-    formal = _matching_success_runs(runs_dir, authority)
+    staged = _matching_staged_success_runs(
+        staging_dir,
+        authority,
+        names=staging_names,
+    )
+    if (
+        _recovery_entry_names(staging_dir) != staging_names
+        or (_recovery_entry_names(runs_dir) - {".staging"}) != formal_names
+    ):
+        raise _RecoveryCertaintyLostV1("OCR recovery namespace changed")
+    if len(staged) > 1:
+        raise _RecoveryCertaintyLostV1("OCR staged success is ambiguous")
+    return staged, formal_names
+
+
+def _inventory_matching_successes(
+    runs_dir: Path,
+    authority: ActiveSourceAuthorityV1,
+    *,
+    staged: tuple[_ValidatedRunV1, ...],
+    formal_names: frozenset[str],
+) -> tuple[_ValidatedRunV1, ...]:
+    if (_recovery_entry_names(runs_dir) - {".staging"}) != formal_names:
+        raise _RecoveryCertaintyLostV1("OCR formal namespace changed")
+    formal = _matching_success_runs(
+        runs_dir,
+        authority,
+        names=formal_names,
+    )
+    if (_recovery_entry_names(runs_dir) - {".staging"}) != formal_names:
+        raise _RecoveryCertaintyLostV1("OCR formal namespace changed")
     matches = formal + staged
     if len(matches) > 1:
         raise _RecoveryCertaintyLostV1("OCR recovery success is ambiguous")
@@ -1740,8 +2494,8 @@ def _recover_unique_staged_success(
         return run
     _fresh_authority_or_stop(authority, root)
     if (
-        run.run_id not in _safe_entry_names(staging_dir)
-        or run.run_id in (_safe_entry_names(runs_dir) - {".staging"})
+        run.run_id not in _recovery_entry_names(staging_dir)
+        or run.run_id in (_recovery_entry_names(runs_dir) - {".staging"})
     ):
         raise _RecoveryCertaintyLostV1("OCR recovery namespace changed")
     target = runs_dir / run.run_id
@@ -1765,8 +2519,8 @@ def _create_unique_stage(
     runs_dir: Path,
 ) -> None:
     if (
-        stage.name in _safe_entry_names(staging_dir)
-        or stage.name in (_safe_entry_names(runs_dir) - {".staging"})
+        stage.name in _recovery_entry_names(staging_dir)
+        or stage.name in (_recovery_entry_names(runs_dir) - {".staging"})
     ):
         raise _RecoveryCertaintyLostV1("OCR run ID collides with its namespace")
     try:
@@ -1867,9 +2621,9 @@ def _ensure_ocr_layout(
     ocr_dir = authority.source_directory / "ocr"
     runs_dir = ocr_dir / "runs"
     staging_dir = runs_dir / ".staging"
-    _ensure_plain_directory(ocr_dir)
-    _ensure_plain_directory(runs_dir)
-    _ensure_plain_directory(staging_dir)
+    _ensure_recovery_directory(ocr_dir)
+    _ensure_recovery_directory(runs_dir)
+    _ensure_recovery_directory(staging_dir)
     return ocr_dir, runs_dir, staging_dir
 
 
@@ -1883,7 +2637,7 @@ def _commit_run(
     _load_run(stage, run_id, authority)
     _fresh_authority_or_stop(authority, root)
     target = runs_dir / run_id
-    if run_id in (_safe_entry_names(runs_dir) - {".staging"}):
+    if run_id in (_recovery_entry_names(runs_dir) - {".staging"}):
         raise _RecoveryCertaintyLostV1("OCR run target conflicts")
     try:
         os.rename(stage, target)
@@ -1982,34 +2736,38 @@ def _execute_mineru_run(
     input_document: dict[str, object],
     input_path: Path,
 ) -> tuple[ResumeOutcome | None, str | None, int]:
-    try:
-        profile = _resolve_ocr_runtime_v1()
-    except OcrRuntimeUnavailableV1:
-        return "blocked", "ocr_runtime_unavailable", 0
-    if (
-        type(profile.executable_path) is not str
-        or type(profile.environment) is not tuple
-        or any(
-            type(item) is not tuple
-            or len(item) != 2
-            or type(item[0]) is not str
-            or type(item[1]) is not str
-            for item in profile.environment
-        )
-        or profile.profile_identity_sha256 != _MINERU_PROFILE_IDENTITY
-    ):
-        return "blocked", "ocr_runtime_unavailable", 0
-
     attempts_dir = stage / "attempts"
-    _ensure_plain_directory(attempts_dir)
     for attempt in (1, 2):
+        try:
+            profile = _resolve_ocr_runtime_v1()
+        except OcrRuntimeUnavailableV1:
+            profile = None
+        if not _valid_ocr_runtime_profile_v1(profile):
+            if attempt == 1:
+                return "blocked", "ocr_runtime_unavailable", 0
+            attempt_dir = attempts_dir / str(attempt)
+            _ensure_plain_directory(attempt_dir)
+            _write_attempt_assets(
+                attempt_dir,
+                stdout=b"",
+                stderr=b"",
+                document=_attempt_document(
+                    attempt,
+                    outcome="runtime_unavailable",
+                    returncode=None,
+                ),
+            )
+            return "blocked", "ocr_runtime_unavailable", attempt
+        if attempt == 1:
+            _ensure_plain_directory(attempts_dir)
+        frozen_profile = cast(OcrRuntimeProfileV1, profile)
         attempt_dir = attempts_dir / str(attempt)
         _ensure_plain_directory(attempt_dir)
         provider_output = attempt_dir / "provider_output"
         _enforce_ocr_artifact_budget_v1(stage)
         try:
             completed = _run_stable_ocr_attempt_v1(
-                profile,
+                frozen_profile,
                 input_path,
                 provider_output,
                 authority,
@@ -2135,8 +2893,46 @@ def _advance_ocr(
             reason="commit_failed",
         )
 
+    staged, formal_names = _inventory_staging_namespace(
+        staging_dir,
+        runs_dir,
+        authority,
+    )
     try:
-        current = _load_current_run(ocr_dir, runs_dir, authority)
+        matches = _inventory_matching_successes(
+            runs_dir,
+            authority,
+            staged=staged,
+            formal_names=formal_names,
+        )
+    except _RunInvalidV1 as error:
+        try:
+            _load_current_run(
+                ocr_dir,
+                runs_dir,
+                authority,
+                root,
+                matching_successes=None,
+            )
+        except _RunInvalidV1:
+            _stop_stage(
+                authority,
+                root,
+                start_stage="ocr",
+                advanced_stages=(),
+                outcome="failed",
+                stage="ocr",
+                reason="asset_integrity_lost",
+            )
+        raise ResumeStoppedV1("failed", "recovery_failed") from error
+    try:
+        current, current_repaired = _load_current_run(
+            ocr_dir,
+            runs_dir,
+            authority,
+            root,
+            matching_successes=matches,
+        )
     except _RunInvalidV1:
         _stop_stage(
             authority,
@@ -2147,20 +2943,12 @@ def _advance_ocr(
             stage="ocr",
             reason="asset_integrity_lost",
         )
-    try:
-        matches = _inventory_matching_successes(
-            staging_dir,
-            runs_dir,
-            authority,
-        )
-    except _RunInvalidV1 as error:
-        raise ResumeStoppedV1("failed", "recovery_failed") from error
     if current is not None and _run_matches_current_profile(current):
         if len(matches) != 1 or matches[0].run_id != current.run_id:
             raise _RecoveryCertaintyLostV1(
                 "OCR current success cannot be uniquely proven"
             )
-        return False, "canonicalize"
+        return (True, "ocr") if current_repaired else (False, "canonicalize")
     if len(matches) == 1:
         try:
             recovered = _recover_unique_staged_success(
@@ -2171,7 +2959,7 @@ def _advance_ocr(
                 root,
             )
             _fresh_authority_or_stop(authority, root)
-            _atomic_replace_current(ocr_dir, authority, recovered)
+            _atomic_replace_current(ocr_dir, authority, recovered, root)
         except _CommitFailedV1:
             _stop_stage(
                 authority,
@@ -2189,6 +2977,7 @@ def _advance_ocr(
     input_dir = stage / "input"
     try:
         _fresh_authority_or_stop(authority, root)
+        _enforce_ocr_input_budget_v1(authority)
         _create_unique_stage(stage, staging_dir, runs_dir)
         _ensure_plain_directory(input_dir)
         input_path = input_dir / "source.pdf"
@@ -2218,7 +3007,7 @@ def _advance_ocr(
                 input_document,
             )
             committed = _commit_run(stage, runs_dir, authority, root)
-            _atomic_replace_current(ocr_dir, authority, committed)
+            _atomic_replace_current(ocr_dir, authority, committed, root)
             return True, "ocr"
 
         outcome, reason, attempt_count = _execute_mineru_run(
@@ -2266,7 +3055,7 @@ def _advance_ocr(
         )
         _write_manifest(stage, receipt=receipt)
         committed = _commit_run(stage, runs_dir, authority, root)
-        _atomic_replace_current(ocr_dir, authority, committed)
+        _atomic_replace_current(ocr_dir, authority, committed, root)
         return True, "ocr"
     except ResumeStoppedV1:
         raise

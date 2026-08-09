@@ -13,6 +13,7 @@ import pytest
 from gezhi import _bounded_probe as bounded_probe
 from gezhi._bounded_probe import (
     ProbeOutputLimitExceeded,
+    ProbeProgressGuardError,
     run_bounded_probe_v1,
 )
 
@@ -286,6 +287,60 @@ def test_unexpected_reader_failure_is_a_probe_lifecycle_error(
         )
 
 
+def test_reader_failure_discovered_during_timeout_settlement_wins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = bounded_probe.threading.Event()
+
+    class DelayedBrokenStream(BytesIO):
+        def read(self, size: int | None = -1) -> bytes:
+            del size
+            assert release.wait(1)
+            raise ValueError("reader failed at deadline")
+
+    class WaitingProcess:
+        stdout = DelayedBrokenStream()
+        stderr = BytesIO()
+        returncode = None
+
+    process = WaitingProcess()
+    monkeypatch.setattr(bounded_probe, "_create_kill_on_close_job", lambda: 7)
+    monkeypatch.setattr(
+        bounded_probe.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: process,
+    )
+    monkeypatch.setattr(bounded_probe, "_process_handle", lambda _process: 11)
+    monkeypatch.setattr(
+        bounded_probe,
+        "_ASSIGN_PROCESS_TO_JOB_OBJECT",
+        lambda _job, _process: 1,
+    )
+    monkeypatch.setattr(bounded_probe, "_NT_RESUME_PROCESS", lambda _process: 0)
+    monkeypatch.setattr(
+        bounded_probe,
+        "_wait_for_probe_completion",
+        lambda *_args: False,
+    )
+    monkeypatch.setattr(bounded_probe, "_terminate_job_best_effort", lambda _job: None)
+    monkeypatch.setattr(
+        bounded_probe,
+        "_settle_process_tree",
+        lambda *_args: release.set(),
+    )
+    monkeypatch.setattr(bounded_probe, "_CLOSE_HANDLE", lambda _job: 1)
+
+    with pytest.raises(
+        bounded_probe.ProbeLifecycleError,
+        match="probe pipe read failed",
+    ):
+        run_bounded_probe_v1(
+            ("probe.exe",),
+            timeout_seconds=5,
+            output_limit=4_096,
+        )
+
+
 def test_reader_settlement_failure_is_not_hidden_by_an_earlier_fault(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -402,3 +457,56 @@ def test_progress_guard_failure_settles_the_job_and_pipes_before_reraising(
     ]
     assert process.stdout.closed
     assert process.stderr.closed
+
+
+def test_progress_guard_error_keeps_bounded_pipe_prefixes_after_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class WaitingProcess:
+        stdout = BytesIO(b"stdout-prefix")
+        stderr = BytesIO(b"stderr-prefix")
+        returncode = None
+
+        def wait(self, *, timeout: float) -> int:
+            raise subprocess.TimeoutExpired(("probe.exe",), timeout)
+
+    process = WaitingProcess()
+    failure = ProbeProgressGuardError("resource budget exceeded")
+    guard_calls = 0
+
+    def guard() -> None:
+        nonlocal guard_calls
+        guard_calls += 1
+        if guard_calls == 2:
+            raise failure
+
+    monkeypatch.setattr(bounded_probe, "_create_kill_on_close_job", lambda: 7)
+    monkeypatch.setattr(
+        bounded_probe.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: process,
+    )
+    monkeypatch.setattr(bounded_probe, "_process_handle", lambda _process: 11)
+    monkeypatch.setattr(
+        bounded_probe,
+        "_ASSIGN_PROCESS_TO_JOB_OBJECT",
+        lambda _job, _process: 1,
+    )
+    monkeypatch.setattr(bounded_probe, "_NT_RESUME_PROCESS", lambda _process: 0)
+    monkeypatch.setattr(bounded_probe, "_terminate_job_best_effort", lambda _job: None)
+    monkeypatch.setattr(bounded_probe, "_settle_process_tree", lambda *_args: None)
+    monkeypatch.setattr(bounded_probe, "_CLOSE_HANDLE", lambda _job: 1)
+
+    with pytest.raises(ProbeProgressGuardError) as caught:
+        run_bounded_probe_v1(
+            ("probe.exe",),
+            timeout_seconds=5,
+            output_limit=4_096,
+            progress_guard=guard,
+        )
+
+    assert caught.value is failure
+    assert (failure.stdout, failure.stderr) == (
+        b"stdout-prefix",
+        b"stderr-prefix",
+    )

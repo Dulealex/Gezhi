@@ -13,6 +13,15 @@ from uuid import UUID
 import pytest
 from literature_pdf_support import write_blank_pdf, write_text_pdf
 from pypdf import PdfReader, PdfWriter
+from pypdf.generic import (
+    ArrayObject,
+    DecodedStreamObject,
+    DictionaryObject,
+    FloatObject,
+    NameObject,
+    NullObject,
+    NumberObject,
+)
 
 from gezhi import _literature_resume as resume
 from gezhi import _windows_data_root as windows_root
@@ -107,6 +116,68 @@ def _rewrite_pdf_pages(source: Path, target: Path) -> None:
             writer.add_page(page)
         writer.add_metadata({"/Producer": "MinerU PDFium rewrite"})
         writer.write(target_stream)
+
+
+def _write_form_pdf(
+    path: Path,
+    *,
+    compressed_form: bool,
+    bbox: tuple[int | float, int | float, int | float, int | float] = (
+        0,
+        0,
+        12,
+        12,
+    ),
+    matrix: tuple[int, int, int, int, int, int] | None = None,
+    form_type: int | None = None,
+    flate_array_length: int = 0,
+) -> None:
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=612, height=792)
+    form = DecodedStreamObject()
+    form.set_data(b"q 0 0 12 12 re f Q")
+    form_values = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/XObject"),
+            NameObject("/Subtype"): NameObject("/Form"),
+            NameObject("/BBox"): ArrayObject(
+                [
+                    FloatObject(str(item))
+                    if type(item) is float
+                    else NumberObject(item)
+                    for item in bbox
+                ]
+            ),
+            NameObject("/Resources"): DictionaryObject(),
+        }
+    )
+    if matrix is not None:
+        form_values[NameObject("/Matrix")] = ArrayObject(
+            [NumberObject(item) for item in matrix]
+        )
+    if form_type is not None:
+        form_values[NameObject("/FormType")] = NumberObject(form_type)
+    form.update(form_values)
+    encoded_form = form.flate_encode() if compressed_form else form
+    if flate_array_length:
+        encoded_form[NameObject("/Filter")] = ArrayObject(
+            [NameObject("/FlateDecode") for _index in range(flate_array_length)]
+        )
+        encoded_form[NameObject("/DecodeParms")] = ArrayObject([NullObject()])
+    form_reference = writer._add_object(encoded_form)
+    resources = DictionaryObject(
+        {
+            NameObject("/XObject"): DictionaryObject(
+                {NameObject("/Fm0"): form_reference}
+            )
+        }
+    )
+    page[NameObject("/Resources")] = resources
+    content = DecodedStreamObject()
+    content.set_data(b"q /Fm0 Do Q")
+    page[NameObject("/Contents")] = writer._add_object(content)
+    with path.open("wb") as stream:
+        writer.write(stream)
 
 
 def _invoke(data_root: Path, work_id: str) -> ResumeStoppedV1:
@@ -231,6 +302,61 @@ def test_semantically_equivalent_rewritten_origin_is_accepted(
     assert stopped.stage == "canonicalize"
 
 
+def test_native_page_ordinal_rejects_json_boolean_alias_for_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        windows_root,
+        "_reject_hidden_short_alias",
+        lambda _parent, _component: None,
+    )
+    data_root = tmp_path / "lit"
+    data_root.mkdir()
+    pdf_path = tmp_path / "native.pdf"
+    write_text_pdf(
+        pdf_path,
+        "The first native page contains more than thirty two visible characters.",
+        "The second native page also contains more than thirty two characters.",
+    )
+    with open_validated_data_root_v1(str(data_root)) as root:
+        added = add_local_pdf(
+            AddLocalPdfRequestV1(
+                pdf_path=str(pdf_path),
+                work_id=None,
+                doi=None,
+                arxiv_id=None,
+                citation=None,
+            ),
+            root=root,
+        )
+    assert _invoke(data_root, added.work_id).stage == "canonicalize"
+    ocr_dir = (
+        data_root
+        / "works"
+        / added.work_id
+        / "sources"
+        / added.source_id
+        / "ocr"
+    )
+    current_path = ocr_dir / "current.json"
+    current = json.loads(current_path.read_bytes())
+    run_dir = ocr_dir / "runs" / current["run_id"]
+    native_path = run_dir / "output" / "native_text.json"
+    native = json.loads(native_path.read_bytes())
+    native["pages"][1]["page_index"] = True
+    native_path.write_bytes(resume._canonical_json_bytes(native))
+    _rehash_run_and_current(run_dir, current_path)
+
+    stopped = _invoke(data_root, added.work_id)
+
+    assert (stopped.outcome, stopped.stage, stopped.reason) == (
+        "failed",
+        "ocr",
+        "asset_integrity_lost",
+    )
+
+
 def test_private_input_cannot_be_replaced_while_mineru_is_running(
     scanned_source: tuple[Path, str, str],
     monkeypatch: pytest.MonkeyPatch,
@@ -338,7 +464,9 @@ def test_ocr_failure_never_creates_success_current_or_canonical_asset(
             if failure == "timeout":
                 raise subprocess.TimeoutExpired(("mineru",), 900)
             if failure == "output_limit":
-                raise ProbeOutputLimitExceeded
+                raise ProbeOutputLimitExceeded(
+                    stdout=b"x" * resume._OCR_OUTPUT_LIMIT
+                )
             output_root.mkdir(parents=True)
             return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
 
@@ -381,8 +509,21 @@ def test_ocr_failure_never_creates_success_current_or_canonical_asset(
         "truncated_pdf",
         "origin_mismatch",
         "middle_shape",
+        "middle_item",
+        "middle_empty_block",
+        "middle_missing_block_field",
         "content_shape",
+        "content_payload",
+        "content_bbox",
+        "boolean_bbox",
+        "missing_image_reference",
+        "traversal_image_reference",
+        "v2_payload",
         "model_shape",
+        "model_item",
+        "huge_dimension",
+        "giant_integer",
+        "deep_json",
         "image_header",
     ],
 )
@@ -412,12 +553,87 @@ def test_structurally_corrupt_provider_output_is_ocr_failed(
             (leaf / "source_middle.json").write_bytes(
                 b'{"_backend":"pipeline","_version_name":"3.4.4","pdf_info":[]}\n'
             )
+        elif corruption == "middle_item":
+            middle = json.loads((leaf / "source_middle.json").read_bytes())
+            middle["pdf_info"][0]["para_blocks"] = [None]
+            (leaf / "source_middle.json").write_bytes(json.dumps(middle).encode())
+        elif corruption in {"middle_empty_block", "middle_missing_block_field"}:
+            middle = json.loads((leaf / "source_middle.json").read_bytes())
+            block = (
+                {}
+                if corruption == "middle_empty_block"
+                else {
+                    "bbox": [0, 0, 1, 1],
+                    "index": 0,
+                    "lines": [],
+                    "type": "text",
+                }
+            )
+            middle["pdf_info"][0]["para_blocks"] = [block]
+            (leaf / "source_middle.json").write_bytes(json.dumps(middle).encode())
         elif corruption == "content_shape":
             (leaf / "source_content_list.json").write_bytes(
                 b'[{"page_idx":0,"type":[]}]\n'
             )
+        elif corruption == "content_payload":
+            (leaf / "source_content_list.json").write_bytes(
+                b'[{"bbox":[0,0,1,1],"page_idx":0,"type":"text"}]\n'
+            )
+        elif corruption == "content_bbox":
+            (leaf / "source_content_list.json").write_bytes(
+                b'[{"page_idx":0,"text":"missing bbox","type":"text"}]\n'
+            )
+        elif corruption == "boolean_bbox":
+            (leaf / "source_content_list.json").write_bytes(
+                b'[{"bbox":[false,0,1,1],"page_idx":0,'
+                b'"text":"bad bbox","type":"text"}]\n'
+            )
+        elif corruption in {"missing_image_reference", "traversal_image_reference"}:
+            image_path = (
+                "images/missing.png"
+                if corruption == "missing_image_reference"
+                else "images/../forged.png"
+            )
+            (leaf / "source_content_list.json").write_bytes(
+                json.dumps(
+                    [
+                        {
+                            "bbox": [0, 0, 1, 1],
+                            "image_caption": [],
+                            "image_footnote": [],
+                            "img_path": image_path,
+                            "page_idx": 0,
+                            "type": "image",
+                        }
+                    ]
+                ).encode()
+            )
+        elif corruption == "v2_payload":
+            (leaf / "source_content_list_v2.json").write_bytes(
+                b'[[{"bbox":[0,0,1,1],"content":{"arbitrary":[]},'
+                b'"type":"paragraph"}]]\n'
+            )
         elif corruption == "model_shape":
             (leaf / "source_model.json").write_bytes(b"[{}]\n")
+        elif corruption == "model_item":
+            model = json.loads((leaf / "source_model.json").read_bytes())
+            model[0]["layout_dets"] = [None]
+            (leaf / "source_model.json").write_bytes(json.dumps(model).encode())
+        elif corruption == "huge_dimension":
+            (leaf / "source_middle.json").write_bytes(
+                b'{"_backend":"pipeline","_version_name":"3.4.4","pdf_info":'
+                b'[{"discarded_blocks":[],"page_idx":0,"page_size":['
+                + (b"9" * 4_000)
+                + b',792],"para_blocks":[]}]}\n'
+            )
+        elif corruption == "giant_integer":
+            (leaf / "source_content_list.json").write_bytes(
+                b"[" + (b"9" * 5_000) + b"]\n"
+            )
+        elif corruption == "deep_json":
+            (leaf / "source_content_list.json").write_bytes(
+                (b"[" * 2_000) + (b"]" * 2_000) + b"\n"
+            )
         else:
             (leaf / "images" / "forged.png").write_bytes(b"not-a-png")
         return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
@@ -434,6 +650,62 @@ def test_structurally_corrupt_provider_output_is_ocr_failed(
     )
     ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
     assert not (ocr_dir / "current.json").exists()
+
+
+def test_provider_page_ordinals_reject_json_boolean_alias_for_one() -> None:
+    middle = {
+        "_backend": "pipeline",
+        "_version_name": "3.4.4",
+        "pdf_info": [
+            {
+                "discarded_blocks": [],
+                "page_idx": 0,
+                "page_size": [612, 792],
+                "para_blocks": [],
+            },
+            {
+                "discarded_blocks": [],
+                "page_idx": True,
+                "page_size": [612, 792],
+                "para_blocks": [],
+            },
+        ],
+    }
+    model = [
+        {
+            "layout_dets": [],
+            "page_info": {"height": 792, "page_no": 0, "width": 612},
+        },
+        {
+            "layout_dets": [],
+            "page_info": {"height": 792, "page_no": True, "width": 612},
+        },
+    ]
+
+    with pytest.raises(RuntimeError) as middle_error:
+        resume._validate_middle_document(middle)
+    with pytest.raises(RuntimeError) as model_error:
+        resume._validate_model_document(model, page_count=2)
+
+    assert type(middle_error.value).__name__ == "_OcrOutputInvalidV1"
+    assert type(model_error.value).__name__ == "_OcrOutputInvalidV1"
+
+
+def test_middle_image_span_binds_bare_leaf_to_provider_inventory() -> None:
+    span = {
+        "bbox": [0, 0, 10, 10],
+        "image_path": "asset.jpg",
+        "type": "image",
+    }
+
+    assert resume._valid_middle_span_v1(span, {"images/asset.jpg"})
+    for invalid in ("images/asset.jpg", "../asset.jpg", "missing.jpg"):
+        changed = dict(span)
+        changed["image_path"] = invalid
+        assert not resume._valid_middle_span_v1(
+            changed,
+            {"images/asset.jpg"},
+        )
 
 
 @pytest.mark.parametrize("failure", ["timeout", "output_limit"])
@@ -458,9 +730,11 @@ def test_ocr_stop_preserves_bounded_stdout_and_stderr_capture(
                 output=b"timeout-out",
                 stderr=b"timeout-err",
             )
+        stderr = b"overflow-err"
+        prefix = b"overflow-out"
         raise ProbeOutputLimitExceeded(
-            stdout=b"overflow-out",
-            stderr=b"overflow-err",
+            stdout=prefix + b"x" * (resume._OCR_OUTPUT_LIMIT - len(prefix) - len(stderr)),
+            stderr=stderr,
         )
 
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", fail)
@@ -474,8 +748,93 @@ def test_ocr_stop_preserves_bounded_stdout_and_stderr_capture(
     for attempt in range(1, attempts + 1):
         attempt_dir = run_dir / "attempts" / str(attempt)
         expected_prefix = b"timeout" if failure == "timeout" else b"overflow"
-        assert (attempt_dir / "stdout.bin").read_bytes() == expected_prefix + b"-out"
-        assert (attempt_dir / "stderr.bin").read_bytes() == expected_prefix + b"-err"
+        stdout = (attempt_dir / "stdout.bin").read_bytes()
+        stderr = (attempt_dir / "stderr.bin").read_bytes()
+        assert stdout.startswith(expected_prefix + b"-out")
+        assert stderr == expected_prefix + b"-err"
+        if failure == "output_limit":
+            assert len(stdout) + len(stderr) == resume._OCR_OUTPUT_LIMIT
+
+
+@pytest.mark.parametrize("extra_byte", [False, True])
+def test_historical_attempt_capture_enforces_combined_inclusive_limit(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    extra_byte: bool,
+) -> None:
+    data_root, work_id, source_id = scanned_source
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", lambda: _runtime())
+
+    def succeed(
+        _profile: OcrRuntimeProfileV1,
+        _input_path: Path,
+        output_root: Path,
+    ) -> OcrAttemptResultV1:
+        _write_valid_mineru_output(output_root)
+        return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
+    assert _invoke(data_root, work_id).stage == "canonicalize"
+    ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
+    current_path = ocr_dir / "current.json"
+    current = json.loads(current_path.read_bytes())
+    run_dir = ocr_dir / "runs" / current["run_id"]
+    attempt_dir = run_dir / "attempts" / "1"
+    (attempt_dir / "stdout.bin").write_bytes(b"a" * resume._OCR_OUTPUT_LIMIT)
+    (attempt_dir / "stderr.bin").write_bytes(b"b" if extra_byte else b"")
+    _rehash_run_and_current(run_dir, current_path)
+    monkeypatch.setattr(
+        resume,
+        "_run_ocr_attempt_v1",
+        lambda *_args: pytest.fail("historical success must not rerun OCR"),
+    )
+
+    stopped = _invoke(data_root, work_id)
+
+    if extra_byte:
+        assert (stopped.outcome, stopped.stage, stopped.reason) == (
+            "failed",
+            "ocr",
+            "asset_integrity_lost",
+        )
+    else:
+        assert stopped.stage == "canonicalize"
+
+
+def test_historical_output_limit_outcome_requires_full_retained_capture(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root, work_id, source_id = scanned_source
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", lambda: _runtime())
+    monkeypatch.setattr(
+        resume,
+        "_run_ocr_attempt_v1",
+        lambda *_args: (_ for _ in ()).throw(
+            ProbeOutputLimitExceeded(stdout=b"x" * resume._OCR_OUTPUT_LIMIT)
+        ),
+    )
+    stopped = _invoke(data_root, work_id)
+    assert stopped.reason == "ocr_failed"
+    runs_dir = data_root / "works" / work_id / "sources" / source_id / "ocr" / "runs"
+    run_dir = next(item for item in runs_dir.iterdir() if item.name != ".staging")
+    with open_validated_data_root_v1(str(data_root)) as root:
+        authority = resume._load_authority_or_stop(work_id, root)
+        resume._load_run(run_dir, run_dir.name, authority)
+
+    capture = run_dir / "attempts" / "1" / "stdout.bin"
+    capture.write_bytes(b"x" * (resume._OCR_OUTPUT_LIMIT - 1))
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest["assets"] = resume._asset_entries(run_dir)
+    manifest_path.write_bytes(resume._canonical_json_bytes(manifest))
+
+    with open_validated_data_root_v1(str(data_root)) as root:
+        authority = resume._load_authority_or_stop(work_id, root)
+        with pytest.raises(RuntimeError) as caught:
+            resume._load_run(run_dir, run_dir.name, authority)
+
+    assert type(caught.value).__name__ == "_RunInvalidV1"
 
 
 @pytest.mark.parametrize("first", ["timeout", "process_failed"])
@@ -535,6 +894,56 @@ def test_transient_then_runtime_unavailable_commits_a_valid_blocked_run(
     ]
 
 
+def test_retry_revalidates_runtime_after_backoff_before_second_launch(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root, work_id, source_id = scanned_source
+    runtime_checks = 0
+    launches = 0
+
+    def resolve() -> OcrRuntimeProfileV1:
+        nonlocal runtime_checks
+        runtime_checks += 1
+        if runtime_checks == 2:
+            raise resume.OcrRuntimeUnavailableV1
+        return _runtime()
+
+    def time_out_once(
+        _profile: OcrRuntimeProfileV1,
+        _input_path: Path,
+        _output_root: Path,
+    ) -> OcrAttemptResultV1:
+        nonlocal launches
+        launches += 1
+        raise subprocess.TimeoutExpired(
+            ("mineru",),
+            900,
+            output=b"first-out",
+            stderr=b"first-err",
+        )
+
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", resolve)
+    monkeypatch.setattr(resume, "_run_ocr_attempt_v1", time_out_once)
+    monkeypatch.setattr(resume.time, "sleep", lambda _seconds: None)
+
+    stopped = _invoke(data_root, work_id)
+
+    assert (stopped.outcome, stopped.stage, stopped.reason) == (
+        "blocked",
+        "ocr",
+        "ocr_runtime_unavailable",
+    )
+    assert runtime_checks == 2
+    assert launches == 1
+    runs_dir = data_root / "works" / work_id / "sources" / source_id / "ocr" / "runs"
+    run_dir = next(item for item in runs_dir.iterdir() if item.name != ".staging")
+    assert json.loads((run_dir / "receipt.json").read_bytes())["attempt_count"] == 2
+    assert json.loads(
+        (run_dir / "attempts" / "2" / "receipt.json").read_bytes()
+    )["outcome"] == "runtime_unavailable"
+
+
 def test_committed_success_without_current_repairs_pointer_without_rerun(
     scanned_source: tuple[Path, str, str],
     monkeypatch: pytest.MonkeyPatch,
@@ -566,6 +975,225 @@ def test_committed_success_without_current_repairs_pointer_without_rerun(
     assert second.result is not None
     assert second.result.advanced_stages == ("ocr",)
     assert json.loads((ocr_dir / "current.json").read_bytes()) == current_before
+
+
+def test_current_temp_uuid_collision_preserves_foreign_marker(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root, work_id, source_id = scanned_source
+    calls = 0
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", lambda: _runtime())
+
+    def succeed(
+        _profile: OcrRuntimeProfileV1,
+        _input_path: Path,
+        output_root: Path,
+    ) -> OcrAttemptResultV1:
+        nonlocal calls
+        calls += 1
+        _write_valid_mineru_output(output_root)
+        return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
+    assert _invoke(data_root, work_id).stage == "canonicalize"
+    ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
+    (ocr_dir / "current.json").unlink()
+    fixed = UUID("123e4567-e89b-42d3-a456-426614174004")
+    marker = ocr_dir / f".current.json.{fixed.hex}.tmp"
+    marker.write_bytes(b"foreign-marker")
+    monkeypatch.setattr(resume.uuid, "uuid4", lambda: fixed)
+
+    with pytest.raises(RuntimeError) as caught:
+        _invoke_unhandled(data_root, work_id)
+
+    assert type(caught.value).__name__ == "_RecoveryCertaintyLostV1"
+    assert marker.read_bytes() == b"foreign-marker"
+    assert not (ocr_dir / "current.json").exists()
+    assert calls == 1
+
+
+def test_foreign_current_temp_is_classified_before_pointer_repair(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root, work_id, source_id = scanned_source
+    calls = 0
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", lambda: _runtime())
+
+    def succeed(
+        _profile: OcrRuntimeProfileV1,
+        _input_path: Path,
+        output_root: Path,
+    ) -> OcrAttemptResultV1:
+        nonlocal calls
+        calls += 1
+        _write_valid_mineru_output(output_root)
+        return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
+    assert _invoke(data_root, work_id).stage == "canonicalize"
+    ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
+    (ocr_dir / "current.json").unlink()
+    foreign = ocr_dir / ".current.json.123e4567e89b42d3a456426614174005.tmp"
+    foreign.write_bytes(b"foreign-marker")
+
+    with pytest.raises(RuntimeError) as caught:
+        _invoke_unhandled(data_root, work_id)
+
+    assert type(caught.value).__name__ == "_RecoveryCertaintyLostV1"
+    assert foreign.read_bytes() == b"foreign-marker"
+    assert not (ocr_dir / "current.json").exists()
+    assert calls == 1
+
+
+def test_multiple_valid_current_temps_are_ambiguous_recovery_evidence(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root, work_id, source_id = scanned_source
+    calls = 0
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", lambda: _runtime())
+
+    def succeed(
+        _profile: OcrRuntimeProfileV1,
+        _input_path: Path,
+        output_root: Path,
+    ) -> OcrAttemptResultV1:
+        nonlocal calls
+        calls += 1
+        _write_valid_mineru_output(output_root)
+        return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
+    assert _invoke(data_root, work_id).stage == "canonicalize"
+    ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
+    payload = (ocr_dir / "current.json").read_bytes()
+    (ocr_dir / "current.json").unlink()
+    first = ocr_dir / ".current.json.123e4567e89b42d3a456426614174006.tmp"
+    second = ocr_dir / ".current.json.123e4567e89b42d3a456426614174007.tmp"
+    first.write_bytes(payload)
+    second.write_bytes(payload)
+
+    with pytest.raises(RuntimeError) as caught:
+        _invoke_unhandled(data_root, work_id)
+
+    assert type(caught.value).__name__ == "_RecoveryCertaintyLostV1"
+    assert first.read_bytes() == payload
+    assert second.read_bytes() == payload
+    assert not (ocr_dir / "current.json").exists()
+    assert calls == 1
+
+
+def test_current_authority_drift_after_temp_write_preserves_temp_without_replace(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root, work_id, source_id = scanned_source
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", lambda: _runtime())
+
+    def succeed(
+        _profile: OcrRuntimeProfileV1,
+        _input_path: Path,
+        output_root: Path,
+    ) -> OcrAttemptResultV1:
+        _write_valid_mineru_output(output_root)
+        return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
+    assert _invoke(data_root, work_id).stage == "canonicalize"
+    ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
+    (ocr_dir / "current.json").unlink()
+    real_checkpoint = resume._fresh_authority_or_stop
+    real_replace = resume.os.replace
+    checkpoints = 0
+    replace_calls = 0
+
+    def drift_on_atomic_pre_replace(authority: object, root: object) -> object:
+        nonlocal checkpoints
+        checkpoints += 1
+        if checkpoints == 3:
+            raise ResumeStoppedV1(
+                "failed",
+                "data_root_integrity_lost",
+                data_root="literature",
+            )
+        return real_checkpoint(authority, root)  # type: ignore[arg-type]
+
+    def observe_replace(source: object, target: object) -> None:
+        nonlocal replace_calls
+        replace_calls += 1
+        real_replace(source, target)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(resume, "_fresh_authority_or_stop", drift_on_atomic_pre_replace)
+    monkeypatch.setattr(resume.os, "replace", observe_replace)
+
+    with pytest.raises(ResumeStoppedV1) as caught:
+        _invoke_unhandled(data_root, work_id)
+
+    assert caught.value.reason == "data_root_integrity_lost"
+    assert checkpoints == 3
+    assert replace_calls == 0
+    assert not (ocr_dir / "current.json").exists()
+    assert len(tuple(ocr_dir.glob(".current.json.*.tmp"))) == 1
+
+
+def test_uncertain_current_replace_preserves_evidence_and_recovers_next_time(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root, work_id, source_id = scanned_source
+    calls = 0
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", lambda: _runtime())
+
+    def succeed(
+        _profile: OcrRuntimeProfileV1,
+        _input_path: Path,
+        output_root: Path,
+    ) -> OcrAttemptResultV1:
+        nonlocal calls
+        calls += 1
+        _write_valid_mineru_output(output_root)
+        return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
+    assert _invoke(data_root, work_id).stage == "canonicalize"
+    ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
+    current_before = json.loads((ocr_dir / "current.json").read_bytes())
+    (ocr_dir / "current.json").unlink()
+    real_replace = resume.os.replace
+
+    def fail_current_replace(source: object, target: object) -> None:
+        if Path(target).name == "current.json":  # type: ignore[arg-type]
+            raise OSError("injected uncertain replace")
+        real_replace(source, target)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(resume.os, "replace", fail_current_replace)
+    with pytest.raises(RuntimeError) as caught:
+        _invoke_unhandled(data_root, work_id)
+
+    assert type(caught.value).__name__ == "_RecoveryCertaintyLostV1"
+    assert not (ocr_dir / "current.json").exists()
+    evidence = tuple(ocr_dir.glob(".current.json.*.tmp"))
+    assert len(evidence) == 1
+    replacement_sources: list[Path] = []
+
+    def observe_recovery_replace(source: object, target: object) -> None:
+        if Path(target).name == "current.json":  # type: ignore[arg-type]
+            replacement_sources.append(Path(source))  # type: ignore[arg-type]
+        real_replace(source, target)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(resume.os, "replace", observe_recovery_replace)
+
+    recovered = _invoke(data_root, work_id)
+
+    assert recovered.stage == "canonicalize"
+    assert recovered.result is not None
+    assert recovered.result.advanced_stages == ("ocr",)
+    assert json.loads((ocr_dir / "current.json").read_bytes()) == current_before
+    assert replacement_sources == [evidence[0]]
+    assert not tuple(ocr_dir.glob(".current.json.*.tmp"))
+    assert calls == 1
 
 
 def test_same_source_and_profile_have_stable_input_fingerprint_after_failed_retry(
@@ -607,6 +1235,48 @@ def test_same_source_and_profile_have_stable_input_fingerprint_after_failed_retr
         (runs_dir / current["run_id"] / "input.json").read_bytes()
     )
     assert success_input["input_fingerprint_sha256"] == first_fingerprint
+
+
+def test_historical_attempt_ordinal_rejects_json_boolean_alias_for_one(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root, work_id, source_id = scanned_source
+    calls = 0
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", lambda: _runtime())
+    monkeypatch.setattr(resume.time, "sleep", lambda _seconds: None)
+
+    def retry_then_succeed(
+        _profile: OcrRuntimeProfileV1,
+        _input_path: Path,
+        output_root: Path,
+    ) -> OcrAttemptResultV1:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise subprocess.TimeoutExpired(("mineru",), 900)
+        _write_valid_mineru_output(output_root)
+        return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(resume, "_run_ocr_attempt_v1", retry_then_succeed)
+    assert _invoke(data_root, work_id).stage == "canonicalize"
+    ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
+    current_path = ocr_dir / "current.json"
+    current = json.loads(current_path.read_bytes())
+    run_dir = ocr_dir / "runs" / current["run_id"]
+    receipt_path = run_dir / "attempts" / "1" / "receipt.json"
+    receipt = json.loads(receipt_path.read_bytes())
+    receipt["attempt"] = True
+    receipt_path.write_bytes(resume._canonical_json_bytes(receipt))
+    _rehash_run_and_current(run_dir, current_path)
+
+    stopped = _invoke(data_root, work_id)
+
+    assert (stopped.outcome, stopped.stage, stopped.reason) == (
+        "failed",
+        "ocr",
+        "asset_integrity_lost",
+    )
 
 
 def test_nonzero_mineru_exit_retries_once_without_reusing_partial_output(
@@ -814,6 +1484,129 @@ def test_formal_and_staging_run_id_collision_fail_stops_without_mutation(
     assert (runs_dir / current["run_id"]).is_dir()
 
 
+def test_partial_staging_with_formal_run_id_fail_stops_without_mutation(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root, work_id, source_id = scanned_source
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", lambda: _runtime())
+
+    def succeed(
+        _profile: OcrRuntimeProfileV1,
+        _input_path: Path,
+        output_root: Path,
+    ) -> OcrAttemptResultV1:
+        _write_valid_mineru_output(output_root)
+        return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
+    assert _invoke(data_root, work_id).stage == "canonicalize"
+    ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
+    current_path = ocr_dir / "current.json"
+    current_bytes = current_path.read_bytes()
+    current = json.loads(current_bytes)
+    runs_dir = ocr_dir / "runs"
+    partial = runs_dir / ".staging" / current["run_id"]
+    partial.mkdir()
+    marker = partial / "partial.bin"
+    marker.write_bytes(b"quarantine")
+
+    with pytest.raises(RuntimeError) as caught:
+        _invoke_unhandled(data_root, work_id)
+
+    assert type(caught.value).__name__ == "_RecoveryCertaintyLostV1"
+    assert marker.read_bytes() == b"quarantine"
+    assert current_path.read_bytes() == current_bytes
+    assert (runs_dir / current["run_id"]).is_dir()
+
+
+def test_staging_collision_precedes_corrupt_current_classification(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root, work_id, source_id = scanned_source
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", lambda: _runtime())
+
+    def succeed(
+        _profile: OcrRuntimeProfileV1,
+        _input_path: Path,
+        output_root: Path,
+    ) -> OcrAttemptResultV1:
+        _write_valid_mineru_output(output_root)
+        return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
+    assert _invoke(data_root, work_id).stage == "canonicalize"
+    ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
+    current_path = ocr_dir / "current.json"
+    current = json.loads(current_path.read_bytes())
+    current["manifest_sha256"] = "0" * 64
+    current_path.write_bytes(resume._canonical_json_bytes(current))
+    runs_dir = ocr_dir / "runs"
+    partial = runs_dir / ".staging" / current["run_id"]
+    partial.mkdir()
+    marker = partial / "partial.bin"
+    marker.write_bytes(b"quarantine")
+
+    with pytest.raises(RuntimeError) as caught:
+        _invoke_unhandled(data_root, work_id)
+
+    assert type(caught.value).__name__ == "_RecoveryCertaintyLostV1"
+    assert marker.read_bytes() == b"quarantine"
+
+
+def test_namespace_inventory_failure_is_not_a_handled_recovery_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = tmp_path / "runs"
+    namespace.mkdir()
+    real_iterdir = Path.iterdir
+
+    def fail_inventory(path: Path) -> Iterator[Path]:
+        if path == namespace:
+            raise OSError("injected inventory failure")
+        return real_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", fail_inventory)
+
+    with pytest.raises(RuntimeError) as caught:
+        resume._recovery_entry_names(namespace)
+
+    assert type(caught.value).__name__ == "_RecoveryCertaintyLostV1"
+
+
+def test_existing_staging_validation_failure_is_not_commit_failed(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root, work_id, source_id = scanned_source
+    staging = (
+        data_root
+        / "works"
+        / work_id
+        / "sources"
+        / source_id
+        / "ocr"
+        / "runs"
+        / ".staging"
+    )
+    staging.mkdir(parents=True)
+    real_open = resume.open_validated_data_root_v1
+
+    def reject_staging(path: str) -> object:
+        if Path(path) == staging:
+            raise windows_root.DataRootOpenErrorV1("unsafe")
+        return real_open(path)
+
+    monkeypatch.setattr(resume, "open_validated_data_root_v1", reject_staging)
+
+    with pytest.raises(RuntimeError) as caught:
+        _invoke_unhandled(data_root, work_id)
+
+    assert type(caught.value).__name__ == "_RecoveryCertaintyLostV1"
+
+
 def test_uuid_collision_with_quarantined_staging_fail_stops_before_write(
     scanned_source: tuple[Path, str, str],
     monkeypatch: pytest.MonkeyPatch,
@@ -973,6 +1766,46 @@ def test_partial_staging_is_quarantined_and_never_used_as_success(
     assert current["run_id"] != partial.name
 
 
+def test_deeply_nested_staging_document_is_quarantined(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root, work_id, source_id = scanned_source
+    staging_dir = (
+        data_root
+        / "works"
+        / work_id
+        / "sources"
+        / source_id
+        / "ocr"
+        / "runs"
+        / ".staging"
+    )
+    partial = staging_dir / "ocrrun_123e4567-e89b-42d3-a456-426614174005"
+    partial.mkdir(parents=True)
+    (partial / "selection.json").write_bytes(
+        (b"[" * 2_000) + (b"]" * 2_000)
+    )
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", lambda: _runtime())
+
+    def succeed(
+        _profile: OcrRuntimeProfileV1,
+        _input_path: Path,
+        output_root: Path,
+    ) -> OcrAttemptResultV1:
+        _write_valid_mineru_output(output_root)
+        return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
+
+    stopped = _invoke(data_root, work_id)
+
+    assert stopped.stage == "canonicalize"
+    assert partial.is_dir()
+    current = json.loads((staging_dir.parent.parent / "current.json").read_bytes())
+    assert current["run_id"] != partial.name
+
+
 def test_corrupt_current_is_asset_integrity_lost_and_does_not_rerun(
     scanned_source: tuple[Path, str, str],
     monkeypatch: pytest.MonkeyPatch,
@@ -1007,6 +1840,43 @@ def test_corrupt_current_is_asset_integrity_lost_and_does_not_rerun(
         "_run_ocr_attempt_v1",
         lambda *_args: pytest.fail("corrupt current must not rerun OCR"),
     )
+
+    stopped = _invoke(data_root, work_id)
+
+    assert (stopped.outcome, stopped.stage, stopped.reason) == (
+        "failed",
+        "ocr",
+        "asset_integrity_lost",
+    )
+
+
+def test_deeply_nested_current_is_asset_integrity_lost(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root, work_id, source_id = scanned_source
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", lambda: _runtime())
+
+    def succeed(
+        _profile: OcrRuntimeProfileV1,
+        _input_path: Path,
+        output_root: Path,
+    ) -> OcrAttemptResultV1:
+        _write_valid_mineru_output(output_root)
+        return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
+    assert _invoke(data_root, work_id).stage == "canonicalize"
+    current_path = (
+        data_root
+        / "works"
+        / work_id
+        / "sources"
+        / source_id
+        / "ocr"
+        / "current.json"
+    )
+    current_path.write_bytes((b"[" * 2_000) + (b"]" * 2_000))
 
     stopped = _invoke(data_root, work_id)
 
@@ -1150,6 +2020,112 @@ def test_provider_artifact_budget_accepts_exact_limits_and_rejects_sparse_overfl
     assert type(caught.value).__name__ == "_OcrArtifactBudgetExceededV1"
 
 
+def test_provider_artifact_scan_stops_at_first_namespace_entry_over_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = tmp_path / "provider"
+    provider.mkdir()
+    for name in ("a.bin", "b.bin", "c.bin"):
+        (provider / name).write_bytes(b"x")
+    real_scandir = resume.os.scandir
+    requested: list[int] = []
+
+    class GuardedScandir:
+        def __init__(self, path: Path) -> None:
+            self._inner = real_scandir(path)
+            self._count = 0
+
+        def __iter__(self) -> GuardedScandir:
+            return self
+
+        def __next__(self) -> object:
+            self._count += 1
+            requested.append(self._count)
+            if self._count > 2:
+                raise AssertionError("scanner consumed beyond the decisive entry")
+            return next(self._inner)
+
+        def close(self) -> None:
+            self._inner.close()
+
+    monkeypatch.setattr(resume.os, "scandir", GuardedScandir)
+    monkeypatch.setattr(resume, "_OCR_ARTIFACT_FILE_COUNT_LIMIT", 1)
+    monkeypatch.setattr(resume, "_OCR_ARTIFACT_NAMESPACE_ENTRY_LIMIT", 1)
+
+    with pytest.raises(RuntimeError) as caught:
+        resume._scan_ocr_artifact_tree(provider)
+
+    assert type(caught.value).__name__ == "_OcrArtifactBudgetExceededV1"
+    assert requested == [1, 2]
+
+
+def test_provider_artifact_file_limit_does_not_count_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = tmp_path / "provider"
+    nested = provider / "source" / "ocr"
+    nested.mkdir(parents=True)
+    (nested / "a.bin").write_bytes(b"a")
+    (nested / "b.bin").write_bytes(b"b")
+    monkeypatch.setattr(resume, "_OCR_ARTIFACT_FILE_COUNT_LIMIT", 2)
+    monkeypatch.setattr(resume, "_OCR_ARTIFACT_NAMESPACE_ENTRY_LIMIT", 8)
+
+    assert resume._scan_ocr_artifact_tree(provider) == (2, 2)
+
+
+@pytest.mark.parametrize("over_limit", [False, True])
+def test_private_ocr_input_is_gated_before_copy_or_parse(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    over_limit: bool,
+) -> None:
+    data_root, work_id, source_id = scanned_source
+    source_path = (
+        data_root
+        / "works"
+        / work_id
+        / "sources"
+        / source_id
+        / "original.pdf"
+    )
+    monkeypatch.setattr(
+        resume,
+        "_OCR_PDF_FILE_LIMIT",
+        source_path.stat().st_size - int(over_limit),
+    )
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", lambda: _runtime())
+
+    def succeed(
+        _profile: OcrRuntimeProfileV1,
+        input_path: Path,
+        output_root: Path,
+    ) -> OcrAttemptResultV1:
+        _write_valid_mineru_output(output_root, source_pdf=input_path)
+        return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
+    if over_limit:
+        monkeypatch.setattr(
+            resume,
+            "_copy_source_to_private_input",
+            lambda *_args: pytest.fail("oversized source must not be copied"),
+        )
+        monkeypatch.setattr(
+            resume,
+            "_select_source_text_v1",
+            lambda *_args: pytest.fail("oversized source must not be parsed"),
+        )
+        with pytest.raises(RuntimeError) as caught:
+            _invoke_unhandled(data_root, work_id)
+        assert type(caught.value).__name__ == "_OcrArtifactBudgetExceededV1"
+        staging = source_path.parent / "ocr" / "runs" / ".staging"
+        assert not tuple(staging.iterdir())
+    else:
+        assert _invoke(data_root, work_id).stage == "canonicalize"
+
+
 def test_provider_pdf_parser_accepts_exact_file_limit_and_rejects_limit_plus_one(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1187,6 +2163,174 @@ def test_pdf_content_decode_accepts_exact_limit_and_rejects_overflow_or_tail(
             zlib.compress(b"x") + b"trailing",
             limit=16,
         )
+
+
+def test_pdf_form_evidence_accepts_equivalent_flate_serialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        windows_root,
+        "_reject_hidden_short_alias",
+        lambda _parent, _component: None,
+    )
+    source = tmp_path / "source.pdf"
+    rewritten = tmp_path / "rewritten.pdf"
+    _write_form_pdf(source, compressed_form=False)
+    _write_form_pdf(rewritten, compressed_form=True)
+
+    assert source.read_bytes() != rewritten.read_bytes()
+    assert resume._validate_pdf_output(source, page_count=1) == (
+        resume._validate_pdf_output(rewritten, page_count=1)
+    )
+
+
+def test_pdf_form_evidence_accepts_nonzero_reversed_bbox_coordinates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        windows_root,
+        "_reject_hidden_short_alias",
+        lambda _parent, _component: None,
+    )
+    source = tmp_path / "source.pdf"
+    rewritten = tmp_path / "rewritten.pdf"
+    _write_form_pdf(
+        source,
+        compressed_form=False,
+        bbox=(12, 12, 0, 0),
+    )
+    _write_form_pdf(
+        rewritten,
+        compressed_form=True,
+        bbox=(12, 12, 0, 0),
+    )
+
+    assert resume._validate_pdf_output(source, page_count=1) == (
+        resume._validate_pdf_output(rewritten, page_count=1)
+    )
+
+
+def test_pdf_form_evidence_normalizes_provider_coordinate_precision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        windows_root,
+        "_reject_hidden_short_alias",
+        lambda _parent, _component: None,
+    )
+    source = tmp_path / "source.pdf"
+    rewritten = tmp_path / "rewritten.pdf"
+    _write_form_pdf(
+        source,
+        compressed_form=False,
+        bbox=(0, 0, 827.343, 446.457),
+    )
+    _write_form_pdf(
+        rewritten,
+        compressed_form=True,
+        bbox=(0, 0, 827.34302, 446.457),
+    )
+
+    assert resume._validate_pdf_output(source, page_count=1) == (
+        resume._validate_pdf_output(rewritten, page_count=1)
+    )
+
+
+@pytest.mark.parametrize(
+    ("source_values", "rewritten_values"),
+    [
+        ({"bbox": (0, 0, 12, 12)}, {"bbox": (0, 0, 13, 12)}),
+        (
+            {"matrix": (1, 0, 0, 1, 0, 0)},
+            {"matrix": (1, 0, 0, 1, 1, 0)},
+        ),
+    ],
+)
+def test_pdf_form_evidence_binds_bbox_and_matrix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_values: dict[str, tuple[int, ...]],
+    rewritten_values: dict[str, tuple[int, ...]],
+) -> None:
+    monkeypatch.setattr(
+        windows_root,
+        "_reject_hidden_short_alias",
+        lambda _parent, _component: None,
+    )
+    source = tmp_path / "source.pdf"
+    rewritten = tmp_path / "rewritten.pdf"
+    _write_form_pdf(source, compressed_form=False, **source_values)  # type: ignore[arg-type]
+    _write_form_pdf(rewritten, compressed_form=True, **rewritten_values)  # type: ignore[arg-type]
+
+    assert resume._validate_pdf_output(source, page_count=1) != (
+        resume._validate_pdf_output(rewritten, page_count=1)
+    )
+
+
+def test_pdf_form_rejects_non_version_one_form_type(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        windows_root,
+        "_reject_hidden_short_alias",
+        lambda _parent, _component: None,
+    )
+    invalid = tmp_path / "invalid-form.pdf"
+    _write_form_pdf(invalid, compressed_form=False, form_type=2)
+
+    with pytest.raises(RuntimeError) as caught:
+        resume._validate_pdf_output(invalid, page_count=1)
+
+    assert type(caught.value).__name__ == "_OcrOutputInvalidV1"
+
+
+def test_pdf_form_accepts_single_flate_array_with_null_decode_parameters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        windows_root,
+        "_reject_hidden_short_alias",
+        lambda _parent, _component: None,
+    )
+    direct = tmp_path / "direct.pdf"
+    array = tmp_path / "array.pdf"
+    _write_form_pdf(direct, compressed_form=True)
+    _write_form_pdf(
+        array,
+        compressed_form=True,
+        flate_array_length=1,
+    )
+
+    assert resume._validate_pdf_output(direct, page_count=1) == (
+        resume._validate_pdf_output(array, page_count=1)
+    )
+
+
+def test_pdf_form_rejects_multiple_filter_array(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        windows_root,
+        "_reject_hidden_short_alias",
+        lambda _parent, _component: None,
+    )
+    invalid = tmp_path / "multiple-filters.pdf"
+    _write_form_pdf(
+        invalid,
+        compressed_form=True,
+        flate_array_length=2,
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        resume._validate_pdf_output(invalid, page_count=1)
+
+    assert type(caught.value).__name__ == "_OcrOutputInvalidV1"
 
 
 def test_partial_output_over_budget_fail_stops_before_retry_or_formal_commit(

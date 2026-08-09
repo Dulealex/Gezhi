@@ -463,6 +463,32 @@ def _validate_resume_result(value: object) -> dict[str, object]:
     complete = cast(bool, result["pipeline_complete"])
     if complete != (stop == "complete" and pending == []):
         raise ValueError("Literature resume completion result is invalid")
+    if start == "complete":
+        if stop != "complete" or advanced:
+            raise ValueError("Literature resume complete continuation is invalid")
+    else:
+        start_index = _RESUME_STAGES.index(cast(str, start))
+        stop_index = (
+            len(_RESUME_STAGES)
+            if stop == "complete"
+            else _RESUME_STAGES.index(cast(str, stop))
+        )
+        returned_from_review_backlog = (
+            start == "review"
+            and stop == "review"
+            and bool(advanced)
+            and all(stage in {"handoff", "knowledge_import"} for stage in advanced)
+        )
+        if not returned_from_review_backlog and (
+            start_index > stop_index
+            or any(
+                not start_index
+                <= _RESUME_STAGES.index(cast(str, stage))
+                <= stop_index
+                for stage in advanced
+            )
+        ):
+            raise ValueError("Literature resume progress ordering is invalid")
     return result
 
 
@@ -549,6 +575,50 @@ def _resume_result_is_required(
     return False
 
 
+def _validate_resume_result_diagnostic_binding(
+    result: dict[str, object],
+    diagnostic: dict[str, object],
+) -> None:
+    code = cast(str, diagnostic["code"])
+    context = cast(dict[str, object], diagnostic["context"])
+    advanced = cast(list[str], result["advanced_stages"])
+    pending = cast(list[str], result["pending_candidate_ids"])
+    if code in {
+        "literature.resume.stage_blocked.v1",
+        "literature.resume.stage_failed.v1",
+    }:
+        stage = cast(str, context["stage"])
+        reason = cast(str, context["reason"])
+        if result["pipeline_complete"] is not False or result["stop_stage"] != stage:
+            raise ValueError("Literature resume stage result binding is invalid")
+        if reason == "awaiting_review":
+            if stage != "review" or not pending:
+                raise ValueError("Literature resume review backlog is invalid")
+        elif stage in {"handoff", "knowledge_import"}:
+            if result["start_stage"] != "review" or not pending:
+                raise ValueError("Literature resume retained backlog is invalid")
+        elif pending:
+            raise ValueError("Literature resume pending backlog is invalid")
+        if stage in advanced:
+            raise ValueError("Literature resume stopped stage was advanced")
+        return
+    if (
+        code
+        in {
+            "literature.resume.data_root_unsafe.v1",
+            "literature.resume.data_root_unavailable.v1",
+            "literature.resume.data_root_integrity_lost.v1",
+        }
+        and context == {"data_root": "knowledge"}
+        and (
+            result["pipeline_complete"] is not False
+            or result["stop_stage"] != "knowledge_import"
+            or "knowledge_import" in advanced
+        )
+    ):
+        raise ValueError("Literature resume Knowledge root result is invalid")
+
+
 def _validate_resume_receipt(
     receipt: ResumeReceiptV1,
 ) -> tuple[dict[str, object] | None, dict[str, object] | None]:
@@ -570,7 +640,9 @@ def _validate_resume_receipt(
     diagnostic = _validate_resume_diagnostic(receipt.outcome, receipt.diagnostic)
     required = _resume_result_is_required(diagnostic)
     if required:
-        return _validate_resume_result(receipt.result), diagnostic
+        result = _validate_resume_result(receipt.result)
+        _validate_resume_result_diagnostic_binding(result, diagnostic)
+        return result, diagnostic
     if receipt.result is not None:
         raise ValueError("Literature resume result presence is invalid")
     return None, diagnostic

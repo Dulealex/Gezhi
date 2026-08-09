@@ -119,6 +119,25 @@ class ProbeOutputLimitExceeded(RuntimeError):
         self.stderr = stderr
 
 
+class ProbeProgressGuardError(RuntimeError):
+    """A progress guard stopped the probe and retains settled pipe evidence."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+    ) -> None:
+        super().__init__(message)
+        self.stdout = stdout
+        self.stderr = stderr
+
+    def _attach_probe_capture_v1(self, *, stdout: bytes, stderr: bytes) -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+
+
 class ProbeLifecycleError(RuntimeError):
     """The probe could not prove that its Windows resources were settled."""
 
@@ -314,6 +333,8 @@ def run_bounded_probe_v1(
     readers: tuple[threading.Thread, threading.Thread] | None = None
     assigned_to_job = False
     tree_settled = False
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
     try:
         try:
             process = subprocess.Popen(
@@ -340,9 +361,6 @@ def run_bounded_probe_v1(
         captured = 0
         reader_failed = threading.Event()
         reader_failures: list[BaseException | None] = [None, None]
-        stdout_buffer = bytearray()
-        stderr_buffer = bytearray()
-
         def drain(index: int, stream: BinaryIO, destination: bytearray) -> None:
             nonlocal captured
             try:
@@ -403,6 +421,12 @@ def run_bounded_probe_v1(
         stdout_stream = None
         stderr_stream = None
 
+        reader_failure = next(
+            (failure for failure in reader_failures if failure is not None),
+            None,
+        )
+        if reader_failure is not None:
+            raise ProbeLifecycleError("probe pipe read failed") from reader_failure
         if timed_out:
             raise subprocess.TimeoutExpired(
                 frozen_command,
@@ -410,12 +434,6 @@ def run_bounded_probe_v1(
                 output=bytes(stdout_buffer),
                 stderr=bytes(stderr_buffer),
             )
-        reader_failure = next(
-            (failure for failure in reader_failures if failure is not None),
-            None,
-        )
-        if reader_failure is not None:
-            raise ProbeLifecycleError("probe pipe read failed") from reader_failure
         if overflow.is_set():
             raise ProbeOutputLimitExceeded(
                 stdout=bytes(stdout_buffer),
@@ -445,6 +463,11 @@ def run_bounded_probe_v1(
                 _join_readers(readers, (stdout_stream, stderr_stream))
             except Exception as cleanup_error:  # noqa: BLE001 - classify cleanup.
                 cleanup_failures.append(cleanup_error)
+        if isinstance(primary_error, ProbeProgressGuardError):
+            primary_error._attach_probe_capture_v1(
+                stdout=bytes(stdout_buffer),
+                stderr=bytes(stderr_buffer),
+            )
         if isinstance(primary_error, (KeyboardInterrupt, SystemExit, GeneratorExit)):
             for _cleanup_failure in cleanup_failures:
                 primary_error.add_note(
