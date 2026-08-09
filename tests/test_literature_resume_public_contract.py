@@ -12,6 +12,8 @@ import pytest
 from launcher_support import SOURCE_ROOT, launcher_commands, run_launcher
 from literature_pdf_support import write_text_pdf
 
+from gezhi import _literature_resume as resume
+
 
 @pytest.fixture
 def resume_workspace() -> Iterator[tuple[Path, Path]]:
@@ -73,6 +75,17 @@ def _run_resume(
         launcher_commands(arguments)[launcher_index],
         pythonpath_roots=pythonpath_roots,
     )
+
+
+def _rehash_run_and_current(run_dir: Path, current_path: Path) -> None:
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest["assets"] = resume._asset_entries(run_dir)
+    manifest_bytes = resume._canonical_json_bytes(manifest)
+    manifest_path.write_bytes(manifest_bytes)
+    current = json.loads(current_path.read_bytes())
+    current["manifest_sha256"] = hashlib.sha256(manifest_bytes).hexdigest()
+    current_path.write_bytes(resume._canonical_json_bytes(current))
 
 
 @pytest.mark.parametrize("launcher_index", [0, 1])
@@ -190,6 +203,49 @@ def test_matching_native_ocr_success_is_reused_without_a_second_run(
         first_runs
     )
     assert (runs_dir.parent / "current.json").read_bytes() == current_before
+
+
+def test_semantically_forged_native_output_is_asset_integrity_lost(
+    resume_workspace: tuple[Path, Path],
+) -> None:
+    data_root, pdf_path = resume_workspace
+    write_text_pdf(
+        pdf_path,
+        "This native PDF has enough text before its audit asset is forged.",
+    )
+    added = _run_add(data_root, pdf_path)
+    assert _run_resume(data_root, str(added["work_id"])).returncode == 2
+    ocr_dir = (
+        data_root
+        / "works"
+        / str(added["work_id"])
+        / "sources"
+        / str(added["source_id"])
+        / "ocr"
+    )
+    current_path = ocr_dir / "current.json"
+    current = json.loads(current_path.read_bytes())
+    run_dir = ocr_dir / "runs" / current["run_id"]
+    native_path = run_dir / "output" / "native_text.json"
+    native = json.loads(native_path.read_bytes())
+    native["pages"][0]["text"] = "forged"
+    native_path.write_bytes(resume._canonical_json_bytes(native))
+    _rehash_run_and_current(run_dir, current_path)
+
+    completed = _run_resume(data_root, str(added["work_id"]))
+
+    assert completed.returncode == 1
+    document = json.loads(completed.stdout)
+    assert document["outcome"] == "failed"
+    assert document["result"]["advanced_stages"] == []
+    assert document["result"]["start_stage"] == "ocr"
+    assert document["result"]["stop_stage"] == "ocr"
+    assert document["diagnostics"] == [
+        {
+            "code": "literature.resume.stage_failed.v1",
+            "context": {"reason": "asset_integrity_lost", "stage": "ocr"},
+        }
+    ]
 
 
 def test_native_text_path_does_not_load_ocr_only_runtime_modules(

@@ -24,6 +24,7 @@ from gezhi._literature_intake import (
     load_active_source_authority_v1,
 )
 from gezhi._windows_data_root import (
+    DataRootLifecycleErrorV1,
     DataRootOpenErrorV1,
     ValidatedDataRootV1,
     open_validated_data_root_v1,
@@ -331,21 +332,29 @@ def _remove_private_input(path: Path) -> None:
 
 def _select_source_text_v1(pdf_path: Path) -> _SelectionV1:
     try:
-        reader = PdfReader(str(pdf_path), strict=True)
-        texts: list[str] = []
-        counts: list[int] = []
-        for page in reader.pages:
-            text = page.extract_text() or ""
-            texts.append(text)
-            counts.append(sum(not character.isspace() for character in text))
-    except Exception:  # noqa: BLE001 - inability to prove native text selects OCR.
-        return _SelectionV1(
-            method="mineru_ocr",
-            reason="native_text_proof_unavailable",
-            page_count=None,
-            non_whitespace_counts=(),
-            page_texts=(),
-        )
+        stable_input = open_validated_local_file_v1(str(pdf_path))
+    except DataRootOpenErrorV1 as error:
+        raise _CommitFailedV1("OCR selector input is unavailable") from error
+    try:
+        with stable_input:
+            try:
+                reader = PdfReader(str(pdf_path), strict=True)
+                texts: list[str] = []
+                counts: list[int] = []
+                for page in reader.pages:
+                    text = page.extract_text() or ""
+                    texts.append(text)
+                    counts.append(sum(not character.isspace() for character in text))
+            except Exception:  # noqa: BLE001 - failure to prove text selects OCR.
+                return _SelectionV1(
+                    method="mineru_ocr",
+                    reason="native_text_proof_unavailable",
+                    page_count=None,
+                    non_whitespace_counts=(),
+                    page_texts=(),
+                )
+    except DataRootLifecycleErrorV1 as error:
+        raise _CommitFailedV1("OCR selector input could not be settled") from error
     if not texts:
         return _SelectionV1(
             method="mineru_ocr",
@@ -449,6 +458,24 @@ def _run_ocr_attempt_v1(
     )
 
 
+def _run_stable_ocr_attempt_v1(
+    profile: OcrRuntimeProfileV1,
+    input_path: Path,
+    output_root: Path,
+    authority: ActiveSourceAuthorityV1,
+) -> OcrAttemptResultV1:
+    try:
+        with open_validated_local_file_v1(str(input_path)) as stable_input:
+            if (
+                stable_input.size != authority.source_byte_length
+                or stable_input.sha256_v1() != authority.source_sha256
+            ):
+                raise _CommitFailedV1("OCR private input integrity was lost")
+            return _run_ocr_attempt_v1(profile, input_path, output_root)
+    except (DataRootLifecycleErrorV1, DataRootOpenErrorV1) as error:
+        raise _CommitFailedV1("OCR private input is unavailable") from error
+
+
 def _provider_output_leaf(output_root: Path) -> Path:
     return output_root / "source" / "ocr"
 
@@ -482,18 +509,21 @@ def _validate_provider_output(output_root: Path) -> None:
                 raise _OcrOutputInvalidV1("MinerU output inventory is invalid")
         markdown = _read_safe_bytes(leaf / "source.md")
         markdown.decode("utf-8")
-        for name in (
-            "source_content_list.json",
-            "source_content_list_v2.json",
-            "source_middle.json",
-            "source_model.json",
-        ):
-            json.loads(_read_safe_bytes(leaf / name))
+        content_list = json.loads(
+            _read_safe_bytes(leaf / "source_content_list.json")
+        )
+        content_list_v2 = json.loads(
+            _read_safe_bytes(leaf / "source_content_list_v2.json")
+        )
         middle = json.loads(_read_safe_bytes(leaf / "source_middle.json"))
+        model = json.loads(_read_safe_bytes(leaf / "source_model.json"))
         if (
-            type(middle) is not dict
+            type(content_list) is not list
+            or type(content_list_v2) is not list
+            or type(middle) is not dict
             or middle.get("_backend") != "pipeline"
             or middle.get("_version_name") != "3.4.4"
+            or type(model) not in {dict, list}
         ):
             raise _OcrOutputInvalidV1("MinerU identity is invalid")
         for name in (
@@ -664,7 +694,8 @@ def _validate_selection(value: dict[str, object]) -> OcrMethod:
     counts = value["non_whitespace_counts"]
     page_count = value["page_count"]
     if (
-        method not in {"native_text", "mineru_ocr"}
+        type(method) is not str
+        or method not in {"native_text", "mineru_ocr"}
         or value["minimum_non_whitespace_per_page"] != _MINIMUM_NON_WHITESPACE
         or type(counts) is not list
         or any(type(count) is not int or count < 0 for count in counts)
@@ -674,6 +705,35 @@ def _validate_selection(value: dict[str, object]) -> OcrMethod:
         or value["selector_profile"] != _SELECTOR_PROFILE
     ):
         raise _RunInvalidV1("OCR selection is invalid")
+    frozen_counts = cast(list[int], counts)
+    reason = cast(str, value["reason"])
+    if method == "native_text":
+        if (
+            type(page_count) is not int
+            or page_count <= 0
+            or len(frozen_counts) != page_count
+            or any(count < _MINIMUM_NON_WHITESPACE for count in frozen_counts)
+            or reason != "all_pages_meet_minimum"
+        ):
+            raise _RunInvalidV1("native text selection is invalid")
+    elif reason == "no_pages":
+        if page_count != 0 or frozen_counts:
+            raise _RunInvalidV1("zero-page OCR selection is invalid")
+    elif reason == "page_below_minimum":
+        if (
+            type(page_count) is not int
+            or page_count <= 0
+            or len(frozen_counts) != page_count
+            or not any(
+                count < _MINIMUM_NON_WHITESPACE for count in frozen_counts
+            )
+        ):
+            raise _RunInvalidV1("low-text OCR selection is invalid")
+    elif reason == "native_text_proof_unavailable":
+        if page_count is not None or frozen_counts:
+            raise _RunInvalidV1("unavailable native proof selection is invalid")
+    else:
+        raise _RunInvalidV1("OCR selection reason is invalid")
     return cast(OcrMethod, method)
 
 
@@ -716,6 +776,103 @@ def _validate_input(
     return cast(str, fingerprint), cast(str, profile)
 
 
+def _validate_attempts(
+    run_dir: Path,
+    *,
+    method: OcrMethod,
+    status: Literal["succeeded", "blocked", "failed"],
+    reason: str | None,
+    attempt_count: int,
+) -> None:
+    run_entries = _safe_entry_names(run_dir)
+    if attempt_count == 0:
+        if "attempts" in run_entries:
+            raise _RunInvalidV1("zero-attempt OCR run has attempt assets")
+        return
+    if method != "mineru_ocr" or "attempts" not in run_entries:
+        raise _RunInvalidV1("OCR attempt assets are missing")
+    attempts_dir = run_dir / "attempts"
+    expected_names = frozenset(str(index) for index in range(1, attempt_count + 1))
+    if _safe_entry_names(attempts_dir) != expected_names:
+        raise _RunInvalidV1("OCR attempt namespace is invalid")
+
+    outcomes: list[str] = []
+    for attempt in range(1, attempt_count + 1):
+        attempt_dir = attempts_dir / str(attempt)
+        names = _safe_entry_names(attempt_dir)
+        if not {"receipt.json", "stderr.bin", "stdout.bin"}.issubset(names):
+            raise _RunInvalidV1("OCR attempt evidence is incomplete")
+        if names - {"provider_output", "receipt.json", "stderr.bin", "stdout.bin"}:
+            raise _RunInvalidV1("OCR attempt inventory is invalid")
+        if "provider_output" in names:
+            try:
+                with open_validated_data_root_v1(
+                    str(attempt_dir / "provider_output")
+                ):
+                    pass
+            except DataRootOpenErrorV1 as error:
+                raise _RunInvalidV1("OCR partial output is unsafe") from error
+        document, _document_bytes = _read_canonical_document(
+            attempt_dir / "receipt.json"
+        )
+        outcome = document.get("outcome")
+        returncode = document.get("returncode")
+        if (
+            set(document) != {"attempt", "outcome", "returncode", "schema_version"}
+            or document.get("attempt") != attempt
+            or type(outcome) is not str
+            or outcome
+            not in {
+                "output_invalid",
+                "output_limit_exceeded",
+                "process_failed",
+                "runtime_unavailable",
+                "succeeded",
+                "timed_out",
+            }
+            or document.get("schema_version")
+            != "gezhi.literature_ocr_attempt.v1"
+            or (
+                outcome in {"process_failed", "succeeded", "output_invalid"}
+                and type(returncode) is not int
+            )
+            or (
+                outcome
+                in {
+                    "output_limit_exceeded",
+                    "runtime_unavailable",
+                    "timed_out",
+                }
+                and returncode is not None
+            )
+            or (outcome == "succeeded" and returncode != 0)
+            or (outcome == "output_invalid" and returncode != 0)
+            or (outcome == "process_failed" and returncode == 0)
+        ):
+            raise _RunInvalidV1("OCR attempt receipt is invalid")
+        outcomes.append(cast(str, outcome))
+
+    transient = {"process_failed", "timed_out"}
+    if status == "succeeded":
+        if outcomes[-1] != "succeeded" or any(
+            outcome not in transient for outcome in outcomes[:-1]
+        ):
+            raise _RunInvalidV1("successful OCR attempt sequence is invalid")
+    elif reason == "ocr_transient_exhausted":
+        if attempt_count != 2 or any(outcome not in transient for outcome in outcomes):
+            raise _RunInvalidV1("exhausted OCR attempt sequence is invalid")
+    elif reason == "ocr_runtime_unavailable":
+        if attempt_count != 1 or outcomes != ["runtime_unavailable"]:
+            raise _RunInvalidV1("unavailable OCR attempt sequence is invalid")
+    elif reason == "ocr_failed":
+        if outcomes[-1] not in {"output_invalid", "output_limit_exceeded"} or any(
+            outcome not in transient for outcome in outcomes[:-1]
+        ):
+            raise _RunInvalidV1("failed OCR attempt sequence is invalid")
+    else:
+        raise _RunInvalidV1("OCR terminal attempt sequence is invalid")
+
+
 def _load_run(
     run_dir: Path,
     run_id: str,
@@ -750,7 +907,8 @@ def _load_run(
     reason = receipt["reason"]
     attempt_count = receipt["attempt_count"]
     if (
-        status not in {"succeeded", "blocked", "failed"}
+        type(status) is not str
+        or status not in {"succeeded", "blocked", "failed"}
         or type(attempt_count) is not int
         or not 0 <= attempt_count <= 2
         or receipt["input_fingerprint_sha256"] != fingerprint
@@ -764,6 +922,28 @@ def _load_run(
         or (status == "succeeded" and reason is not None)
     ):
         raise _RunInvalidV1("OCR receipt is invalid")
+    if method == "native_text":
+        if status != "succeeded" or attempt_count != 0:
+            raise _RunInvalidV1("native text receipt is invalid")
+    elif status == "succeeded":
+        if attempt_count not in {1, 2}:
+            raise _RunInvalidV1("successful MinerU attempt count is invalid")
+    elif status == "blocked":
+        if reason == "ocr_runtime_unavailable" and attempt_count not in {0, 1}:
+            raise _RunInvalidV1("unavailable MinerU receipt is invalid")
+        if reason == "ocr_transient_exhausted" and attempt_count != 2:
+            raise _RunInvalidV1("exhausted MinerU receipt is invalid")
+        if reason not in {"ocr_runtime_unavailable", "ocr_transient_exhausted"}:
+            raise _RunInvalidV1("blocked MinerU reason is invalid")
+    elif reason != "ocr_failed" or attempt_count not in {1, 2}:
+        raise _RunInvalidV1("failed MinerU receipt is invalid")
+    _validate_attempts(
+        run_dir,
+        method=method,
+        status=cast(Literal["succeeded", "blocked", "failed"], status),
+        reason=cast(str | None, reason),
+        attempt_count=attempt_count,
+    )
     manifest, manifest_bytes = _read_canonical_document(run_dir / "manifest.json")
     expected_manifest = {
         "assets": _asset_entries(run_dir),
@@ -781,14 +961,31 @@ def _load_run(
             native, _native_bytes = _read_canonical_document(
                 run_dir / "output" / "native_text.json"
             )
+            pages = native.get("pages")
+            counts = cast(list[int], selection["non_whitespace_counts"])
+            page_count = cast(int, selection["page_count"])
             if (
                 set(native) != {"pages", "schema_version", "source_id", "work_id"}
                 or native["schema_version"] != "gezhi.literature_native_text.v1"
                 or native["source_id"] != authority.source_id
                 or native["work_id"] != authority.work_id
-                or type(native["pages"]) is not list
+                or type(pages) is not list
+                or len(pages) != page_count
             ):
                 raise _RunInvalidV1("native text output is invalid")
+            for index, page in enumerate(pages):
+                if (
+                    type(page) is not dict
+                    or set(page) != {"page_index", "text"}
+                    or page.get("page_index") != index
+                    or type(page.get("text")) is not str
+                    or sum(
+                        not character.isspace()
+                        for character in cast(str, page["text"])
+                    )
+                    != counts[index]
+                ):
+                    raise _RunInvalidV1("native text page output is invalid")
         else:
             output, _output_bytes = _read_canonical_document(
                 run_dir / "output" / "output.json"
@@ -1173,7 +1370,12 @@ def _execute_mineru_run(
         _ensure_plain_directory(attempt_dir)
         provider_output = attempt_dir / "provider_output"
         try:
-            completed = _run_ocr_attempt_v1(profile, input_path, provider_output)
+            completed = _run_stable_ocr_attempt_v1(
+                profile,
+                input_path,
+                provider_output,
+                authority,
+            )
         except ProbeUnavailableError:
             _write_attempt_assets(
                 attempt_dir,

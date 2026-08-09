@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from collections.abc import Iterator
@@ -88,6 +89,17 @@ def _invoke(data_root: Path, work_id: str) -> ResumeStoppedV1:
     return caught.value
 
 
+def _rehash_run_and_current(run_dir: Path, current_path: Path) -> None:
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest["assets"] = resume._asset_entries(run_dir)
+    manifest_bytes = resume._canonical_json_bytes(manifest)
+    manifest_path.write_bytes(manifest_bytes)
+    current = json.loads(current_path.read_bytes())
+    current["manifest_sha256"] = hashlib.sha256(manifest_bytes).hexdigest()
+    current_path.write_bytes(resume._canonical_json_bytes(current))
+
+
 def test_scanned_pdf_uses_frozen_profile_and_commits_auditable_attempt(
     scanned_source: tuple[Path, str, str],
     monkeypatch: pytest.MonkeyPatch,
@@ -145,6 +157,30 @@ def test_scanned_pdf_uses_frozen_profile_and_commits_auditable_attempt(
     assert (run_dir / "attempts" / "1" / "stdout.bin").read_bytes() == b"ok"
     assert (run_dir / "attempts" / "1" / "stderr.bin").read_bytes() == b""
     assert (run_dir / "output" / "mineru" / "source" / "ocr" / "source.md").is_file()
+
+
+def test_private_input_cannot_be_replaced_while_mineru_is_running(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root, work_id, _source_id = scanned_source
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", lambda: _runtime())
+
+    def succeed(
+        _profile: OcrRuntimeProfileV1,
+        input_path: Path,
+        output_root: Path,
+    ) -> OcrAttemptResultV1:
+        with pytest.raises(OSError):
+            input_path.write_bytes(b"replacement")
+        _write_valid_mineru_output(output_root)
+        return OcrAttemptResultV1(returncode=0, stdout=b"ok", stderr=b"")
+
+    monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
+
+    stopped = _invoke(data_root, work_id)
+
+    assert stopped.stage == "canonicalize"
 
 
 def test_transient_failure_retries_once_with_fresh_output(
@@ -505,6 +541,86 @@ def test_corrupt_current_is_asset_integrity_lost_and_does_not_rerun(
         resume,
         "_run_ocr_attempt_v1",
         lambda *_args: pytest.fail("corrupt current must not rerun OCR"),
+    )
+
+    stopped = _invoke(data_root, work_id)
+
+    assert (stopped.outcome, stopped.stage, stopped.reason) == (
+        "failed",
+        "ocr",
+        "asset_integrity_lost",
+    )
+
+
+def test_unhashable_corrupt_selection_is_classified_as_asset_integrity_lost(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root, work_id, source_id = scanned_source
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", lambda: _runtime())
+
+    def succeed(
+        _profile: OcrRuntimeProfileV1,
+        _input_path: Path,
+        output_root: Path,
+    ) -> OcrAttemptResultV1:
+        _write_valid_mineru_output(output_root)
+        return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
+    assert _invoke(data_root, work_id).stage == "canonicalize"
+    ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
+    current = json.loads((ocr_dir / "current.json").read_bytes())
+    selection_path = ocr_dir / "runs" / current["run_id"] / "selection.json"
+    selection = json.loads(selection_path.read_bytes())
+    selection["method"] = []
+    selection_path.write_bytes(resume._canonical_json_bytes(selection))
+    monkeypatch.setattr(
+        resume,
+        "_run_ocr_attempt_v1",
+        lambda *_args: pytest.fail("corrupt selection must not rerun OCR"),
+    )
+
+    stopped = _invoke(data_root, work_id)
+
+    assert (stopped.outcome, stopped.stage, stopped.reason) == (
+        "failed",
+        "ocr",
+        "asset_integrity_lost",
+    )
+
+
+def test_semantically_forged_attempt_receipt_is_asset_integrity_lost(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root, work_id, source_id = scanned_source
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", lambda: _runtime())
+
+    def succeed(
+        _profile: OcrRuntimeProfileV1,
+        _input_path: Path,
+        output_root: Path,
+    ) -> OcrAttemptResultV1:
+        _write_valid_mineru_output(output_root)
+        return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
+    assert _invoke(data_root, work_id).stage == "canonicalize"
+    ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
+    current_path = ocr_dir / "current.json"
+    current = json.loads(current_path.read_bytes())
+    run_dir = ocr_dir / "runs" / current["run_id"]
+    attempt_path = run_dir / "attempts" / "1" / "receipt.json"
+    attempt = json.loads(attempt_path.read_bytes())
+    attempt["outcome"] = "process_failed"
+    attempt["returncode"] = 17
+    attempt_path.write_bytes(resume._canonical_json_bytes(attempt))
+    _rehash_run_and_current(run_dir, current_path)
+    monkeypatch.setattr(
+        resume,
+        "_run_ocr_attempt_v1",
+        lambda *_args: pytest.fail("forged success must not rerun OCR"),
     )
 
     stopped = _invoke(data_root, work_id)
