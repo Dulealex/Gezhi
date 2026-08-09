@@ -2409,24 +2409,14 @@ def _write_current_staging_v1(path: Path, payload: bytes) -> None:
         raise _CommitFailedV1("OCR current staging readback failed") from error
 
 
-def _create_current_replace_link_v1(
-    temporary: Path,
+def _create_current_replace_copy_v1(
     staging_dir: Path,
     payload: bytes,
 ) -> Path:
     replacement = staging_dir / f".current-replace.{uuid.uuid4().hex}.tmp"
     try:
-        with (
-            open_validated_data_root_v1(str(temporary.parent)),
-            open_validated_data_root_v1(str(staging_dir)),
-        ):
-            os.link(temporary, replacement, follow_symlinks=False)
-        if (
-            not os.path.samefile(temporary, replacement)
-            or _read_safe_bytes(replacement, limit=len(payload)) != payload
-        ):
-            raise OSError("OCR current replacement link differs")
-    except (_RunInvalidV1, DataRootOpenErrorV1, OSError) as error:
+        _write_current_staging_v1(replacement, payload)
+    except (_CommitFailedV1, _RecoveryCertaintyLostV1) as error:
         raise _RecoveryCertaintyLostV1(
             "OCR current replacement evidence cannot be preserved"
         ) from error
@@ -2475,8 +2465,7 @@ def _atomic_replace_current(
         raise _RecoveryCertaintyLostV1(
             "OCR current replacement evidence is ambiguous"
         )
-    replacement = _create_current_replace_link_v1(
-        temporary,
+    replacement = _create_current_replace_copy_v1(
         ocr_dir / "runs" / ".staging",
         payload,
     )
@@ -2606,8 +2595,7 @@ def _load_current_run(
         != inventory.snapshot
     ):
         raise _RecoveryCertaintyLostV1("OCR current namespace changed")
-    replacement = _create_current_replace_link_v1(
-        temporary,
+    replacement = _create_current_replace_copy_v1(
         runs_dir / ".staging",
         temporary_bytes,
     )

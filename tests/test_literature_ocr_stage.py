@@ -1272,7 +1272,7 @@ def test_uncertain_current_replace_preserves_evidence_and_recovers_next_time(
     assert not (ocr_dir / "current.json").exists()
     evidence = tuple(ocr_dir.glob(".current.json.*.tmp"))
     assert len(evidence) == 1
-    replacement_source_was_evidence: list[bool] = []
+    replacement_source_matched_evidence: list[bool] = []
     replacement_completed = False
     fail_readback_once = True
     real_read = resume._read_safe_bytes
@@ -1280,8 +1280,8 @@ def test_uncertain_current_replace_preserves_evidence_and_recovers_next_time(
     def observe_recovery_replace(source: object, target: object) -> None:
         nonlocal replacement_completed
         if Path(target).name == "current.json":  # type: ignore[arg-type]
-            replacement_source_was_evidence.append(
-                resume.os.path.samefile(source, evidence[0])  # type: ignore[arg-type]
+            replacement_source_matched_evidence.append(
+                Path(source).read_bytes() == evidence[0].read_bytes()  # type: ignore[arg-type]
             )
         real_replace(source, target)  # type: ignore[arg-type]
         if Path(target).name == "current.json":  # type: ignore[arg-type]
@@ -1318,7 +1318,7 @@ def test_uncertain_current_replace_preserves_evidence_and_recovers_next_time(
     assert recovered.result is not None
     assert recovered.result.advanced_stages == ("ocr",)
     assert json.loads((ocr_dir / "current.json").read_bytes()) == current_before
-    assert replacement_source_was_evidence == [True, True]
+    assert replacement_source_matched_evidence == [True, True]
     assert not tuple(ocr_dir.glob(".current.json.*.tmp"))
     assert calls == 1
 
@@ -1378,6 +1378,35 @@ def test_current_readback_failure_after_replace_preserves_temp_evidence(
 
     assert recovered.result is not None
     assert recovered.result.advanced_stages == ("ocr",)
+    assert not tuple(ocr_dir.glob(".current.json.*.tmp"))
+
+
+def test_current_publish_does_not_require_hard_link_support(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root, work_id, source_id = scanned_source
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", lambda: _runtime())
+
+    def succeed(
+        _profile: OcrRuntimeProfileV1,
+        _input_path: Path,
+        output_root: Path,
+    ) -> OcrAttemptResultV1:
+        _write_valid_mineru_output(output_root)
+        return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
+
+    def reject_hard_link(*_args: object, **_kwargs: object) -> None:
+        raise OSError("hard links are not supported")
+
+    monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
+    monkeypatch.setattr(resume.os, "link", reject_hard_link)
+
+    stopped = _invoke(data_root, work_id)
+
+    assert stopped.stage == "canonicalize"
+    ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
+    assert (ocr_dir / "current.json").is_file()
     assert not tuple(ocr_dir.glob(".current.json.*.tmp"))
 
 
