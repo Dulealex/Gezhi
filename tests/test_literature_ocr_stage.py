@@ -1664,6 +1664,64 @@ def test_valid_current_still_classifies_matching_staging_success(
     assert current_path.read_bytes() == current_bytes
 
 
+@pytest.mark.parametrize("corrupt_first", [True, False])
+def test_multiple_formal_successes_outrank_corrupt_run_in_any_scan_order(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    corrupt_first: bool,
+) -> None:
+    data_root, work_id, source_id = scanned_source
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", lambda: _runtime())
+
+    def succeed(
+        _profile: OcrRuntimeProfileV1,
+        _input_path: Path,
+        output_root: Path,
+    ) -> OcrAttemptResultV1:
+        _write_valid_mineru_output(output_root)
+        return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
+    assert _invoke(data_root, work_id).stage == "canonicalize"
+    ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
+    current = json.loads((ocr_dir / "current.json").read_bytes())
+    runs_dir = ocr_dir / "runs"
+    original = runs_dir / current["run_id"]
+    clone_id = "ocrrun_123e4567-e89b-42d3-a456-426614174010"
+    _clone_success_run(original, runs_dir / clone_id, clone_id)
+    corrupt_id = "ocrrun_123e4567-e89b-42d3-a456-426614174011"
+    corrupt = runs_dir / corrupt_id
+    corrupt.mkdir()
+    marker = corrupt / "corrupt.bin"
+    marker.write_bytes(b"quarantine")
+    real_iter = resume._iter_recovery_entry_names_v1
+
+    def ordered_names(path: Path) -> Iterator[str]:
+        names = list(real_iter(path))
+        if path != runs_dir:
+            yield from names
+            return
+        staging = [name for name in names if name == ".staging"]
+        formal = [name for name in names if name != ".staging"]
+        formal.remove(corrupt_id)
+        ordered_formal = (
+            [corrupt_id, *formal]
+            if corrupt_first
+            else [*formal, corrupt_id]
+        )
+        yield from [*staging, *ordered_formal]
+
+    monkeypatch.setattr(resume, "_iter_recovery_entry_names_v1", ordered_names)
+
+    with pytest.raises(RuntimeError) as caught:
+        _invoke_unhandled(data_root, work_id)
+
+    assert type(caught.value).__name__ == "_RecoveryCertaintyLostV1"
+    assert marker.read_bytes() == b"quarantine"
+    assert original.is_dir()
+    assert (runs_dir / clone_id).is_dir()
+
+
 def test_formal_and_staging_run_id_collision_fail_stops_without_mutation(
     scanned_source: tuple[Path, str, str],
     monkeypatch: pytest.MonkeyPatch,

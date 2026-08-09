@@ -2643,17 +2643,25 @@ def _matching_staged_success_runs(
 def _matching_success_runs(
     runs_dir: Path,
     authority: ActiveSourceAuthorityV1,
-) -> tuple[_ValidatedRunV1, ...]:
+) -> tuple[tuple[_ValidatedRunV1, ...], _RunInvalidV1 | None]:
     runs: list[_ValidatedRunV1] = []
+    first_invalid: _RunInvalidV1 | None = None
     for name in _iter_recovery_entry_names_v1(runs_dir):
         if name == ".staging":
             continue
         if _RUN_ID.fullmatch(name) is None:
             raise _RecoveryCertaintyLostV1("OCR formal namespace is invalid")
-        run = _load_run(runs_dir / name, name, authority)
+        if len(runs) >= 2:
+            continue
+        try:
+            run = _load_run(runs_dir / name, name, authority)
+        except _RunInvalidV1 as error:
+            if first_invalid is None:
+                first_invalid = error
+            continue
         if _run_matches_current_profile(run) and len(runs) < 2:
             runs.append(run)
-    return tuple(runs)
+    return tuple(runs), first_invalid
 
 
 def _inventory_staging_namespace(
@@ -2691,7 +2699,7 @@ def _inventory_matching_successes(
         _snapshot_formal_run_namespace_v1(runs_dir) != formal_snapshot
     ):
         raise _RecoveryCertaintyLostV1("OCR formal namespace changed")
-    formal = _matching_success_runs(
+    formal, first_invalid = _matching_success_runs(
         runs_dir,
         authority,
     )
@@ -2702,6 +2710,8 @@ def _inventory_matching_successes(
     matches = formal + staged
     if len(matches) > 1:
         raise _RecoveryCertaintyLostV1("OCR recovery success is ambiguous")
+    if first_invalid is not None:
+        raise first_invalid
     return matches
 
 
