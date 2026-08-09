@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import ntpath
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from gezhi._windows_data_root import (
     data_roots_are_physically_isolated,
     inspect_data_root_v1,
     open_validated_data_root_v1,
+    open_validated_local_file_v1,
 )
 
 
@@ -37,6 +39,47 @@ def test_existing_local_directory_has_a_stable_ready_identity(
         inspection.identity is not None,
         inspection.canonical_path,
     ) == ("ready", True, str(data_root))
+
+
+def test_local_file_is_opened_no_follow_and_streamed_from_one_held_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "paper.pdf"
+    payload = b"%PDF-1.7\n" + b"x" * (1024 * 1024 + 7)
+    source.write_bytes(payload)
+    monkeypatch.setattr(
+        windows_root,
+        "_reject_hidden_short_alias",
+        lambda _parent, _component: None,
+    )
+
+    with open_validated_local_file_v1(str(source)) as opened:
+        original_identity = opened.identity
+        chunks = tuple(opened.iter_verified_chunks_v1())
+        assert opened.size == len(payload)
+        assert opened.identity == original_identity
+
+    assert b"".join(chunks) == payload
+    assert hashlib.sha256(b"".join(chunks)).hexdigest() == hashlib.sha256(
+        payload
+    ).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        r"relative\paper.pdf",
+        r"\\server\share\paper.pdf",
+        r"\\?\Volume{00000000-0000-0000-0000-000000000000}\paper.pdf",
+        r"E:\paper.pdf:stream",
+    ],
+)
+def test_local_file_rejects_unsupported_namespaces(value: str) -> None:
+    with pytest.raises(windows_root.DataRootOpenErrorV1) as raised:
+        open_validated_local_file_v1(value)
+
+    assert raised.value.status == "unsafe"
 
 
 def test_non_bmp_components_use_their_actual_utf16_length(
