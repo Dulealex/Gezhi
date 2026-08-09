@@ -71,8 +71,8 @@ SQLite、JSON、TOML、日志、哈希、路径、子进程和原子文件操作
 - `MODELSCOPE_CACHE` 仅在下载子进程中指向 `E:\Gezhi\.local\mineru`。
 - 固定模板为 `runtimes/ocr/mineru.template.json`，来源是 MinerU `3.4.4` 发布标签。
 - 实际配置生成到 `E:\Gezhi\.local\mineru\mineru.json`，不纳入 Git。
-- 运行 OCR 时向子进程注入 `MINERU_TOOLS_CONFIG_JSON`、`MINERU_MODEL_SOURCE=local` 和 `MINERU_DEVICE_MODE=cuda`。
-- 同时设置 ModelScope/Hugging Face 离线开关；运行期不得下载模型。
+- 运行 OCR 时向子进程注入 `MINERU_TOOLS_CONFIG_JSON=E:\Gezhi\.local\mineru\mineru.json`、`MINERU_MODEL_SOURCE=local`、`MINERU_DEVICE_MODE=cuda`、`HF_HUB_OFFLINE=1` 和 `TRANSFORMERS_OFFLINE=1`；完整 profile 与 ModelScope 本地门见 [ADR 0123](./adr/0123-freeze-the-ocr-offline-profile-and-model-manifest.md)。
+- 已验收的 pipeline 模型内容由 `runtimes/ocr/model-manifest.v1.json` 的 40 项相对 path、size 与 SHA-256 固定；运行期不得下载模型，Doctor 不得用目录存在或总大小替代逐文件身份复验。
 - 不设置用户级或系统级 MinerU/ModelScope 环境变量。
 
 ## 语义模型与 Codex CLI
@@ -88,7 +88,7 @@ SQLite、JSON、TOML、日志、哈希、路径、子进程和原子文件操作
 
 ## 已通过的验收门槛
 
-1. 核心环境：`uv lock --check`、`uv sync --frozen`、`uv pip check`、全部直接依赖导入和工具版本均通过，且同步无安装、卸载或升级。Editable `gezhi==0.1.0` 已安装，环境中恰有一个名为 `gezhi` 的 console entry point，其 target 精确为 `gezhi.bootstrap:main`，并已生成 `.venv\Scripts\gezhi.exe`；按 [ADR 0112](./adr/0112-package-gezhi-with-two-launch-adapters-and-one-bootstrap-seam.md)，真正执行该入口的 runtime contract smoke 仍等待 bootstrap/preflight implementation。
+1. 核心环境：`uv lock --check`、`uv sync --frozen`、`uv pip check`、全部直接依赖导入和工具版本均通过，且同步无安装、卸载或升级。Editable `gezhi==0.1.0` 已安装，环境中恰有一个名为 `gezhi` 的 console entry point，其 target 精确为 `gezhi.bootstrap:main`，并已生成 `.venv\Scripts\gezhi.exe`；两个启动器现已通过共享 bootstrap、preflight、parser 与 `doctor` runtime contract smoke。
 2. OCR 环境：同样通过锁、冻结同步和包兼容检查；Python 为 `3.11.15`，MinerU 为 `3.4.4`。
 3. CUDA：PyTorch CUDA 构建为 `13.0`，`torch.cuda.is_available()` 为真，并识别 `NVIDIA GeForce RTX 4090`。
 4. MinerU：在完全离线模型模式下，使用 GPU pipeline 解析真实的 6 页论文 PDF；生成 22 个文件、Markdown、4 个可解析 JSON、标注 PDF 和 14 张图片。

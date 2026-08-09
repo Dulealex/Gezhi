@@ -49,11 +49,16 @@ def test_parser_call_receives_exact_snapshot_suffix_and_fixed_settings(
     spy = _ParserCallSpy()
     monkeypatch.setattr(_cli, "_build_cli", lambda: spy)
     literal_arguments = (
-        "first",
+        "literature",
+        "add",
         "*.txt",
+        "--doi",
         "~",
+        "--arxiv-id",
         "%GEZHI_EXPANSION%",
+        "--citation",
         "$GEZHI_EXPANSION",
+        "--work-id",
         "二",
     )
 
