@@ -11,7 +11,7 @@ import subprocess
 import time
 import uuid
 import zlib
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Iterator
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -274,6 +274,20 @@ class _ValidatedRunV1:
     source_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class _RecoveryNamespaceSnapshotV1:
+    entry_count: int
+    sum_sha256: str
+    xor_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _CurrentNamespaceInventoryV1:
+    has_current: bool
+    snapshot: _RecoveryNamespaceSnapshotV1
+    temporary_name: str | None
+
+
 def _write_all(destination: BinaryIO, payload: bytes) -> None:
     offset = 0
     view = memoryview(payload)
@@ -324,13 +338,149 @@ def _safe_entry_names(path: Path) -> frozenset[str]:
         raise _RunInvalidV1("OCR directory inventory is invalid") from error
 
 
-def _recovery_entry_names(path: Path) -> frozenset[str]:
+def _iter_recovery_entry_names_v1(path: Path) -> Iterator[str]:
     try:
-        return _safe_entry_names(path)
-    except _RunInvalidV1 as error:
+        with open_validated_data_root_v1(str(path)), os.scandir(path) as entries:
+            for entry in entries:
+                yield entry.name
+    except (DataRootOpenErrorV1, OSError) as error:
         raise _RecoveryCertaintyLostV1(
             "OCR recovery namespace cannot be proven"
         ) from error
+
+
+def _recovery_name_sha256_v1(name: str) -> int:
+    try:
+        encoded = name.encode("utf-8")
+    except UnicodeError as error:
+        raise _RecoveryCertaintyLostV1(
+            "OCR recovery namespace name is invalid"
+        ) from error
+    framed = (
+        b"gezhi.ocr.recovery-name.v1\0"
+        + len(encoded).to_bytes(8, "big")
+        + encoded
+    )
+    return int.from_bytes(hashlib.sha256(framed).digest(), "big")
+
+
+def _snapshot_recovery_name_stream_v1(
+    names: Iterable[str],
+    *,
+    excluded_names: Collection[str] = (),
+) -> _RecoveryNamespaceSnapshotV1:
+    count = 0
+    xor_digest = 0
+    sum_digest = 0
+    modulus = 1 << 256
+    for name in names:
+        if name in excluded_names:
+            continue
+        digest = _recovery_name_sha256_v1(name)
+        count += 1
+        xor_digest ^= digest
+        sum_digest = (sum_digest + digest) % modulus
+    return _RecoveryNamespaceSnapshotV1(
+        entry_count=count,
+        sum_sha256=f"{sum_digest:064x}",
+        xor_sha256=f"{xor_digest:064x}",
+    )
+
+
+def _snapshot_recovery_namespace_v1(
+    path: Path,
+    *,
+    excluded_names: Collection[str] = (),
+) -> _RecoveryNamespaceSnapshotV1:
+    return _snapshot_recovery_name_stream_v1(
+        _iter_recovery_entry_names_v1(path),
+        excluded_names=excluded_names,
+    )
+
+
+def _snapshot_formal_run_namespace_v1(
+    path: Path,
+) -> _RecoveryNamespaceSnapshotV1:
+    count = 0
+    xor_digest = 0
+    sum_digest = 0
+    modulus = 1 << 256
+    for name in _iter_recovery_entry_names_v1(path):
+        if name == ".staging":
+            continue
+        if _RUN_ID.fullmatch(name) is None:
+            raise _RecoveryCertaintyLostV1("OCR formal namespace is invalid")
+        digest = _recovery_name_sha256_v1(name)
+        count += 1
+        xor_digest ^= digest
+        sum_digest = (sum_digest + digest) % modulus
+    return _RecoveryNamespaceSnapshotV1(
+        entry_count=count,
+        sum_sha256=f"{sum_digest:064x}",
+        xor_sha256=f"{xor_digest:064x}",
+    )
+
+
+def _recovery_name_exists_v1(path: Path, name: str) -> bool:
+    try:
+        with open_validated_data_root_v1(str(path)):
+            try:
+                (path / name).lstat()
+            except FileNotFoundError:
+                return False
+            return True
+    except (DataRootOpenErrorV1, OSError) as error:
+        raise _RecoveryCertaintyLostV1(
+            "OCR recovery namespace membership cannot be proven"
+        ) from error
+
+
+def _inventory_current_namespace_v1(path: Path) -> _CurrentNamespaceInventoryV1:
+    count = 0
+    xor_digest = 0
+    sum_digest = 0
+    modulus = 1 << 256
+    has_current = False
+    has_runs = False
+    temporary_name: str | None = None
+    for name in _iter_recovery_entry_names_v1(path):
+        if name == "runs":
+            if has_runs:
+                raise _RecoveryCertaintyLostV1(
+                    "OCR current namespace is ambiguous"
+                )
+            has_runs = True
+        elif name == "current.json":
+            if has_current:
+                raise _RecoveryCertaintyLostV1(
+                    "OCR current namespace is ambiguous"
+                )
+            has_current = True
+        elif _CURRENT_TEMP_NAME.fullmatch(name) is not None:
+            if temporary_name is not None:
+                raise _RecoveryCertaintyLostV1(
+                    "OCR current namespace is ambiguous"
+                )
+            temporary_name = name
+        else:
+            raise _RecoveryCertaintyLostV1(
+                "OCR current namespace is ambiguous"
+            )
+        digest = _recovery_name_sha256_v1(name)
+        count += 1
+        xor_digest ^= digest
+        sum_digest = (sum_digest + digest) % modulus
+    if not has_runs:
+        raise _RecoveryCertaintyLostV1("OCR current namespace is incomplete")
+    return _CurrentNamespaceInventoryV1(
+        has_current=has_current,
+        snapshot=_RecoveryNamespaceSnapshotV1(
+            entry_count=count,
+            sum_sha256=f"{sum_digest:064x}",
+            xor_sha256=f"{xor_digest:064x}",
+        ),
+        temporary_name=temporary_name,
+    )
 
 
 def _read_safe_bytes(path: Path, *, limit: int = _MAX_INT64) -> bytes:
@@ -713,7 +863,6 @@ def _run_ocr_attempt_v1(
 
 
 def _run_stable_ocr_attempt_v1(
-    profile: OcrRuntimeProfileV1,
     input_path: Path,
     output_root: Path,
     authority: ActiveSourceAuthorityV1,
@@ -725,6 +874,9 @@ def _run_stable_ocr_attempt_v1(
                 or stable_input.sha256_v1() != authority.source_sha256
             ):
                 raise _CommitFailedV1("OCR private input integrity was lost")
+            profile = _resolve_ocr_runtime_v1()
+            if not _valid_ocr_runtime_profile_v1(profile):
+                raise OcrRuntimeUnavailableV1
             return _run_ocr_attempt_v1(profile, input_path, output_root)
     except (DataRootLifecycleErrorV1, DataRootOpenErrorV1) as error:
         raise _CommitFailedV1("OCR private input is unavailable") from error
@@ -1055,7 +1207,15 @@ def _valid_middle_span_v1(
     span = cast(dict[str, object], value)
     span_type = cast(str, span["type"])
     if span_type in _MIDDLE_IMAGE_SPAN_TYPES:
-        if not _valid_middle_image_path_v1(span.get("image_path"), provider_paths):
+        if (
+            not _valid_middle_image_path_v1(
+                span.get("image_path"), provider_paths
+            )
+            or (
+                "score" in span
+                and not _valid_unit_score(span.get("score"))
+            )
+        ):
             return False
     elif type(span.get("content")) is not str or not _valid_unit_score(
         span.get("score")
@@ -2249,6 +2409,57 @@ def _write_current_staging_v1(path: Path, payload: bytes) -> None:
         raise _CommitFailedV1("OCR current staging readback failed") from error
 
 
+def _create_current_replace_link_v1(
+    temporary: Path,
+    staging_dir: Path,
+    payload: bytes,
+) -> Path:
+    replacement = staging_dir / f".current-replace.{uuid.uuid4().hex}.tmp"
+    try:
+        with (
+            open_validated_data_root_v1(str(temporary.parent)),
+            open_validated_data_root_v1(str(staging_dir)),
+        ):
+            os.link(temporary, replacement, follow_symlinks=False)
+        if (
+            not os.path.samefile(temporary, replacement)
+            or _read_safe_bytes(replacement, limit=len(payload)) != payload
+        ):
+            raise OSError("OCR current replacement link differs")
+    except (_RunInvalidV1, DataRootOpenErrorV1, OSError) as error:
+        raise _RecoveryCertaintyLostV1(
+            "OCR current replacement evidence cannot be preserved"
+        ) from error
+    return replacement
+
+
+def _replace_current_from_preserved_link_v1(
+    ocr_dir: Path,
+    temporary: Path,
+    replacement: Path,
+    payload: bytes,
+) -> None:
+    try:
+        os.replace(replacement, ocr_dir / "current.json")
+        if _read_safe_bytes(
+            ocr_dir / "current.json",
+            limit=len(payload),
+        ) != payload:
+            raise OSError("OCR current readback differs")
+        inventory = _inventory_current_namespace_v1(ocr_dir)
+        if (
+            not inventory.has_current
+            or inventory.temporary_name != temporary.name
+        ):
+            raise OSError("OCR current namespace differs after replacement")
+        with open_validated_data_root_v1(str(ocr_dir)):
+            temporary.unlink()
+    except (_RunInvalidV1, DataRootOpenErrorV1, OSError) as error:
+        raise _RecoveryCertaintyLostV1(
+            "OCR current replacement is uncertain"
+        ) from error
+
+
 def _atomic_replace_current(
     ocr_dir: Path,
     authority: ActiveSourceAuthorityV1,
@@ -2259,15 +2470,27 @@ def _atomic_replace_current(
     temporary = ocr_dir / f".current.json.{uuid.uuid4().hex}.tmp"
     _fresh_authority_or_stop(authority, root)
     _write_current_staging_v1(temporary, payload)
-    _fresh_authority_or_stop(authority, root)
-    try:
-        os.replace(temporary, ocr_dir / "current.json")
-        if _read_safe_bytes(ocr_dir / "current.json", limit=len(payload)) != payload:
-            raise OSError("OCR current readback differs")
-    except (_RunInvalidV1, OSError) as error:
+    inventory = _inventory_current_namespace_v1(ocr_dir)
+    if inventory.temporary_name != temporary.name:
         raise _RecoveryCertaintyLostV1(
-            "OCR current replacement is uncertain"
-        ) from error
+            "OCR current replacement evidence is ambiguous"
+        )
+    replacement = _create_current_replace_link_v1(
+        temporary,
+        ocr_dir / "runs" / ".staging",
+        payload,
+    )
+    _fresh_authority_or_stop(authority, root)
+    if _inventory_current_namespace_v1(ocr_dir).snapshot != inventory.snapshot:
+        raise _RecoveryCertaintyLostV1(
+            "OCR current namespace changed before replacement"
+        )
+    _replace_current_from_preserved_link_v1(
+        ocr_dir,
+        temporary,
+        replacement,
+        payload,
+    )
 
 
 def _load_current_document_run_v1(
@@ -2315,23 +2538,27 @@ def _load_current_run(
     *,
     matching_successes: tuple[_ValidatedRunV1, ...] | None,
 ) -> tuple[_ValidatedRunV1 | None, bool]:
-    names = _recovery_entry_names(ocr_dir)
-    unexpected = names - {"current.json", "runs"}
-    if (
-        any(_CURRENT_TEMP_NAME.fullmatch(name) is None for name in unexpected)
-        or len(unexpected) > 1
-    ):
-        raise _RecoveryCertaintyLostV1("OCR current namespace is ambiguous")
-    temporary_name = next(iter(unexpected), None)
+    inventory = _inventory_current_namespace_v1(ocr_dir)
+    temporary_name = inventory.temporary_name
     if temporary_name is None:
-        if "current.json" not in names:
+        if not inventory.has_current:
+            if (
+                _inventory_current_namespace_v1(ocr_dir).snapshot
+                != inventory.snapshot
+            ):
+                raise _RecoveryCertaintyLostV1(
+                    "OCR current namespace changed"
+                )
             return None, False
         run, _current_bytes = _load_current_document_run_v1(
             ocr_dir / "current.json",
             runs_dir,
             authority,
         )
-        if _recovery_entry_names(ocr_dir) != names:
+        if (
+            _inventory_current_namespace_v1(ocr_dir).snapshot
+            != inventory.snapshot
+        ):
             raise _RecoveryCertaintyLostV1("OCR current namespace changed")
         return run, False
 
@@ -2355,7 +2582,7 @@ def _load_current_run(
         raise _RecoveryCertaintyLostV1(
             "OCR current staging success is not unique"
         )
-    if "current.json" in names:
+    if inventory.has_current:
         try:
             current_run, current_bytes = _load_current_document_run_v1(
                 ocr_dir / "current.json",
@@ -2374,63 +2601,69 @@ def _load_current_run(
             raise _RecoveryCertaintyLostV1(
                 "OCR current and staging evidence conflict"
             )
-    if _recovery_entry_names(ocr_dir) != names:
+    if (
+        _inventory_current_namespace_v1(ocr_dir).snapshot
+        != inventory.snapshot
+    ):
         raise _RecoveryCertaintyLostV1("OCR current namespace changed")
+    replacement = _create_current_replace_link_v1(
+        temporary,
+        runs_dir / ".staging",
+        temporary_bytes,
+    )
     _fresh_authority_or_stop(authority, root)
-    if _recovery_entry_names(ocr_dir) != names:
+    if (
+        _inventory_current_namespace_v1(ocr_dir).snapshot
+        != inventory.snapshot
+    ):
         raise _RecoveryCertaintyLostV1("OCR current namespace changed")
-    try:
-        os.replace(temporary, ocr_dir / "current.json")
-        if (
-            _read_safe_bytes(
-                ocr_dir / "current.json",
-                limit=len(temporary_bytes),
-            )
-            != temporary_bytes
-        ):
-            raise OSError("OCR recovered current readback differs")
-    except (_RunInvalidV1, OSError) as error:
-        raise _RecoveryCertaintyLostV1(
-            "OCR current staging recovery is uncertain"
-        ) from error
-    expected_names = (names - {temporary_name}) | {"current.json"}
-    if _recovery_entry_names(ocr_dir) != expected_names:
-        raise _RecoveryCertaintyLostV1("OCR recovered current namespace differs")
+    _replace_current_from_preserved_link_v1(
+        ocr_dir,
+        temporary,
+        replacement,
+        temporary_bytes,
+    )
     return temporary_run, True
 
 
 def _matching_staged_success_runs(
     staging_dir: Path,
+    runs_dir: Path,
     authority: ActiveSourceAuthorityV1,
-    *,
-    names: frozenset[str],
-) -> tuple[_ValidatedRunV1, ...]:
+) -> tuple[tuple[_ValidatedRunV1, ...], bool]:
     runs: list[_ValidatedRunV1] = []
-    for name in sorted(
-        names,
-        key=lambda item: item.encode("utf-8"),
-    ):
+    target_conflicts = False
+    for name in _iter_recovery_entry_names_v1(staging_dir):
         if _RUN_ID.fullmatch(name) is None:
+            continue
+        if _recovery_name_exists_v1(runs_dir, name):
+            target_conflicts = True
             continue
         try:
             run = _load_run(staging_dir / name, name, authority)
         except _RunInvalidV1:
             continue
-        if run.status == "succeeded" and _run_matches_current_profile(run):
+        if (
+            run.status == "succeeded"
+            and _run_matches_current_profile(run)
+            and len(runs) < 2
+        ):
             runs.append(run)
-    return tuple(runs)
+    return tuple(runs), target_conflicts
 
 
 def _matching_success_runs(
     runs_dir: Path,
     authority: ActiveSourceAuthorityV1,
-    *,
-    names: frozenset[str],
 ) -> tuple[_ValidatedRunV1, ...]:
     runs: list[_ValidatedRunV1] = []
-    for name in sorted(names, key=lambda item: item.encode("utf-8")):
+    for name in _iter_recovery_entry_names_v1(runs_dir):
+        if name == ".staging":
+            continue
+        if _RUN_ID.fullmatch(name) is None:
+            raise _RecoveryCertaintyLostV1("OCR formal namespace is invalid")
         run = _load_run(runs_dir / name, name, authority)
-        if _run_matches_current_profile(run):
+        if _run_matches_current_profile(run) and len(runs) < 2:
             runs.append(run)
     return tuple(runs)
 
@@ -2439,26 +2672,24 @@ def _inventory_staging_namespace(
     staging_dir: Path,
     runs_dir: Path,
     authority: ActiveSourceAuthorityV1,
-) -> tuple[tuple[_ValidatedRunV1, ...], frozenset[str]]:
-    staging_names = _recovery_entry_names(staging_dir)
-    formal_names = _recovery_entry_names(runs_dir) - {".staging"}
-    if any(_RUN_ID.fullmatch(name) is None for name in formal_names):
-        raise _RecoveryCertaintyLostV1("OCR formal namespace is invalid")
-    if staging_names & formal_names:
-        raise _RecoveryCertaintyLostV1("OCR recovery target conflicts")
-    staged = _matching_staged_success_runs(
+) -> tuple[tuple[_ValidatedRunV1, ...], _RecoveryNamespaceSnapshotV1]:
+    staging_snapshot = _snapshot_recovery_namespace_v1(staging_dir)
+    formal_snapshot = _snapshot_formal_run_namespace_v1(runs_dir)
+    staged, target_conflicts = _matching_staged_success_runs(
         staging_dir,
+        runs_dir,
         authority,
-        names=staging_names,
     )
     if (
-        _recovery_entry_names(staging_dir) != staging_names
-        or (_recovery_entry_names(runs_dir) - {".staging"}) != formal_names
+        _snapshot_recovery_namespace_v1(staging_dir) != staging_snapshot
+        or _snapshot_formal_run_namespace_v1(runs_dir) != formal_snapshot
     ):
         raise _RecoveryCertaintyLostV1("OCR recovery namespace changed")
+    if target_conflicts:
+        raise _RecoveryCertaintyLostV1("OCR recovery target conflicts")
     if len(staged) > 1:
         raise _RecoveryCertaintyLostV1("OCR staged success is ambiguous")
-    return staged, formal_names
+    return staged, formal_snapshot
 
 
 def _inventory_matching_successes(
@@ -2466,16 +2697,19 @@ def _inventory_matching_successes(
     authority: ActiveSourceAuthorityV1,
     *,
     staged: tuple[_ValidatedRunV1, ...],
-    formal_names: frozenset[str],
+    formal_snapshot: _RecoveryNamespaceSnapshotV1,
 ) -> tuple[_ValidatedRunV1, ...]:
-    if (_recovery_entry_names(runs_dir) - {".staging"}) != formal_names:
+    if (
+        _snapshot_formal_run_namespace_v1(runs_dir) != formal_snapshot
+    ):
         raise _RecoveryCertaintyLostV1("OCR formal namespace changed")
     formal = _matching_success_runs(
         runs_dir,
         authority,
-        names=formal_names,
     )
-    if (_recovery_entry_names(runs_dir) - {".staging"}) != formal_names:
+    if (
+        _snapshot_formal_run_namespace_v1(runs_dir) != formal_snapshot
+    ):
         raise _RecoveryCertaintyLostV1("OCR formal namespace changed")
     matches = formal + staged
     if len(matches) > 1:
@@ -2494,8 +2728,8 @@ def _recover_unique_staged_success(
         return run
     _fresh_authority_or_stop(authority, root)
     if (
-        run.run_id not in _recovery_entry_names(staging_dir)
-        or run.run_id in (_recovery_entry_names(runs_dir) - {".staging"})
+        not _recovery_name_exists_v1(staging_dir, run.run_id)
+        or _recovery_name_exists_v1(runs_dir, run.run_id)
     ):
         raise _RecoveryCertaintyLostV1("OCR recovery namespace changed")
     target = runs_dir / run.run_id
@@ -2519,8 +2753,8 @@ def _create_unique_stage(
     runs_dir: Path,
 ) -> None:
     if (
-        stage.name in _recovery_entry_names(staging_dir)
-        or stage.name in (_recovery_entry_names(runs_dir) - {".staging"})
+        _recovery_name_exists_v1(staging_dir, stage.name)
+        or _recovery_name_exists_v1(runs_dir, stage.name)
     ):
         raise _RecoveryCertaintyLostV1("OCR run ID collides with its namespace")
     try:
@@ -2637,7 +2871,7 @@ def _commit_run(
     _load_run(stage, run_id, authority)
     _fresh_authority_or_stop(authority, root)
     target = runs_dir / run_id
-    if run_id in (_recovery_entry_names(runs_dir) - {".staging"}):
+    if _recovery_name_exists_v1(runs_dir, run_id):
         raise _RecoveryCertaintyLostV1("OCR run target conflicts")
     try:
         os.rename(stage, target)
@@ -2738,41 +2972,26 @@ def _execute_mineru_run(
 ) -> tuple[ResumeOutcome | None, str | None, int]:
     attempts_dir = stage / "attempts"
     for attempt in (1, 2):
-        try:
-            profile = _resolve_ocr_runtime_v1()
-        except OcrRuntimeUnavailableV1:
-            profile = None
-        if not _valid_ocr_runtime_profile_v1(profile):
-            if attempt == 1:
+        if attempt == 1:
+            try:
+                initial_profile = _resolve_ocr_runtime_v1()
+            except OcrRuntimeUnavailableV1:
                 return "blocked", "ocr_runtime_unavailable", 0
-            attempt_dir = attempts_dir / str(attempt)
-            _ensure_plain_directory(attempt_dir)
-            _write_attempt_assets(
-                attempt_dir,
-                stdout=b"",
-                stderr=b"",
-                document=_attempt_document(
-                    attempt,
-                    outcome="runtime_unavailable",
-                    returncode=None,
-                ),
-            )
-            return "blocked", "ocr_runtime_unavailable", attempt
+            if not _valid_ocr_runtime_profile_v1(initial_profile):
+                return "blocked", "ocr_runtime_unavailable", 0
         if attempt == 1:
             _ensure_plain_directory(attempts_dir)
-        frozen_profile = cast(OcrRuntimeProfileV1, profile)
         attempt_dir = attempts_dir / str(attempt)
         _ensure_plain_directory(attempt_dir)
         provider_output = attempt_dir / "provider_output"
         _enforce_ocr_artifact_budget_v1(stage)
         try:
             completed = _run_stable_ocr_attempt_v1(
-                frozen_profile,
                 input_path,
                 provider_output,
                 authority,
             )
-        except ProbeUnavailableError:
+        except (OcrRuntimeUnavailableV1, ProbeUnavailableError):
             _enforce_ocr_artifact_budget_v1(stage)
             _write_attempt_assets(
                 attempt_dir,
@@ -2893,7 +3112,7 @@ def _advance_ocr(
             reason="commit_failed",
         )
 
-    staged, formal_names = _inventory_staging_namespace(
+    staged, formal_snapshot = _inventory_staging_namespace(
         staging_dir,
         runs_dir,
         authority,
@@ -2903,7 +3122,7 @@ def _advance_ocr(
             runs_dir,
             authority,
             staged=staged,
-            formal_names=formal_names,
+            formal_snapshot=formal_snapshot,
         )
     except _RunInvalidV1 as error:
         try:

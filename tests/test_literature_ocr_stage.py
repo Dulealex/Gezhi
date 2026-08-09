@@ -708,6 +708,18 @@ def test_middle_image_span_binds_bare_leaf_to_provider_inventory() -> None:
         )
 
 
+@pytest.mark.parametrize("score", [float("nan"), float("inf"), -0.01, 1.01])
+def test_middle_image_span_rejects_invalid_optional_score(score: float) -> None:
+    span = {
+        "bbox": [0, 0, 10, 10],
+        "image_path": "asset.jpg",
+        "score": score,
+        "type": "image",
+    }
+
+    assert not resume._valid_middle_span_v1(span, {"images/asset.jpg"})
+
+
 @pytest.mark.parametrize("failure", ["timeout", "output_limit"])
 def test_ocr_stop_preserves_bounded_stdout_and_stderr_capture(
     scanned_source: tuple[Path, str, str],
@@ -905,7 +917,7 @@ def test_retry_revalidates_runtime_after_backoff_before_second_launch(
     def resolve() -> OcrRuntimeProfileV1:
         nonlocal runtime_checks
         runtime_checks += 1
-        if runtime_checks == 2:
+        if runtime_checks == 3:
             raise resume.OcrRuntimeUnavailableV1
         return _runtime()
 
@@ -934,7 +946,7 @@ def test_retry_revalidates_runtime_after_backoff_before_second_launch(
         "ocr",
         "ocr_runtime_unavailable",
     )
-    assert runtime_checks == 2
+    assert runtime_checks == 3
     assert launches == 1
     runs_dir = data_root / "works" / work_id / "sources" / source_id / "ocr" / "runs"
     run_dir = next(item for item in runs_dir.iterdir() if item.name != ".staging")
@@ -942,6 +954,90 @@ def test_retry_revalidates_runtime_after_backoff_before_second_launch(
     assert json.loads(
         (run_dir / "attempts" / "2" / "receipt.json").read_bytes()
     )["outcome"] == "runtime_unavailable"
+
+
+def test_first_attempt_launch_time_runtime_drift_is_audited_without_launch(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root, work_id, source_id = scanned_source
+    runtime_checks = 0
+    launches = 0
+
+    def resolve() -> OcrRuntimeProfileV1:
+        nonlocal runtime_checks
+        runtime_checks += 1
+        if runtime_checks == 2:
+            raise resume.OcrRuntimeUnavailableV1
+        return _runtime()
+
+    def launch(*_args: object) -> OcrAttemptResultV1:
+        nonlocal launches
+        launches += 1
+        return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", resolve)
+    monkeypatch.setattr(resume, "_run_ocr_attempt_v1", launch)
+
+    stopped = _invoke(data_root, work_id)
+
+    assert (stopped.outcome, stopped.stage, stopped.reason) == (
+        "blocked",
+        "ocr",
+        "ocr_runtime_unavailable",
+    )
+    assert runtime_checks == 2
+    assert launches == 0
+    runs_dir = data_root / "works" / work_id / "sources" / source_id / "ocr" / "runs"
+    run_dir = next(item for item in runs_dir.iterdir() if item.name != ".staging")
+    assert json.loads((run_dir / "receipt.json").read_bytes())["attempt_count"] == 1
+    assert json.loads(
+        (run_dir / "attempts" / "1" / "receipt.json").read_bytes()
+    )["outcome"] == "runtime_unavailable"
+
+
+def test_runtime_revalidation_is_the_last_observable_step_before_each_launch(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root, work_id, _source_id = scanned_source
+    events: list[str] = []
+    launches = 0
+    real_budget = resume._enforce_ocr_artifact_budget_v1
+
+    def resolve() -> OcrRuntimeProfileV1:
+        events.append("runtime")
+        return _runtime()
+
+    def enforce_budget(stage: Path) -> None:
+        events.append("budget")
+        real_budget(stage)
+
+    def launch(
+        _profile: OcrRuntimeProfileV1,
+        _input_path: Path,
+        output_root: Path,
+    ) -> OcrAttemptResultV1:
+        nonlocal launches
+        events.append("launch")
+        launches += 1
+        if launches == 1:
+            raise subprocess.TimeoutExpired(("mineru",), 900)
+        _write_valid_mineru_output(output_root)
+        return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", resolve)
+    monkeypatch.setattr(resume, "_enforce_ocr_artifact_budget_v1", enforce_budget)
+    monkeypatch.setattr(resume, "_run_ocr_attempt_v1", launch)
+    monkeypatch.setattr(resume.time, "sleep", lambda _seconds: None)
+
+    assert _invoke(data_root, work_id).stage == "canonicalize"
+
+    launch_indexes = [
+        index for index, event in enumerate(events) if event == "launch"
+    ]
+    assert len(launch_indexes) == 2
+    assert all(events[index - 1] == "runtime" for index in launch_indexes)
 
 
 def test_committed_success_without_current_repairs_pointer_without_rerun(
@@ -1176,14 +1272,45 @@ def test_uncertain_current_replace_preserves_evidence_and_recovers_next_time(
     assert not (ocr_dir / "current.json").exists()
     evidence = tuple(ocr_dir.glob(".current.json.*.tmp"))
     assert len(evidence) == 1
-    replacement_sources: list[Path] = []
+    replacement_source_was_evidence: list[bool] = []
+    replacement_completed = False
+    fail_readback_once = True
+    real_read = resume._read_safe_bytes
 
     def observe_recovery_replace(source: object, target: object) -> None:
+        nonlocal replacement_completed
         if Path(target).name == "current.json":  # type: ignore[arg-type]
-            replacement_sources.append(Path(source))  # type: ignore[arg-type]
+            replacement_source_was_evidence.append(
+                resume.os.path.samefile(source, evidence[0])  # type: ignore[arg-type]
+            )
         real_replace(source, target)  # type: ignore[arg-type]
+        if Path(target).name == "current.json":  # type: ignore[arg-type]
+            replacement_completed = True
+
+    def fail_recovery_readback_once(
+        path: Path,
+        *,
+        limit: int = resume._MAX_INT64,
+    ) -> bytes:
+        nonlocal fail_readback_once
+        if (
+            path == ocr_dir / "current.json"
+            and replacement_completed
+            and fail_readback_once
+        ):
+            fail_readback_once = False
+            raise resume._RunInvalidV1("injected recovery readback failure")
+        return real_read(path, limit=limit)
 
     monkeypatch.setattr(resume.os, "replace", observe_recovery_replace)
+    monkeypatch.setattr(resume, "_read_safe_bytes", fail_recovery_readback_once)
+
+    with pytest.raises(RuntimeError) as recovery_error:
+        _invoke_unhandled(data_root, work_id)
+
+    assert type(recovery_error.value).__name__ == "_RecoveryCertaintyLostV1"
+    assert evidence[0].read_bytes() == resume._canonical_json_bytes(current_before)
+    assert tuple(ocr_dir.glob(".current.json.*.tmp")) == evidence
 
     recovered = _invoke(data_root, work_id)
 
@@ -1191,9 +1318,67 @@ def test_uncertain_current_replace_preserves_evidence_and_recovers_next_time(
     assert recovered.result is not None
     assert recovered.result.advanced_stages == ("ocr",)
     assert json.loads((ocr_dir / "current.json").read_bytes()) == current_before
-    assert replacement_sources == [evidence[0]]
+    assert replacement_source_was_evidence == [True, True]
     assert not tuple(ocr_dir.glob(".current.json.*.tmp"))
     assert calls == 1
+
+
+def test_current_readback_failure_after_replace_preserves_temp_evidence(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root, work_id, source_id = scanned_source
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", lambda: _runtime())
+
+    def succeed(
+        _profile: OcrRuntimeProfileV1,
+        _input_path: Path,
+        output_root: Path,
+    ) -> OcrAttemptResultV1:
+        _write_valid_mineru_output(output_root)
+        return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
+    assert _invoke(data_root, work_id).stage == "canonicalize"
+    ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
+    current = ocr_dir / "current.json"
+    expected = current.read_bytes()
+    current.unlink()
+    real_replace = resume.os.replace
+    real_read = resume._read_safe_bytes
+    replacement_completed = False
+    fail_readback_once = True
+
+    def observe_replace(source: object, target: object) -> None:
+        nonlocal replacement_completed
+        real_replace(source, target)  # type: ignore[arg-type]
+        if Path(target) == current:  # type: ignore[arg-type]
+            replacement_completed = True
+
+    def fail_current_readback(path: Path, *, limit: int = resume._MAX_INT64) -> bytes:
+        nonlocal fail_readback_once
+        if path == current and replacement_completed and fail_readback_once:
+            fail_readback_once = False
+            raise resume._RunInvalidV1("injected current readback failure")
+        return real_read(path, limit=limit)
+
+    monkeypatch.setattr(resume.os, "replace", observe_replace)
+    monkeypatch.setattr(resume, "_read_safe_bytes", fail_current_readback)
+
+    with pytest.raises(RuntimeError) as caught:
+        _invoke_unhandled(data_root, work_id)
+
+    assert type(caught.value).__name__ == "_RecoveryCertaintyLostV1"
+    evidence = tuple(ocr_dir.glob(".current.json.*.tmp"))
+    assert len(evidence) == 1
+    assert evidence[0].read_bytes() == expected
+    assert current.read_bytes() == expected
+
+    recovered = _invoke(data_root, work_id)
+
+    assert recovered.result is not None
+    assert recovered.result.advanced_stages == ("ocr",)
+    assert not tuple(ocr_dir.glob(".current.json.*.tmp"))
 
 
 def test_same_source_and_profile_have_stable_input_fingerprint_after_failed_retry(
@@ -1559,21 +1744,66 @@ def test_namespace_inventory_failure_is_not_a_handled_recovery_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        windows_root,
+        "_reject_hidden_short_alias",
+        lambda _parent, _component: None,
+    )
     namespace = tmp_path / "runs"
     namespace.mkdir()
-    real_iterdir = Path.iterdir
+    real_scandir = resume.os.scandir
 
-    def fail_inventory(path: Path) -> Iterator[Path]:
-        if path == namespace:
+    def fail_inventory(path: object) -> object:
+        if Path(path) == namespace:  # type: ignore[arg-type]
             raise OSError("injected inventory failure")
-        return real_iterdir(path)
+        return real_scandir(path)  # type: ignore[call-overload]
 
-    monkeypatch.setattr(Path, "iterdir", fail_inventory)
+    monkeypatch.setattr(resume.os, "scandir", fail_inventory)
 
     with pytest.raises(RuntimeError) as caught:
-        resume._recovery_entry_names(namespace)
+        resume._snapshot_recovery_namespace_v1(namespace)
 
     assert type(caught.value).__name__ == "_RecoveryCertaintyLostV1"
+
+
+def test_recovery_namespace_snapshot_is_fixed_size_and_detects_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        windows_root,
+        "_reject_hidden_short_alias",
+        lambda _parent, _component: None,
+    )
+    namespace = tmp_path / "runs"
+    namespace.mkdir()
+    for index in range(128):
+        (namespace / f"entry-{index:04d}").mkdir()
+
+    before = resume._snapshot_recovery_namespace_v1(namespace)
+    repeated = resume._snapshot_recovery_namespace_v1(namespace)
+    names = [f"entry-{index:04d}" for index in range(128)]
+
+    assert before == repeated
+    assert resume._snapshot_recovery_name_stream_v1(
+        iter(names)
+    ) == resume._snapshot_recovery_name_stream_v1(reversed(names))
+    assert before.entry_count == 128
+    assert set(before.__dataclass_fields__) == {
+        "entry_count",
+        "sum_sha256",
+        "xor_sha256",
+    }
+
+    (namespace / "entry-0000").rename(namespace / "entry-renamed")
+
+    renamed = resume._snapshot_recovery_namespace_v1(namespace)
+    assert renamed.entry_count == before.entry_count
+    assert renamed != before
+
+    (namespace / "entry-new").mkdir()
+
+    assert resume._snapshot_recovery_namespace_v1(namespace) != renamed
 
 
 def test_existing_staging_validation_failure_is_not_commit_failed(
