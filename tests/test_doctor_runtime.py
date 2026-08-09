@@ -152,6 +152,7 @@ def test_ocr_probe_environment_is_closed_over_provider_policy(
     monkeypatch.setenv("MODELSCOPE_OFFLINE", "invented")
     monkeypatch.setenv("HF_HOME", r"D:\hf")
     monkeypatch.setenv("TRANSFORMERS_CACHE", r"D:\transformers")
+    monkeypatch.setenv("NO_PROXY", "example.invalid")
     monkeypatch.setenv("UNRELATED", "preserved")
     config_path = Path(r"E:\Gezhi\.local\mineru\mineru.json")
 
@@ -166,6 +167,7 @@ def test_ocr_probe_environment_is_closed_over_provider_policy(
             "MINERU_DEVICE_MODE",
             "HF_HUB_OFFLINE",
             "TRANSFORMERS_OFFLINE",
+            "NO_PROXY",
             "MODELSCOPE_CACHE",
             "MODELSCOPE_OFFLINE",
             "HF_HOME",
@@ -177,6 +179,7 @@ def test_ocr_probe_environment_is_closed_over_provider_policy(
         "MINERU_DEVICE_MODE": "cuda",
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",
+        "NO_PROXY": "127.0.0.1,localhost",
         "MODELSCOPE_CACHE": None,
         "MODELSCOPE_OFFLINE": None,
         "HF_HOME": None,

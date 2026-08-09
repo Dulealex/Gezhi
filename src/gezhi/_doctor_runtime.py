@@ -67,6 +67,19 @@ _OCR_PYTHON_PARTS = (
     "Scripts",
     "python.exe",
 )
+_OCR_MINERU_PARTS = (
+    "runtimes",
+    "ocr",
+    ".venv",
+    "Scripts",
+    "mineru.exe",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenOcrExecutionRuntimeV1:
+    executable_path: str
+    environment: tuple[tuple[str, str], ...]
 
 
 def probe_core_environment_v1() -> tuple[ProbeStatus, ProbeStatus]:
@@ -470,6 +483,7 @@ value = {
             "MINERU_DEVICE_MODE",
             "HF_HUB_OFFLINE",
             "TRANSFORMERS_OFFLINE",
+            "NO_PROXY",
             "MODELSCOPE_CACHE",
             "MODELSCOPE_OFFLINE",
         )
@@ -506,6 +520,7 @@ def _ocr_probe_environment(config_path: Path) -> dict[str, str]:
             "MINERU_DEVICE_MODE": "cuda",
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
+            "NO_PROXY": "127.0.0.1,localhost",
             "PYTHONDONTWRITEBYTECODE": "1",
         }
     )
@@ -569,6 +584,7 @@ def probe_ocr_runtime_v1(
             "MINERU_TOOLS_CONFIG_JSON": str(config_path),
             "MODELSCOPE_CACHE": None,
             "MODELSCOPE_OFFLINE": None,
+            "NO_PROXY": "127.0.0.1,localhost",
             "TRANSFORMERS_OFFLINE": "1",
         },
         "python": [3, 11, 15],
@@ -577,6 +593,39 @@ def probe_ocr_runtime_v1(
         "torchvision": "0.24.1+cu130",
     }
     return "ready" if observed == expected else "blocked"
+
+
+def resolve_ocr_execution_runtime_v1(
+    *,
+    project_root: Path,
+    deployment_root: Path,
+) -> FrozenOcrExecutionRuntimeV1:
+    """Return the exact executable/profile only after the frozen probe passes."""
+
+    if (
+        probe_ocr_runtime_v1(
+            project_root=project_root,
+            deployment_root=deployment_root,
+        )
+        != "ready"
+    ):
+        raise RuntimeUnavailableError("the frozen OCR runtime is unavailable")
+    try:
+        config_path, _model_root = _read_ocr_configuration_v1(deployment_root)
+        with (
+            open_validated_data_root_v1(str(deployment_root)) as deployment,
+            deployment.open_relative_file_v1(_OCR_MINERU_PARTS) as executable,
+        ):
+            executable_path = executable.canonical_path
+    except (DataRootOpenErrorV1, OSError, ValueError) as error:
+        raise RuntimeUnavailableError(
+            "the frozen OCR executable is unavailable"
+        ) from error
+    environment = _ocr_probe_environment(config_path)
+    return FrozenOcrExecutionRuntimeV1(
+        executable_path=executable_path,
+        environment=tuple(sorted(environment.items())),
+    )
 
 
 DoctorObservation = tuple[str, str, str | None]
