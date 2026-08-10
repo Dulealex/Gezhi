@@ -100,13 +100,13 @@ def test_resume_null_result_primary_has_only_catalog_reason_and_next_action() ->
     ]
 
 
-def test_resume_stage_matrix_has_17_blocked_and_25_failed_sealed_witnesses() -> None:
+def test_resume_stage_matrix_has_18_blocked_and_25_failed_sealed_witnesses() -> None:
     matrices = (
         (
             "blocked",
             "literature.resume.stage_blocked.v1",
             commands._RESUME_STAGE_BLOCKED,
-            17,
+            18,
         ),
         (
             "failed",

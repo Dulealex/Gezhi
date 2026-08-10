@@ -12,6 +12,7 @@
 ## 关系
 
 - **Literature → Knowledge**：Literature 只通过版本化 Reviewed Handoff 交付符合 [Candidate Knowledge v1](./docs/contracts/candidate-knowledge-v1.md) 的已审核候选、来源身份、Evidence Pointer、风险与审核状态。
+- **Literature 阅读边界**：[Canonical Reading Asset v1](./docs/contracts/canonical-reading-asset-v1.md) 冻结 Active Source 经 OCR success 生成 `document.md`、Evidence Block、内容寻址图片、Canonical 内容身份与 Evidence Pointer 的确定性合同；Reader 和后续 Bot 只消费该边界，不读取 MinerU 私有输出。
 - **Knowledge → Literature**：Knowledge 可以报告合同、证据或冲突问题，但不回写 Literature 的全文、阅读资产或 Active Source 决策。
 - **未来上下文 ↔ 现有上下文**：通过显式、版本化的交接合同协作；一个上下文不得直接拥有或改写另一个上下文的内部状态。
 - **共同边界**：任何上下文都不能静默把 Candidate Knowledge 变成 Promoted Knowledge。
