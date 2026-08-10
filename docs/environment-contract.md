@@ -81,7 +81,7 @@ SQLite、JSON、TOML、日志、哈希、路径、子进程和原子文件操作
 
 - `runtimes/codex/package.json` 和 `package-lock.json` 精确锁定 `@openai/codex==0.146.0`。
 - `tools/codex.ps1` 保留为安装验收与人工项目入口，负责校验 npm 主包、Windows x64 原生包和实际 CLI 版本；它不作为 Literature/Knowledge runtime attempt 的 PowerShell wrapper。
-- Runtime adapter 在首次 launch commitment 前通过项目自有 resolver 读取同一 npm lock/package identity，证明主包 `0.146.0`、native package `0.146.0-win32-x64` 与唯一绝对 native CLI 路径，然后按 [ADR 0106](./adr/0106-run-command-owned-children-without-a-console.md) 直接启动该文件。不得在每个 attempt 内先运行 `codex.exe --version`，也不得引入可更新的 PowerShell host 作为运行时依赖。
+- Runtime adapter 在首次 launch commitment 前通过项目自有 resolver，从一个 held project-root capability 相对读取 `runtimes/codex/runtime-identity-v1.json` 与同一 npm lock/package identity，证明主包 `0.146.0`、native package `0.146.0-win32-x64` 与唯一绝对 native CLI 路径，然后按 [ADR 0106](./adr/0106-run-command-owned-children-without-a-console.md) 直接启动该文件。不得在每个 attempt 内先运行 `codex.exe --version`，也不得引入可更新的 PowerShell host 作为运行时依赖。
 - Windows 上的项目级 Codex CLI 最终就是上述原生 `codex.exe`；直接启动它是在调用 npm 锁定 CLI 的实现，不代表使用桌面应用内置版本。
 - 不使用 Codex 桌面应用 WindowsApps 目录中的随附 CLI，也不使用用户级 npm Codex；这两者均不属于项目锁定范围。
 - 桌面应用更新不会改变项目级 `0.146.0`。但在线服务的最低兼容版本不能由本地仓库冻结；如果服务端拒绝旧 CLI，只按冻结规则开启受控升级窗口。

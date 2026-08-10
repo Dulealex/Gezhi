@@ -57,17 +57,21 @@ run_codex_child(
 `frozen_launch_plan` 是不可变 value，不是可执行 callback 集合，至少已经由调用方冻结：
 
 - role identity；
-- resolver proof 绑定的 absolute `codex.exe` path；
+- resolver proof 绑定的 absolute `codex.exe` path、FileIdentity、size 与 SHA-256；
 - exact argv、不可变的 Windows quoted command-line value、Unicode environment block 与 working directory；
 - exact immutable prompt bytes；
 - attempt ordinal、私有 capture namespace 与 fresh final spool pathname；
 - role-owned capture profile；
 - role-owned 单 attempt timeout duration/policy、同一 monotonic clock domain，以及仅在前一次成功启动已建立时才存在的 shared absolute deadline；
+- attempt root、working/TEMP/SQLite/capture parent、Literature/Knowledge authoritative root 与 `CODEX_HOME` 的 frozen directory identity；attempt root 另冻结恰含 `captures`、`sqlite`、`temporary`、`working` 四个 immediate directory 的 exact entry set，四个 child 另冻结 exact empty entry set；
+- Schema 的 canonical path、FileIdentity、size 与 SHA-256；
 - commitment 前已经通过的 prompt/Schema/config/provenance/audit prerequisites。
 
-该 plan 不含秘密的持久副本，不允许把 prompt/Question 放进 argv，也不允许在模块内改选 executable、model、reasoning 或 role。
+该 plan 不含秘密的持久副本，不允许把 prompt/Question 放进 argv，也不允许在模块内改选 executable、model、reasoning 或 role。plan 与其 attempt workspace 都是 non-cloneable sealed value：公开构造器拒绝实例化，只有 role module 的 private exact-field builder 能物化；`dataclasses.replace`、字段复制、伪造 seal 或只伪造 `proof_kind` 不能通过本模块的完整 seal/proof validation。
 
-plan 绝不预存「从未来成功启动时刻计算」的 absolute attempt deadline。30-minute 规则仍由两个角色各自拥有，plan 只携带该角色已冻结的 duration/policy；模块仅在 `ResumeThread` 精确返回 `1` 后采集 `provider_started_at`，再在同一 monotonic domain 内派生本 attempt 的 absolute deadline。Knowledge 第一次成功启动还在同一转换中建立 95-minute shared absolute deadline；后续 retry 的新 plan 只能携带这个已经存在且不可变的 shared deadline。第一次启动前不存在可推测的 shared deadline。
+模块在 commitment 前以 no-follow handle 重新打开并持有 executable、Schema 与上述目录 capability，逐项复验 frozen identity；executable/Schema 同时复验 size 与 SHA-256，attempt root 复验 exact four-name directory entry set，四个 attempt child 复验 exact empty entry set，Literature/Knowledge authoritative root 与 `CODEX_HOME` 只复验 directory identity。任一同路径替换、generation 变化、内容变化或 private namespace 漂移都必须在 `CreateProcessW` 前得到 `PreAttemptRejected`；最后一次复验后不得再释放这些 path guard 再按 pathname 重开。若一个已打开但不匹配的 capability 在拒绝路径上无法确定关闭，结果必须升级为 `UNSAFE_HOLD`，不能以 `PreAttemptRejected` 与伪造 ledger=0 降级。
+
+plan 绝不预存「从未来成功启动时刻计算」的 absolute attempt deadline。30-minute 规则仍由两个角色各自拥有，plan 只携带该角色已冻结的 duration/policy；模块仅在 `ResumeThread` 精确返回 `1` 后采集 `provider_started_at`，再在同一 monotonic domain 内派生本 attempt 的 absolute deadline。Knowledge 第一次成功启动还在同一转换中建立 95-minute shared absolute deadline；后续 retry 的新 plan 只能携带这个已经存在且不可变的 shared deadline。第一次启动前不存在可推测的 shared deadline。所有 duration、deadline 与可用 observation 都是非负 integer nanoseconds，禁止 bool、float 或 wall-clock duration 进入裁决。
 
 `read_only_cancellation_observation` 只能读取 ADR 0098–0105 已选择并拥有的 latch/profile。模块不能 install/release console handler、不能写 cancellation latch、不能把 child exit 转成 cancellation，也不能把一个 no-source profile 伪装成可取消 profile。
 
@@ -169,7 +173,7 @@ writer 是 `stdin-write` 的唯一 owner。收到 `GO` 后，从 offset `0` 开�
 2. `WriteFile` 成功且 `1 <= written <= requested` 时只推进 `written`，对 partial write 继续剩余 suffix。
 3. 成功但 `written=0`、`written>requested` 或 offset 算术异常，锁存 `stdin_delivery_failure`。
 4. 非 stop 情况下的 `ERROR_BROKEN_PIPE`、`ERROR_NO_DATA` 或其他 error 锁存 `stdin_delivery_failure`；orchestrator 请求 Job stop。
-5. stop latch 已存在时，不开始下一次 write；若一个同步 write 已阻塞，orchestrator 先终止 Job，使 child/descendant read handles 关闭，writer 待该调用以 success/error 返回后再收尾。主线程禁止并发关闭一个正被 worker 使用的 handle。
+5. 每次 write 前先读取受锁保护的 in-memory abort/stop fact，再对 Win32 abort event 做 zero-time observation；任一来源已锁存时都不开始下一次 write，event wait 的 `WAIT_FAILED` 或任何非 `WAIT_OBJECT_0`/`WAIT_TIMEOUT` 结果锁存 structural failure。若一个同步 write 已阻塞，orchestrator 先终止 Job，使 child/descendant read handles 关闭；该次 write 返回后还要再次检查 in-memory abort fact，才能决定是否推进 suffix。主线程禁止并发关闭一个正被 worker 使用的 handle。
 6. 全部 bytes 已被 Windows write 调用接受后，writer 立即且恰好一次关闭 `stdin-write`，向 child 表示 EOF。
 7. `ABORT` 或 stop 后也由 writer 本身关闭该 handle；不得由 orchestrator 与 writer 双重关闭。
 
@@ -203,7 +207,7 @@ V1 的 liveness 依赖以下拓扑，而不依赖 pipe buffer 大小：
 
 ## 7. launch commitment 与唯一启动顺序
 
-`READY_TO_COMMIT` 表示 pipes、NUL、Job、attribute list、writable command-line buffer、capture namespace、workers、ledger、monotonic clock domain 与最后一次 cancellation/既存 shared-deadline check 均已完成。此状态以前的任何失败都按 pre-attempt 收尾。
+`READY_TO_COMMIT` 表示 pipes、NUL、Job、attribute list、writable command-line buffer、capture namespace、workers、ledger、monotonic clock domain 与最后一次 cancellation/既存 shared-deadline check 均已完成。root-process 与 primary-thread 的 ledger ownership slots 也必须在此状态前预留；`CreateProcessW` 成功只把 raw handles 事务性激活进既有 slots，commitment 后不能再为它们分配 ledger entry。此状态以前的任何失败都按 pre-attempt 收尾。
 
 commitment 是 attempt ordinal 被不可逆加入 invocation attempt 序列的线性化点。成功记录 commitment 后，不允许执行新的验证、路径解析、allocation、hash 或字符串构造；下一项且唯一一项操作必须是本 attempt 的单次 `CreateProcessW`。可写 command-line buffer 已在 commitment 前分配，不是此后的新 allocation。
 
@@ -212,16 +216,17 @@ commitment 是 attempt ordinal 被不可逆加入 invocation attempt 序列的�
 1. 完成 `READY_TO_COMMIT`，读取 cancellation observation 与同一 monotonic domain 的 `now`；只在 plan 已携带既存 shared absolute deadline 时检查该 deadline。
 2. 采集 role 已规定的 attempt start facts并原子记录 launch commitment。
 3. 调用一次 `CreateProcessW`。
-4. 创建失败：记录 Win32 failure，关闭三项 child-side parent duplicates，向 writer 发 `ABORT`，让 collector取得 EOF，形成 role 规定的空/条件式 capture，再安全收尾；这是 attempted `process_error`，不是 pre-attempt。
-5. 创建成功：root 仍 suspended，先 `AssignProcessToJobObject`。
-6. assignment 成功后，关闭父进程持有的 `stdin-read`、`stdout-write`、`stderr-NUL` 三项 child-side duplicates。
-7. 在任何 `ResumeThread` 前执行确定性 post-create/pre-resume gate：再次读取 cancellation observation 与同一 monotonic domain 的 `now`，并且只检查 plan 中可能已经存在的 shared absolute deadline。若已经观察 cancel，或 `now` 已到/越过既存 shared deadline，root 必须保持 suspended，writer 获得 `ABORT` 而不是 `GO`，绝不调用 `ResumeThread`；orchestrator 只通过唯一 stop latch 恰好一次调用 `TerminateJobObject(attempt_job, 0x475A0001)`，随后按普通 Job-empty、root signal、stdout drain、worker join 与 ledger 规则机械收尾。两项同时满足时都保留真实 observation，最终仍由既有时间仲裁决定，时间相等时 cancel 赢。
-8. gate 通过后才调用一次 `ResumeThread`。只有返回 previous suspend count 恰为 `1` 才在同一转换中记录 `provider_started_at`、从 role-owned duration/policy 派生本 attempt absolute deadline、按需建立 Knowledge 首个 95-minute shared deadline、打开 writer `GO` gate并进入 `RUNNING`。
-9. primary thread handle 在 gate/resume 决策已经读取、且不存在待对该 handle 执行的操作后关闭；root process handle保留到 signaled 并读取最终 DWORD。
+4. API 明确返回失败且 `PROCESS_INFORMATION` 没有可接管的成功句柄：记录 Win32 failure，结清两个 reserved slots，关闭三项 child-side parent duplicates，向 writer 发 `ABORT`，让 collector取得 EOF，形成 role 规定的空/条件式 capture，再安全收尾；这是 attempted `process_error`，不是 pre-attempt。
+5. API 返回成功时，把 root process 与 primary thread raw handles 激活进两个 reserved slots。若 fault adapter/异步异常发生在真实 `CreateProcessW` 已成功且两个 raw handles 已填充之后，仍必须识别为 committed created root并完成同一接管；该 root 保持 suspended，禁止 Assign/Resume，直接 `TerminateProcess` 后按 root signal、stdout drain、worker join与ledger规则收尾。任一 slot activation/adoption 异常同样 force-adopt仍有效的raw handle并进入该 containment分支，不能把它退回create failure。
+6. 只有成功接管且 create observation 确定时才调用 `AssignProcessToJobObject`；返回失败或 adapter 抛异常时，root 始终不 resume，直接 `TerminateProcess` 并排空。
+7. assignment 成功后，关闭父进程持有的 `stdin-read`、`stdout-write`、`stderr-NUL` 三项 child-side duplicates。
+8. 在任何 `ResumeThread` 前执行确定性 post-create/pre-resume gate：再次读取 cancellation observation 与同一 monotonic domain 的 `now`，并且只检查 plan 中可能已经存在的 shared absolute deadline。若已经观察 cancel，或 `now` 已到/越过既存 shared deadline，root 必须保持 suspended，writer 获得 `ABORT` 而不是 `GO`，绝不调用 `ResumeThread`；orchestrator 只通过唯一 stop latch 恰好一次调用 `TerminateJobObject(attempt_job, 0x475A0001)`，随后按普通 Job-empty、root signal、stdout drain、worker join 与 ledger 规则机械收尾。两项同时满足时都保留真实 observation，最终仍由既有时间仲裁决定，时间相等时 cancel 赢。
+9. gate 通过后才调用一次 `ResumeThread`。只有返回 previous suspend count 恰为 `1` 才在同一转换中记录 `provider_started_at`、从 role-owned duration/policy 派生本 attempt absolute deadline、按需建立 Knowledge 首个 95-minute shared deadline、打开 writer `GO` gate并进入 `RUNNING`。
+10. primary thread handle 在 gate/resume 决策已经读取、且不存在待对该 handle 执行的操作后关闭；root process handle保留到 signaled 并读取最终 DWORD。
 
 特殊分支：
 
-- assignment failure：root 仍应 suspended；用 `TerminateProcess(root, CODEX_JOB_STOP_EXIT_DWORD_V1)` 直接请求终止，随后关闭三项 child-side duplicates、向 writer发 `ABORT`，等待 root signaled并排空 stdout。空 Job 不能证明 root 已死。
+- create observation/adoption/assignment failure：只要真实创建留下可接管的 root handle，root 必须保持 suspended；用 `TerminateProcess(root, CODEX_JOB_STOP_EXIT_DWORD_V1)` 直接请求终止，随后关闭三项 child-side duplicates、向 writer发 `ABORT`，等待 root signaled并排空 stdout。空 Job 不能证明 root 已死。
 - post-create/pre-resume gate 赢得：commitment 已存在，所以这是没有 `provider_started_at`、没有 attempt deadline 的真实 attempted item；既存 shared deadline与cancel仍按第12节裁决，不能撤回为pre-attempt。
 - `ResumeThread` 返回 `0`、大于 `1`、`0xFFFFFFFF` 或调用结果不确定：按“可能已运行”处理，writer 不获 `GO`，用 attempt Job stop 整棵树并机械排空。
 - assignment/resume failure 不得用普通 launch、第二个 process、breakaway 或 wrapper 重试。同一 semantic retry只能在本 attempt 已经安全冻结、且 role retry policy明确允许后创建下一个 ordinal。
@@ -272,6 +277,8 @@ orchestrator 是 attempt state、stop latch、deadline observation、Job query�
 
 随后 orchestrator在同一串行转换中锁存 terminal facts，关闭最后一个 Job handle并把 ledger归零。Job close成功且 ownership确定后才可形成 `AttemptTerminalEvidence`。若最后 close失败或 ownership不确定，不得重试可能已经关闭的 raw handle，也不得返回正常结果。
 
+monotonic clock/cancellation observation 自身也属于受审计的 syscall seam。commitment 前读取失败、返回非 `None | nonnegative exact int` 的 cancellation 值，或 monotonic clock失败时，模块必须撤销全部预备资源并返回 `PreAttemptRejected`。commitment 后同类 fault 必须只锁存一次结构性 lifecycle fact、请求至多一次 stop并继续机械收敛；不得让 orchestrator 以未处理异常跳过 Job/worker/ledger teardown。若成功 resume 或 capture-ready transition 恰逢 clock fault，evidence 中对应 `provider_started_monotonic_ns` / `capture_ready_monotonic_ns` 为 `null`，并分别保留 `provider_started_timestamp_unavailable` / `capture_ready_timestamp_unavailable`；内部用于 fail-safe 排序的值不得伪装成真实观测时间对外暴露。
+
 ## 9. stop、termination 与 teardown
 
 ### 9.1 唯一 stop latch
@@ -312,7 +319,7 @@ assignment failure是唯一允许直接 `TerminateProcess(root, 0x475A0001)` 的
 
 发生 stop时步骤 4–8可并行推进，但 owner与终态依赖不变。不得在另一个线程仍对 handle执行同步 I/O或 wait时并发 `CloseHandle`；Windows对 pending wait中的 handle被关闭不提供安全语义。
 
-`CloseHandle` failure使该 ledger entry进入 `uncertain`，不得盲目第二次 close，因为数值可能已被回收复用。任何 `uncertain` entry都阻止正常 terminal evidence。
+`CloseHandle` failure使该 ledger entry进入 `uncertain`，不得盲目第二次 close，因为数值可能已被回收复用。任何 `uncertain` entry都阻止正常 terminal evidence。commitment 后的 close uncertainty 不得直接 unwind：若发生在 pre-resume gate 以前，它必须阻止 `ResumeThread`；若发生在 `GO` 以后，它必须经唯一 Job stop transition 终止整棵树。两者都要先完成 root/Job/pipe/worker 的机械收敛，再以 `UNSAFE_HOLD` 暴露 ownership 不确定性，不能伪造 ledger=0 或普通 `process_error`。
 
 ## 10. capture 与 final spool
 
@@ -354,7 +361,7 @@ Job `ActiveProcesses=0` 后，对 final pathname执行一次权威 finalization�
 
 Knowledge formal final在overflow时恰为前1,048,576 bytes；witness与tail不进入资产。非overflow时为完整source bytes。任何final prefix都不进入Answer validation。
 
-### 10.4 Knowledge pair、overflow与usage
+### 10.4 Knowledge pair、overflow与role-owned usage seam
 
 每个 launch-committed Knowledge attempt最终必须且只能成对安装：
 
@@ -365,13 +372,13 @@ Knowledge formal final在overflow时恰为前1,048,576 bytes；witness与tail不
 
 两个 overflow latch都是单调 `false -> true`，在capture-finalization时做OR。任一为true都按ADR 0080固定最高优先级、不可重试的`process_error`，覆盖cancel、deadline、provider、exit与其他lifecycle facts；safe boundary失败则不是一个可提交`process_error`，而是只留staging。
 
-Knowledge usage只在正式events已形成后计算：
+本共享 child module 到正式 events 安装并形成 mechanical terminal evidence 为止，不解析 JSONL、不计算 usage，也不在 T13 evidence 中创建 usage 字段。T22 Knowledge role adapter 必须在 capture 已安装后按自己的版本化合同计算 usage receipt：
 
 - `byte_length == 16,777,216`：四项token全部`null`且`usage_unavailable=true`，不解码、不parse；这不反推overflow。
 - `byte_length < 16,777,216`：按ADR 0069/0081对完整正式bytes运行strict whole-file adapter，只从唯一`turn.completed.usage`逐字段投影。
 - `byte_length > 16,777,216`：合同无效，不能形成terminal manifest。
 
-usage缺失本身不产生process failure；event编码/framing/结构或collector lifecycle failure继续按Knowledge Answerer完整矩阵处理。
+usage缺失本身不产生process failure；event编码/framing/结构或collector lifecycle failure继续按Knowledge Answerer完整矩阵处理。T14 Literature role adapter同样在共享 child 返回 raw capture 后形成自己的 `attempt.json` 与 usage/metadata receipt；两种 receipt 都不能反向污染共享 child 的 provider-neutral evidence。
 
 ### 10.5 Literature capture差异
 
@@ -424,7 +431,7 @@ Literature Reader v1现有合同要求`events.jsonl`保留实际原始bytes，�
 
 ### 12.1 唯一串行裁决
 
-所有事实都有同一 monotonic clock domain中的不可变 observation，且只有orchestrator可以冻结`classification_ready_at`。每个attempt恰好执行一次以下算法：
+所有成功取得的时间事实都属于同一 monotonic clock domain并冻结为非负 integer nanoseconds，且只有orchestrator可以冻结`classification_ready_at`。clock observation fault 按第8.2节锁存结构性 failure；缺失时间戳不得由 wall clock 或内部 fallback 冒充。每个attempt恰好执行一次以下算法：
 
 1. 若capture-finalization/lifecycle完整性门禁不成立：不分类、不返回，继续安全收尾或进入`UNSAFE_HOLD`。
 2. 任一Knowledge overflow latch为true：`process_error`。
@@ -501,12 +508,12 @@ double通过固定scenario参数控制行为，但其stdout/final仍是普通byt
 - 长时间hang直到Job termination；
 - 向stderr写大于pipe buffer量级的数据；
 - 检查`GetConsoleWindow()==NULL`及standard handle类型；
-- 尝试访问一组由parent创建、标记inheritable但未列入allowlist的sentinel event handles，并证明全部不可用；
+- 尝试访问一组由parent创建、标记inheritable但未列入allowlist的sentinel raw handle values，并回报每次 probe；parent 以自己仍持有的 authoritative event objects 证明child没有 signal这些对象；Windows可在child中复用相同数值指向无关对象，因此不得把“同一裸整数上的调用成功/失败”当成继承身份的唯一证明；
 - 返回固定exit DWORD。
 
 Win32 API本身的失败（CreateProcess、Assign、Resume、Wait、Query、Terminate、Close）以及同步 `ReadFile` / `WriteFile` 的 result、error 与 transferred-count 组合，由test-only syscall fault adapter在原调用边界注入；它只控制该次kernel-call observation，真实状态机、ledger、两个worker与executable double仍照常运行。adapter不得把worker换成mock、直接写内部fact、伪造EOF/Job-empty或跳过drain。`DeleteProcThreadAttributeList` 返回 `VOID`，不属于可注入“返回失败”的调用。
 
-D01 另行冻结 test-only `CodexPipeCapacityObserverV1`。只在测试构建中，它在两次 `CreatePipe` 成功后、任何 endpoint ownership 移动、worker 启动或 commitment 之前，以 borrowed handle 对本 attempt 的 `stdin-read` 与 `stdout-read` 各恰好调用一次 `GetNamedPipeInfo(handle, &flags, NULL, &in_buffer_size, NULL)`；两次调用都必须证明 byte-pipe mode 且 `in_buffer_size > 0`，并分别锁存为 `measured_stdin_pipe_capacity_bytes` 与 `measured_stdout_pipe_capacity_bytes`。observer 不 duplicate/close handle、不改变 inheritance、不执行 pipe I/O，也不把测量值写入 production plan、evidence、状态或 correctness decision；production build 不含该 observer。任一 probe 失败或返回零只令 D01 test setup 失败，且发生在 commitment 前，不触发产品 fallback。两个值来自本次将实际交给 writer/collector 的两个不同 pipe instance，禁止假定二者相等，也禁止以 `CODEX_PIPE_BUFFER_HINT_BYTES_V1` 代替任一测量值。
+D01 另行冻结 test-only `CodexPipeCapacityObserverV1`。它的实现只位于 `tests/support`；production invocation 不提供 observer callback，production execution 因而不调用 `GetNamedPipeInfo`。共享源码只保留一个窄的 test-hook 注入点。测试中，该 observer 在两次 `CreatePipe` 成功后、任何 endpoint ownership 移动、worker 启动或 commitment 之前，以 borrowed handle 对本 attempt 的 `stdin-read` 与 `stdout-read` 各恰好调用一次 `GetNamedPipeInfo(handle, &flags, NULL, &in_buffer_size, NULL)`；两次调用都必须证明 byte-pipe mode且 `in_buffer_size > 0`，并分别锁存为 `measured_stdin_pipe_capacity_bytes` 与 `measured_stdout_pipe_capacity_bytes`。observer 不 duplicate/close handle、不改变 inheritance、不执行 pipe I/O，也不把测量值写入 production plan、evidence、状态或 correctness decision。任一 probe 失败或返回零只令 D01 test setup 失败，且发生在 commitment 前，不触发产品 fallback。两个值来自本次将实际交给 writer/collector 的两个不同 pipe instance，禁止假定二者相等，也禁止以 `CODEX_PIPE_BUFFER_HINT_BYTES_V1` 代替任一测量值。double 的 pending stdout boundary 必须以一个预分配 buffer 的单次 oversized native Win32 `WriteFile` 实现；started/returned events 紧贴该调用前后，不能以 Python buffered stream 或多次小 write 伪造“同一个调用仍 pending”。
 
 ### 15.1 必过矩阵
 
@@ -519,13 +526,13 @@ D01 另行冻结 test-only `CodexPipeCapacityObserverV1`。只在测试构建中
 | D05 | descendant无限持有stdout，deadline到期 | 一次Job stop杀整棵树，collector EOF、writer join、ledger=0，分类timeout |
 | D06 | double从不读stdin且持续运行，cancel到达 | pending writer不被main并发close；Job stop后writer返回并关闭，分类interrupted |
 | D07 | stderr写至少1 MiB，stdout正常 | stderr不capture且不造成backpressure；stdout/final正常 |
-| D08 | no-console与forbidden inheritable sentinel probe | 无console；stdio为pipe/pipe/NUL；全部sentinel不可用 |
+| D08 | no-console与forbidden inheritable sentinel probe | 无console；stdio为pipe/pipe/NUL；child对每个raw value执行probe；parent持有的authoritative sentinel event objects全部保持unsignaled，证明没有对象身份越过allowlist。child中数值slot复用不算继承 |
 | D09 | `CreateProcessW` fault | commitment已存在；Knowledge两项0-byte；exit null；process_error；ledger=0 |
 | D10 | `AssignProcessToJobObject` fault | root始终未resume，direct terminate后signal；process_error；无orphan |
 | D11 | `ResumeThread`分别返回0、2、`0xFFFFFFFF` | writer从未GO；各自只用Job stop；process_error；无第二launch |
-| D12 | events为Knowledge cap恰好值后EOF | 无overflow；正式长度cap；usage全null/unavailable；终因不因长度改变 |
+| D12 | events为Knowledge cap恰好值后EOF | 无overflow；正式长度cap；T13不解析usage，terminal evidence不因长度改变；T22另以该正式capture证明全null/`usage_unavailable` receipt |
 | D13 | events为Knowledge cap+1 | latch只在真实第cap+1 byte；exact-cap prefix；一次Job stop；不可重试process_error |
-| D14 | final为Knowledge cap恰好值 | 无overflow；完整cap资产；usage只由events决定 |
+| D14 | final为Knowledge cap恰好值 | 无overflow；完整cap资产；T13不产生usage，T22 role adapter只从events形成usage receipt |
 | D15 | final为Knowledge cap+1且active probe读到witness | latch绑定generation；exact prefix；一次Job stop；process_error |
 | D16 | active final witness后pathname替换成小文件 | 不清latch、不拼generation、不提交terminal Answer；保留staging |
 | D17 | active probe一直sharing violation，Job空后发现cap+1 | post-close锁存overflow并形成exact prefix；不对空Job调用terminate |
@@ -540,12 +547,15 @@ D01 另行冻结 test-only `CodexPipeCapacityObserverV1`。只在测试构建中
 | D26 | pre-commit pipe/worker/final gate fault | 无CreateProcess调用、无attempt、所有temp撤销、ledger=0 |
 | D27 | Literature无final pathname | 不补0-byte final；其余attempt资产按Reader合同形成 |
 | D28 | Literature stdout/final超过Knowledge caps | 不套用Knowledge overflow；完整流式capture或按Reader I/O failure处理 |
-| D29 | worker完成与wake reset交错一万次barrier迭代 | 无lost wakeup、无hang、每次ledger=0 |
-| D30 | parent有多个额外inheritable handles并并发launch两个attempt | 每个child只得到自己的三项stdio；cross-attempt无继承、capture不串线 |
+| D29 | 内部worker完成与wake reset以fresh Win32 wake event及fresh ledger交错一万次barrier迭代；另至少一次公开 executable attempt覆盖同一reset观察点 | 无lost wakeup、无hang、每次barrier ledger=0；公开attempt完整收敛且terminal ledger=0。这里的一万次是wake-state barrier迭代，不是一万次child launch |
+| D30 | parent有多个额外inheritable sentinel objects并并发launch两个attempt | 每个child只得到自己的三项stdio；cross-attempt无继承、prompt/capture不串线；parent authoritative sentinels全程unsignaled，且不以child裸handle数值是否复用作身份判断 |
 | D31 | real CreateProcess/Assign调用边界分别由barrier跨过cancel或既存shared deadline；另含cancel时间恰等于deadline | root始终suspended、writer只ABORT、Resume调用数为0、唯一Job stop后完整收敛；attempt保留且无started anchor，cancel同刻赢 |
 | D32 | command-line adapter在CreateProcess内原地改写最后一个参数及NUL前字符 | 传入buffer可写且NUL-terminated、生命周期覆盖调用；frozen argv/quoted value/hash/audit identity逐byte不变，返回后buffer settled |
 | D33 | fresh-attempt 参数化组，每个子例创建新 attempt，且每个 terminal/invalid 子例只注入一个目标 observation：`W-progress` 在同一正常 attempt 依次注入 success+full、success+short，再以合法 success 完成交付；`W-zero` 注入 success+0；`W-over` 注入 success+`requested+1`；`W-broken` 注入 pre-stop `FALSE/ERROR_BROKEN_PIPE`；`W-no-data` 注入 pre-stop `FALSE/ERROR_NO_DATA`；`W-other` 注入 pre-stop `FALSE/ERROR_GEN_FAILURE` | `W-progress` 只按实际 count 推进 remaining suffix、最终逐 byte 完整交付且不 stop。其余每个 fresh attempt 都独立证明该唯一目标 observation 锁存 `stdin_delivery_failure` 并请求至多一次 stop；stop 后 writer 不开始下一次 write，不在同一 attempt 继续注入其他 terminal observation；stdout 按真实 lifecycle 排空，worker 全部 join，terminal boundary 完整且 ledger=0，任何 failure 都不伪装成 EOF |
 | D34 | fresh-attempt 参数化组：`R-progress` 在同一正常 attempt 依次覆盖 success+0、success+short、合法正数 progress，最后取得真实 `FALSE/ERROR_BROKEN_PIPE`；`R-over` 在新 attempt 注入唯一 terminal observation success+`requested+1`；`R-other` 在另一新 attempt 注入唯一 terminal observation `FALSE/ERROR_GEN_FAILURE`。`R-over` 与 `R-other` 首次锁存后，后续 read 可使用真实 observation 或只注入合法的非 EOF progress 来 mechanical drain，最终必须取得真实 `ERROR_BROKEN_PIPE`，或在 Job 已空且所有 child-side writer 已证明消失后由唯一 owner 安全结清 endpoint | `R-progress` 证明 zero 不是 EOF、short bytes 按序完整保留且正常 EOF 不产生 failure。`R-over` 与 `R-other` 各自独立锁存 `stdout_collector_failure` 并请求至多一次 stop；目标 invalid/failure 本身不当作 EOF，collector 不跳过 drain，并在各自 fresh attempt 达到完整 terminal boundary、worker join 与 ledger=0；同一 attempt 不串联第二个 terminal/invalid observation |
+| D35 | fault adapter 先调用真实 `CreateProcessW` 并确认成功、PI 已填入两个 raw handles，随后在返回 observation 前抛异常；test-only watchdog 只作 orphan safeguard且不得实际触发 | committed root 保持 suspended；两个 reserved slots 接管 PI handles；Assign/Resume 调用数均为0；direct `TerminateProcess` 恰好一次；root signal、stdout EOF、workers join 后两个 raw handles 都由 production close；watchdog未兜底，terminal为`process_error`且ledger=0 |
+| D36 | fault adapter 先调用真实 `ResumeThread` 并确认 previous suspend count为1，随后在返回 observation 前抛异常；double保持运行直到Job stop，test-only watchdog只作orphan safeguard且不得实际触发 | 结果按“可能已运行”处理但不形成started anchor，writer从未GO；锁存structural fact并经唯一stop transition调用一次`TerminateJobObject`；root/Job/EOF/workers完整收敛，watchdog未兜底，terminal为`process_error`且ledger=0 |
+| D37 | 分别在 pre-reserved `root-process` 与 `primary-thread` slot activation 边界抛异常，每个子例使用 fresh real CreateProcess | 两种子例都force-adopt PI中的两个有效raw handles，Assign/Resume均为0，direct `TerminateProcess`恰好一次，两个raw handles均由production close，terminal为`process_error`且ledger=0 |
 
 矩阵编号可随已冻结mechanics继续增加，不存在“最多30项”的上限。并发与竞态case必须用barrier/event控制先后，不用概率性sleep断言。每个case除业务断言外都必须断言：单次CreateProcess、单次commit、stop transition至多一次、root/Job/capture terminal边界、worker全部join、private source按合同撤销、ledger恰为零。
 
@@ -557,7 +567,7 @@ D01 另行冻结 test-only `CodexPipeCapacityObserverV1`。只在测试构建中
 - Knowledge capture-overflow 的外部 supplemental diagnostic 已由 [Knowledge Ask Observable v1](./knowledge-ask-observable-v1.md) 冻结为 `knowledge.ask.capture_overflow.v1`；本文仍只冻结内部 latch、stop 与既有 primary mapping，不拥有或扩展 diagnostic/Human 字段与 code。
 - `CreatePipe.nSize`不保证实际buffer大小；验收必须覆盖更小实际capacity。
 - final active probe是best-effort，sharing policy可使物理spool在Job退出前超过1 MiB；ADR 0076/0079本就不承诺spool物理硬上限。
-- runtime subtree或private staging被同权限外部进程恶意替换不在supported baseline；generation checks用于防内部竞态，不构成对抗性sandbox。
+- plan formation到commitment之间的runtime executable、Schema与关键directory replacement/原地修改由held capability、FileIdentity、size/hash与entry-set复验拒绝。最后一次复验后，attempt-private namespace仍依赖composition提供的exclusive trusted owner；同权限外部进程的主动注入不在supported baseline，generation checks不构成对抗性sandbox。
 - Windows kernel API持续失败、assignment-failure suspended root无法终止、Job永不为空、pipe无法证明EOF、final source无法exclusive open或任一handle ownership进入`uncertain`时，模块不能伪造正常结果；它保持`UNSAFE_HOLD`/fail-safe路径，最终进程异常退出时才由`KILL_ON_JOB_CLOSE`兜底。
 - 本合同没有用Job阻止不受信任descendant主动`AllocConsole`或创建breakaway process；锁定Codex runtime不做这些行为是ADR 0106的supported baseline。
 

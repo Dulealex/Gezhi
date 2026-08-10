@@ -129,6 +129,161 @@ def test_validated_root_owns_the_final_handle_and_closes_it_once(
         capability.borrowed_handle()
 
 
+def test_validated_root_opens_and_enumerates_one_held_relative_subroot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = tmp_path / "runtimes" / "codex"
+    (runtime / "vendor" / "bin").mkdir(parents=True)
+    (runtime / "package.json").write_text("{}", encoding="utf-8")
+    (runtime / "vendor" / "bin" / "codex.exe").write_bytes(b"exe")
+    (tmp_path / "outside.txt").write_text("outside", encoding="utf-8")
+    monkeypatch.setattr(
+        windows_root,
+        "_reject_hidden_short_alias",
+        lambda _parent, _component: None,
+    )
+
+    with open_validated_data_root_v1(str(tmp_path)) as project:
+        project_handle = project.borrowed_handle()
+        with project.open_relative_data_root_v1(("runtimes", "codex")) as child:
+            child_handle = child.borrowed_handle()
+            assert child_handle != project_handle
+            assert child.inspection.canonical_path == str(runtime)
+            assert child.relative_file_paths_v1() == (
+                "package.json",
+                "vendor/bin/codex.exe",
+            )
+        with pytest.raises(RuntimeError, match="closed"):
+            child.borrowed_handle()
+        assert project.borrowed_handle() == project_handle
+
+
+def test_relative_subroot_closes_a_partial_chain_when_opening_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = windows_root.ValidatedDataRootV1(
+        inspection=DataRootInspectionV1(
+            status="ready",
+            canonical_path=r"D:\Root",
+            identity=(7, 11),
+            ancestor_identities=((7, 11),),
+        ),
+        handles=(1,),
+    )
+    closed: list[tuple[int, ...]] = []
+
+    def open_child(_parent: int, component: str, *, directory: bool) -> int:
+        assert directory
+        if component == "runtime":
+            return 2
+        raise windows_root.DataRootOpenErrorV1("unavailable")
+
+    monkeypatch.setattr(windows_root, "_open_relative_handle", open_child)
+    monkeypatch.setattr(
+        windows_root,
+        "_handle_facts",
+        lambda _handle, *, directory: SimpleNamespace(
+            canonical_path=r"D:\Root\runtime",
+            identity=(7, 13),
+            attributes=windows_root._FILE_ATTRIBUTE_DIRECTORY,
+        ),
+    )
+    monkeypatch.setattr(
+        windows_root,
+        "_reject_hidden_short_alias",
+        lambda _parent, _component: None,
+    )
+    monkeypatch.setattr(
+        windows_root,
+        "_close_handles",
+        lambda handles: closed.append(handles),
+    )
+
+    with pytest.raises(windows_root.DataRootOpenErrorV1):
+        root.open_relative_data_root_v1(("runtime", "native"))
+
+    assert closed == [(2,)]
+    root._handles = ()
+    root._closed = True
+
+
+def test_relative_subroot_surfaces_cleanup_failure_over_open_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = windows_root.ValidatedDataRootV1(
+        inspection=DataRootInspectionV1(
+            status="ready",
+            canonical_path=r"D:\Root",
+            identity=(7, 11),
+            ancestor_identities=((7, 11),),
+        ),
+        handles=(1,),
+    )
+
+    def open_child(_parent: int, component: str, *, directory: bool) -> int:
+        assert directory
+        if component == "runtime":
+            return 2
+        raise windows_root.DataRootOpenErrorV1("unavailable")
+
+    monkeypatch.setattr(windows_root, "_open_relative_handle", open_child)
+    monkeypatch.setattr(
+        windows_root,
+        "_handle_facts",
+        lambda _handle, *, directory: SimpleNamespace(
+            canonical_path=r"D:\Root\runtime",
+            identity=(7, 13),
+            attributes=windows_root._FILE_ATTRIBUTE_DIRECTORY,
+        ),
+    )
+    monkeypatch.setattr(
+        windows_root,
+        "_reject_hidden_short_alias",
+        lambda _parent, _component: None,
+    )
+    monkeypatch.setattr(
+        windows_root,
+        "_close_handles",
+        lambda _handles: (_ for _ in ()).throw(
+            windows_root.DataRootLifecycleErrorV1("cleanup failed")
+        ),
+    )
+
+    with pytest.raises(
+        windows_root.DataRootLifecycleErrorV1,
+        match="cleanup failed",
+    ):
+        root.open_relative_data_root_v1(("runtime", "native"))
+
+    root._handles = ()
+    root._closed = True
+
+
+def test_validated_root_lists_immediate_entry_names_without_case_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / "AGENTS.md").write_text("rules", encoding="utf-8")
+    (tmp_path / "Asset.BIN").write_bytes(b"asset")
+    (tmp_path / "nested").mkdir()
+    (tmp_path / "nested" / "hidden.txt").write_text("hidden", encoding="utf-8")
+    monkeypatch.setattr(
+        windows_root,
+        "_reject_hidden_short_alias",
+        lambda _parent, _component: None,
+    )
+
+    with open_validated_data_root_v1(str(tmp_path)) as root:
+        assert root.relative_entry_names_v1() == (
+            ".codex",
+            "AGENTS.md",
+            "Asset.BIN",
+            "nested",
+        )
+
+
 def test_physical_isolation_rejects_a_root_nested_by_file_identity() -> None:
     literature = DataRootInspectionV1(
         status="ready",
@@ -536,6 +691,36 @@ def test_directory_enumeration_budget_counts_directories_and_files(
     with pytest.raises(windows_root.DataRootOpenErrorV1):
         root.relative_file_paths_v1()
 
+    root._handles = ()
+    root._closed = True
+
+
+def test_immediate_entry_budget_rejects_an_oversized_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = windows_root.ValidatedDataRootV1(
+        inspection=DataRootInspectionV1(
+            status="ready",
+            canonical_path=r"D:\Root",
+            identity=(7, 11),
+            ancestor_identities=((7, 11),),
+        ),
+        handles=(1,),
+    )
+    entries = tuple(
+        windows_root._DirectoryEntryV1(
+            name=f"entry-{index}",
+            attributes=0,
+            short_name=None,
+        )
+        for index in range(windows_root._MAX_ENUMERATED_ENTRIES + 1)
+    )
+    monkeypatch.setattr(windows_root, "_enumerate_directory", lambda _handle: entries)
+
+    with pytest.raises(windows_root.DataRootOpenErrorV1) as raised:
+        root.relative_entry_names_v1()
+
+    assert raised.value.status == "unavailable"
     root._handles = ()
     root._closed = True
 
