@@ -3096,7 +3096,7 @@ def _execute_mineru_run(
 def _advance_ocr(
     authority: ActiveSourceAuthorityV1,
     root: ValidatedDataRootV1,
-) -> tuple[bool, ResumeStage]:
+) -> tuple[bool, ResumeStage, _ValidatedRunV1]:
     try:
         ocr_dir, runs_dir, staging_dir = _ensure_ocr_layout(authority)
     except _CommitFailedV1:
@@ -3165,7 +3165,11 @@ def _advance_ocr(
             raise _RecoveryCertaintyLostV1(
                 "OCR current success cannot be uniquely proven"
             )
-        return (True, "ocr") if current_repaired else (False, "canonicalize")
+        return (
+            current_repaired,
+            "ocr" if current_repaired else "canonicalize",
+            current,
+        )
     if len(matches) == 1:
         try:
             recovered = _recover_unique_staged_success(
@@ -3187,7 +3191,7 @@ def _advance_ocr(
                 stage="ocr",
                 reason="commit_failed",
             )
-        return True, "ocr"
+        return True, "ocr", recovered
 
     run_id = "ocrrun_" + str(uuid.uuid4())
     stage = staging_dir / run_id
@@ -3225,7 +3229,7 @@ def _advance_ocr(
             )
             committed = _commit_run(stage, runs_dir, authority, root)
             _atomic_replace_current(ocr_dir, authority, committed, root)
-            return True, "ocr"
+            return True, "ocr", committed
 
         outcome, reason, attempt_count = _execute_mineru_run(
             stage,
@@ -3273,7 +3277,7 @@ def _advance_ocr(
         _write_manifest(stage, receipt=receipt)
         committed = _commit_run(stage, runs_dir, authority, root)
         _atomic_replace_current(ocr_dir, authority, committed, root)
-        return True, "ocr"
+        return True, "ocr", committed
     except ResumeStoppedV1:
         raise
     except _RunInvalidV1 as error:
@@ -3325,15 +3329,79 @@ def resume_work(
                 stage="ingest",
                 reason="identity_review_required",
             )
-        advanced, start = _advance_ocr(authority, root)
+        ocr_advanced, ocr_start, ocr_run = _advance_ocr(authority, root)
+        from gezhi._literature_canonical import (
+            CanonicalAuthorityStoppedV1,
+            CanonicalStageStoppedV1,
+            CurrentOcrAssetV1,
+            advance_canonicalize_v1,
+        )
+
+        try:
+            canonical = advance_canonicalize_v1(
+                authority,
+                CurrentOcrAssetV1(
+                    method=ocr_run.method,
+                    run_id=ocr_run.run_id,
+                    run_directory=ocr_run.path,
+                    input_fingerprint_sha256=(
+                        ocr_run.input_fingerprint_sha256
+                    ),
+                    manifest_sha256=ocr_run.manifest_sha256,
+                ),
+                root=root,
+            )
+        except CanonicalStageStoppedV1 as error:
+            _stop_stage(
+                authority,
+                root,
+                start_stage=ocr_start,
+                advanced_stages=(("ocr",) if ocr_advanced else ()),
+                outcome="failed",
+                stage="canonicalize",
+                reason=error.reason,
+            )
+        except CanonicalAuthorityStoppedV1 as error:
+            if error.reason == "data_root_integrity_lost":
+                raise ResumeStoppedV1(
+                    "failed",
+                    "data_root_integrity_lost",
+                    data_root="literature",
+                ) from error
+            if error.reason in {
+                "active_source_unavailable",
+                "active_source_invalid",
+            }:
+                _stop_stage(
+                    authority,
+                    root,
+                    start_stage=ocr_start,
+                    advanced_stages=(("ocr",) if ocr_advanced else ()),
+                    outcome="failed",
+                    stage="canonicalize",
+                    reason="asset_integrity_lost",
+                )
+            raise ResumeStoppedV1("failed", "recovery_failed") from error
+
+        advanced_stages: tuple[ResumeStage, ...] = (
+            *(("ocr",) if ocr_advanced else ()),
+            *(("canonicalize",) if canonical.advanced else ()),
+        )
+        start_stage: ResumeStage = (
+            "ocr"
+            if ocr_advanced
+            else "canonicalize"
+            if canonical.advanced
+            else "read"
+        )
         _stop_stage(
             authority,
             root,
-            start_stage=start,
-            advanced_stages=(("ocr",) if advanced else ()),
+            start_stage=start_stage,
+            advanced_stages=advanced_stages,
             outcome="blocked",
-            stage="canonicalize",
-            reason="canonical_prerequisite_unavailable",
+            stage="read",
+            reason="reader_prerequisite_unavailable",
         )
     finally:
         owner.close()

@@ -23,6 +23,7 @@ from pypdf.generic import (
     NumberObject,
 )
 
+from gezhi import _literature_canonical as canonical
 from gezhi import _literature_resume as resume
 from gezhi import _windows_data_root as windows_root
 from gezhi._bounded_probe import (
@@ -30,7 +31,11 @@ from gezhi._bounded_probe import (
     ProbeOutputLimitExceeded,
     ProbeUnavailableError,
 )
-from gezhi._literature_intake import AddLocalPdfRequestV1, add_local_pdf
+from gezhi._literature_intake import (
+    ActiveSourceAuthorityV1,
+    AddLocalPdfRequestV1,
+    add_local_pdf,
+)
 from gezhi._literature_resume import (
     OcrAttemptResultV1,
     OcrRuntimeProfileV1,
@@ -90,7 +95,11 @@ def _write_valid_mineru_output(
     files = {
         "source.md": b"# OCR text\n",
         "source_content_list.json": b"[]\n",
-        "source_content_list_v2.json": b"[[]]\n",
+        "source_content_list_v2.json": (
+            b'[[{"bbox":[72,72,540,100],"content":'
+            b'{"paragraph_content":[{"content":"OCR text",'
+            b'"type":"text"}]},"type":"paragraph"}]]\n'
+        ),
         "source_middle.json": (
             b'{"_backend":"pipeline","_version_name":"3.4.4","pdf_info":'
             b'[{"discarded_blocks":[],"page_idx":0,"page_size":[612,792],'
@@ -224,6 +233,7 @@ def test_scanned_pdf_uses_frozen_profile_and_commits_auditable_attempt(
 ) -> None:
     data_root, work_id, source_id = scanned_source
     observed: list[tuple[str, Path, Path]] = []
+    image_bytes = b"\x89PNG\r\n\x1a\ncanonical-published-image"
     monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", lambda: _runtime())
 
     def succeed(
@@ -233,6 +243,42 @@ def test_scanned_pdf_uses_frozen_profile_and_commits_auditable_attempt(
     ) -> OcrAttemptResultV1:
         observed.append((profile.executable_path, input_path, output_root))
         _write_valid_mineru_output(output_root)
+        leaf = output_root / "source" / "ocr"
+        (leaf / "images" / "table.png").write_bytes(image_bytes)
+        (leaf / "images" / "unused.png").write_bytes(
+            b"\x89PNG\r\n\x1a\nunused-provider-image"
+        )
+        (leaf / "source_content_list_v2.json").write_bytes(
+            resume._canonical_json_bytes(
+                [
+                    [
+                        {
+                            "bbox": [72, 72, 540, 100],
+                            "content": {
+                                "paragraph_content": [
+                                    {"content": "OCR text", "type": "text"}
+                                ]
+                            },
+                            "type": "paragraph",
+                        },
+                        {
+                            "bbox": [72, 120, 540, 300],
+                            "content": {
+                                "html": "<table><tr><td>42</td></tr></table>",
+                                "image_source": {"path": "images/table.png"},
+                                "table_caption": [
+                                    {"content": "Results", "type": "text"}
+                                ],
+                                "table_footnote": [],
+                                "table_nest_level": 1,
+                                "table_type": "simple_table",
+                            },
+                            "type": "table",
+                        },
+                    ]
+                ]
+            )
+        )
         return OcrAttemptResultV1(returncode=0, stdout=b"ok", stderr=b"")
 
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
@@ -241,11 +287,11 @@ def test_scanned_pdf_uses_frozen_profile_and_commits_auditable_attempt(
 
     assert (stopped.outcome, stopped.stage, stopped.reason) == (
         "blocked",
-        "canonicalize",
-        "canonical_prerequisite_unavailable",
+        "read",
+        "reader_prerequisite_unavailable",
     )
     assert stopped.result is not None
-    assert stopped.result.advanced_stages == ("ocr",)
+    assert stopped.result.advanced_stages == ("ocr", "canonicalize")
     assert len(observed) == 1
     assert observed[0][1].name == "source.pdf"
     current = json.loads(
@@ -275,6 +321,295 @@ def test_scanned_pdf_uses_frozen_profile_and_commits_auditable_attempt(
     assert (run_dir / "attempts" / "1" / "stdout.bin").read_bytes() == b"ok"
     assert (run_dir / "attempts" / "1" / "stderr.bin").read_bytes() == b""
     assert (run_dir / "output" / "mineru" / "source" / "ocr" / "source.md").is_file()
+    canonical_dir = run_dir.parents[2] / "canonical"
+    canonical_current = json.loads((canonical_dir / "current.json").read_bytes())
+    canonical_run = canonical_dir / "runs" / canonical_current["run_id"]
+    image_sha256 = hashlib.sha256(image_bytes).hexdigest()
+    image_path = f"images/{image_sha256}.png"
+    assert (canonical_run / Path(image_path)).read_bytes() == image_bytes
+    blocks_bytes = (canonical_run / "blocks.jsonl").read_bytes()
+    blocks = [json.loads(line) for line in blocks_bytes.splitlines()]
+    assert [block["kind"] for block in blocks] == [
+        "paragraph",
+        "figure_caption",
+        "table",
+    ]
+    assert blocks[1]["image_path"] == image_path
+    assert blocks[2]["image_path"] == image_path
+    canonical_manifest = json.loads(
+        (canonical_run / "manifest.json").read_bytes()
+    )
+    assert canonical_manifest["image_count"] == 1
+    assert [
+        asset
+        for asset in canonical_manifest["assets"]
+        if asset["path"].startswith("images/")
+    ] == [
+        {
+            "byte_length": len(image_bytes),
+            "media_type": "image/png",
+            "path": image_path,
+            "sha256": image_sha256,
+        }
+    ]
+    assert {path.name for path in (canonical_run / "images").iterdir()} == {
+        Path(image_path).name
+    }
+    document_bytes = (canonical_run / "document.md").read_bytes()
+    content_identity = {
+        "blocks_sha256": hashlib.sha256(blocks_bytes).hexdigest(),
+        "document_sha256": hashlib.sha256(document_bytes).hexdigest(),
+        "images": [{"path": image_path, "sha256": image_sha256}],
+        "schema_version": "gezhi.canonical_content.v1",
+    }
+    assert canonical_current["canonical_content_sha256"] == hashlib.sha256(
+        resume._canonical_json_bytes(content_identity)[:-1]
+    ).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "content_v2",
+    [
+        b"[[]]\n",
+        (
+            b'[[{"bbox":[72,72,540,100],"content":'
+            b'{"paragraph_content":[{"content":"unsafe\\u0000text",'
+            b'"type":"text"}]},"type":"paragraph"}]]\n'
+        ),
+        (
+            b'[[{"bbox":[72,72,540,100],"content":'
+            b'{"paragraph_content":[{"content":"unsafe\\ud800text",'
+            b'"type":"text"}]},"type":"paragraph"}]]\n'
+        ),
+    ],
+)
+def test_valid_mineru_structure_that_cannot_be_normalized_fails_canonicalize(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    content_v2: bytes,
+) -> None:
+    data_root, work_id, source_id = scanned_source
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", lambda: _runtime())
+
+    def succeed(
+        _profile: OcrRuntimeProfileV1,
+        _input_path: Path,
+        output_root: Path,
+    ) -> OcrAttemptResultV1:
+        _write_valid_mineru_output(output_root)
+        (
+            output_root
+            / "source"
+            / "ocr"
+            / "source_content_list_v2.json"
+        ).write_bytes(content_v2)
+        return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
+
+    stopped = _invoke(data_root, work_id)
+
+    assert (stopped.outcome, stopped.stage, stopped.reason) == (
+        "failed",
+        "canonicalize",
+        "canonicalization_failed",
+    )
+    assert stopped.result is not None
+    assert stopped.result.start_stage == "ocr"
+    assert stopped.result.advanced_stages == ("ocr",)
+    canonical_dir = (
+        data_root
+        / "works"
+        / work_id
+        / "sources"
+        / source_id
+        / "canonical"
+    )
+    assert not (canonical_dir / "current.json").exists()
+    assert not tuple(
+        entry
+        for entry in (canonical_dir / "runs").iterdir()
+        if entry.name != ".staging"
+    )
+
+
+def test_native_ocr_asset_drift_before_canonical_read_is_integrity_lost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        windows_root,
+        "_reject_hidden_short_alias",
+        lambda _parent, _component: None,
+    )
+    data_root = tmp_path / "lit"
+    data_root.mkdir()
+    pdf_path = tmp_path / "native.pdf"
+    write_text_pdf(
+        pdf_path,
+        "This native PDF has enough text before a canonical read race.",
+    )
+    with open_validated_data_root_v1(str(data_root)) as root:
+        added = add_local_pdf(
+            AddLocalPdfRequestV1(
+                pdf_path=str(pdf_path),
+                work_id=None,
+                doi=None,
+                arxiv_id=None,
+                citation=None,
+            ),
+            root=root,
+        )
+    real_build = canonical._build_bundle
+
+    def drift_then_build(
+        authority: ActiveSourceAuthorityV1,
+        ocr: canonical.CurrentOcrAssetV1,
+    ) -> canonical._BundleV1:
+        native_path = ocr.run_directory / "output" / "native_text.json"
+        native = json.loads(native_path.read_bytes())
+        native["pages"][0]["text"] = (
+            "This forged text remains structurally valid but is not manifest-bound."
+        )
+        native_path.write_bytes(resume._canonical_json_bytes(native))
+        return real_build(authority, ocr)
+
+    monkeypatch.setattr(canonical, "_build_bundle", drift_then_build)
+
+    stopped = _invoke(data_root, added.work_id)
+
+    assert (stopped.outcome, stopped.stage, stopped.reason) == (
+        "failed",
+        "canonicalize",
+        "asset_integrity_lost",
+    )
+    assert stopped.result is not None
+    assert stopped.result.advanced_stages == ("ocr",)
+    canonical_dir = (
+        data_root
+        / "works"
+        / added.work_id
+        / "sources"
+        / added.source_id
+        / "canonical"
+    )
+    assert not (canonical_dir / "current.json").exists()
+    assert not tuple(
+        entry
+        for entry in (canonical_dir / "runs").iterdir()
+        if entry.name != ".staging"
+    )
+
+
+@pytest.mark.parametrize(
+    "drifted_asset",
+    ["content_v2", "image_before_build", "image_before_copy"],
+)
+def test_mineru_ocr_asset_drift_before_canonical_read_is_integrity_lost(
+    scanned_source: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    drifted_asset: str,
+) -> None:
+    data_root, work_id, source_id = scanned_source
+    original_image = b"\x89PNG\r\n\x1a\nmanifest-bound-image"
+    monkeypatch.setattr(resume, "_resolve_ocr_runtime_v1", lambda: _runtime())
+
+    def succeed(
+        _profile: OcrRuntimeProfileV1,
+        _input_path: Path,
+        output_root: Path,
+    ) -> OcrAttemptResultV1:
+        _write_valid_mineru_output(output_root)
+        leaf = output_root / "source" / "ocr"
+        (leaf / "images" / "table.png").write_bytes(original_image)
+        (leaf / "source_content_list_v2.json").write_bytes(
+            resume._canonical_json_bytes(
+                [
+                    [
+                        {
+                            "bbox": [72, 72, 540, 220],
+                            "content": {
+                                "html": "<table><tr><td>42</td></tr></table>",
+                                "image_source": {"path": "images/table.png"},
+                                "table_caption": [
+                                    {"content": "Results", "type": "text"}
+                                ],
+                                "table_footnote": [],
+                                "table_nest_level": 1,
+                                "table_type": "simple_table",
+                            },
+                            "type": "table",
+                        }
+                    ]
+                ]
+            )
+        )
+        return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
+    real_build = canonical._build_bundle
+
+    def drift_then_build(
+        authority: ActiveSourceAuthorityV1,
+        ocr: canonical.CurrentOcrAssetV1,
+    ) -> canonical._BundleV1:
+        leaf = ocr.run_directory / "output" / "mineru" / "source" / "ocr"
+        if drifted_asset == "content_v2":
+            value = json.loads(
+                (leaf / "source_content_list_v2.json").read_bytes()
+            )
+            value[0][0]["content"]["html"] = (
+                "<table><tr><td>forged</td></tr></table>"
+            )
+            (leaf / "source_content_list_v2.json").write_bytes(
+                resume._canonical_json_bytes(value)
+            )
+        elif drifted_asset == "image_before_build":
+            (leaf / "images" / "table.png").write_bytes(
+                b"\x89PNG\r\n\x1a\nforged-image"
+            )
+        return real_build(authority, ocr)
+
+    monkeypatch.setattr(canonical, "_build_bundle", drift_then_build)
+    if drifted_asset == "image_before_copy":
+        real_copy = canonical._copy_image
+        drifted = False
+
+        def remove_then_copy(
+            source: canonical._ImageSourceV1,
+            destination: Path,
+        ) -> None:
+            nonlocal drifted
+            if not drifted:
+                drifted = True
+                source.source_path.unlink()
+            real_copy(source, destination)
+
+        monkeypatch.setattr(canonical, "_copy_image", remove_then_copy)
+
+    stopped = _invoke(data_root, work_id)
+
+    assert (stopped.outcome, stopped.stage, stopped.reason) == (
+        "failed",
+        "canonicalize",
+        "asset_integrity_lost",
+    )
+    assert stopped.result is not None
+    assert stopped.result.advanced_stages == ("ocr",)
+    canonical_dir = (
+        data_root
+        / "works"
+        / work_id
+        / "sources"
+        / source_id
+        / "canonical"
+    )
+    assert not (canonical_dir / "current.json").exists()
+    assert not tuple(
+        entry
+        for entry in (canonical_dir / "runs").iterdir()
+        if entry.name != ".staging"
+    )
 
 
 def test_semantically_equivalent_rewritten_origin_is_accepted(
@@ -299,7 +634,7 @@ def test_semantically_equivalent_rewritten_origin_is_accepted(
 
     stopped = _invoke(data_root, work_id)
 
-    assert stopped.stage == "canonicalize"
+    assert stopped.stage == "read"
 
 
 def test_native_page_ordinal_rejects_json_boolean_alias_for_one(
@@ -330,7 +665,7 @@ def test_native_page_ordinal_rejects_json_boolean_alias_for_one(
             ),
             root=root,
         )
-    assert _invoke(data_root, added.work_id).stage == "canonicalize"
+    assert _invoke(data_root, added.work_id).stage == "read"
     ocr_dir = (
         data_root
         / "works"
@@ -378,7 +713,7 @@ def test_private_input_cannot_be_replaced_while_mineru_is_running(
 
     stopped = _invoke(data_root, work_id)
 
-    assert stopped.stage == "canonicalize"
+    assert stopped.stage == "read"
 
 
 def test_transient_failure_retries_once_with_fresh_output(
@@ -408,7 +743,7 @@ def test_transient_failure_retries_once_with_fresh_output(
 
     stopped = _invoke(data_root, work_id)
 
-    assert stopped.stage == "canonicalize"
+    assert stopped.stage == "read"
     assert calls == 2
     assert sleeps == [10.0]
     current = json.loads(
@@ -786,7 +1121,7 @@ def test_historical_attempt_capture_enforces_combined_inclusive_limit(
         return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
-    assert _invoke(data_root, work_id).stage == "canonicalize"
+    assert _invoke(data_root, work_id).stage == "read"
     ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
     current_path = ocr_dir / "current.json"
     current = json.loads(current_path.read_bytes())
@@ -810,7 +1145,11 @@ def test_historical_attempt_capture_enforces_combined_inclusive_limit(
             "asset_integrity_lost",
         )
     else:
-        assert stopped.stage == "canonicalize"
+        assert (stopped.outcome, stopped.stage, stopped.reason) == (
+            "failed",
+            "canonicalize",
+            "asset_integrity_lost",
+        )
 
 
 def test_historical_output_limit_outcome_requires_full_retained_capture(
@@ -1031,7 +1370,7 @@ def test_runtime_revalidation_is_the_last_observable_step_before_each_launch(
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", launch)
     monkeypatch.setattr(resume.time, "sleep", lambda _seconds: None)
 
-    assert _invoke(data_root, work_id).stage == "canonicalize"
+    assert _invoke(data_root, work_id).stage == "read"
 
     launch_indexes = [
         index for index, event in enumerate(events) if event == "launch"
@@ -1060,7 +1399,7 @@ def test_committed_success_without_current_repairs_pointer_without_rerun(
 
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
     first = _invoke(data_root, work_id)
-    assert first.stage == "canonicalize"
+    assert first.stage == "read"
     ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
     current_before = json.loads((ocr_dir / "current.json").read_bytes())
     (ocr_dir / "current.json").unlink()
@@ -1092,7 +1431,7 @@ def test_current_temp_uuid_collision_preserves_foreign_marker(
         return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
-    assert _invoke(data_root, work_id).stage == "canonicalize"
+    assert _invoke(data_root, work_id).stage == "read"
     ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
     (ocr_dir / "current.json").unlink()
     fixed = UUID("123e4567-e89b-42d3-a456-426614174004")
@@ -1128,7 +1467,7 @@ def test_foreign_current_temp_is_classified_before_pointer_repair(
         return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
-    assert _invoke(data_root, work_id).stage == "canonicalize"
+    assert _invoke(data_root, work_id).stage == "read"
     ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
     (ocr_dir / "current.json").unlink()
     foreign = ocr_dir / ".current.json.123e4567e89b42d3a456426614174005.tmp"
@@ -1162,7 +1501,7 @@ def test_multiple_valid_current_temps_are_ambiguous_recovery_evidence(
         return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
-    assert _invoke(data_root, work_id).stage == "canonicalize"
+    assert _invoke(data_root, work_id).stage == "read"
     ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
     payload = (ocr_dir / "current.json").read_bytes()
     (ocr_dir / "current.json").unlink()
@@ -1197,7 +1536,7 @@ def test_current_authority_drift_after_temp_write_preserves_temp_without_replace
         return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
-    assert _invoke(data_root, work_id).stage == "canonicalize"
+    assert _invoke(data_root, work_id).stage == "read"
     ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
     (ocr_dir / "current.json").unlink()
     real_checkpoint = resume._fresh_authority_or_stop
@@ -1253,7 +1592,7 @@ def test_uncertain_current_replace_preserves_evidence_and_recovers_next_time(
         return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
-    assert _invoke(data_root, work_id).stage == "canonicalize"
+    assert _invoke(data_root, work_id).stage == "read"
     ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
     current_before = json.loads((ocr_dir / "current.json").read_bytes())
     (ocr_dir / "current.json").unlink()
@@ -1314,7 +1653,7 @@ def test_uncertain_current_replace_preserves_evidence_and_recovers_next_time(
 
     recovered = _invoke(data_root, work_id)
 
-    assert recovered.stage == "canonicalize"
+    assert recovered.stage == "read"
     assert recovered.result is not None
     assert recovered.result.advanced_stages == ("ocr",)
     assert json.loads((ocr_dir / "current.json").read_bytes()) == current_before
@@ -1339,7 +1678,7 @@ def test_current_readback_failure_after_replace_preserves_temp_evidence(
         return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
-    assert _invoke(data_root, work_id).stage == "canonicalize"
+    assert _invoke(data_root, work_id).stage == "read"
     ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
     current = ocr_dir / "current.json"
     expected = current.read_bytes()
@@ -1404,7 +1743,7 @@ def test_current_publish_does_not_require_hard_link_support(
 
     stopped = _invoke(data_root, work_id)
 
-    assert stopped.stage == "canonicalize"
+    assert stopped.stage == "read"
     ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
     assert (ocr_dir / "current.json").is_file()
     assert not tuple(ocr_dir.glob(".current.json.*.tmp"))
@@ -1443,7 +1782,7 @@ def test_same_source_and_profile_have_stable_input_fingerprint_after_failed_retr
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
     second = _invoke(data_root, work_id)
 
-    assert second.stage == "canonicalize"
+    assert second.stage == "read"
     current = json.loads((runs_dir.parent / "current.json").read_bytes())
     success_input = json.loads(
         (runs_dir / current["run_id"] / "input.json").read_bytes()
@@ -1473,7 +1812,7 @@ def test_historical_attempt_ordinal_rejects_json_boolean_alias_for_one(
         return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", retry_then_succeed)
-    assert _invoke(data_root, work_id).stage == "canonicalize"
+    assert _invoke(data_root, work_id).stage == "read"
     ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
     current_path = ocr_dir / "current.json"
     current = json.loads(current_path.read_bytes())
@@ -1526,7 +1865,7 @@ def test_nonzero_mineru_exit_retries_once_without_reusing_partial_output(
 
     stopped = _invoke(data_root, work_id)
 
-    assert stopped.stage == "canonicalize"
+    assert stopped.stage == "read"
     assert calls == 2
     assert sleeps == [10.0]
 
@@ -1579,9 +1918,9 @@ def test_complete_success_staging_orphan_is_recovered_without_rerun(
     monkeypatch.setattr(resume.os, "rename", real_rename)
     second = _invoke(data_root, work_id)
 
-    assert second.stage == "canonicalize"
+    assert second.stage == "read"
     assert second.result is not None
-    assert second.result.advanced_stages == ("ocr",)
+    assert second.result.advanced_stages == ("ocr", "canonicalize")
     assert calls == 1
     assert not tuple(staging_dir.iterdir())
 
@@ -1602,7 +1941,7 @@ def test_two_complete_staging_successes_fail_stop_before_any_rename(
         return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
-    assert _invoke(data_root, work_id).stage == "canonicalize"
+    assert _invoke(data_root, work_id).stage == "read"
     ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
     current_path = ocr_dir / "current.json"
     current = json.loads(current_path.read_bytes())
@@ -1642,7 +1981,7 @@ def test_valid_current_still_classifies_matching_staging_success(
         return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
-    assert _invoke(data_root, work_id).stage == "canonicalize"
+    assert _invoke(data_root, work_id).stage == "read"
     ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
     current_path = ocr_dir / "current.json"
     current_bytes = current_path.read_bytes()
@@ -1682,7 +2021,7 @@ def test_multiple_formal_successes_outrank_corrupt_run_in_any_scan_order(
         return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
-    assert _invoke(data_root, work_id).stage == "canonicalize"
+    assert _invoke(data_root, work_id).stage == "read"
     ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
     current = json.loads((ocr_dir / "current.json").read_bytes())
     runs_dir = ocr_dir / "runs"
@@ -1738,7 +2077,7 @@ def test_formal_and_staging_run_id_collision_fail_stops_without_mutation(
         return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
-    assert _invoke(data_root, work_id).stage == "canonicalize"
+    assert _invoke(data_root, work_id).stage == "read"
     ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
     current = json.loads((ocr_dir / "current.json").read_bytes())
     runs_dir = ocr_dir / "runs"
@@ -1772,7 +2111,7 @@ def test_partial_staging_with_formal_run_id_fail_stops_without_mutation(
         return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
-    assert _invoke(data_root, work_id).stage == "canonicalize"
+    assert _invoke(data_root, work_id).stage == "read"
     ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
     current_path = ocr_dir / "current.json"
     current_bytes = current_path.read_bytes()
@@ -1808,7 +2147,7 @@ def test_staging_collision_precedes_corrupt_current_classification(
         return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
-    assert _invoke(data_root, work_id).stage == "canonicalize"
+    assert _invoke(data_root, work_id).stage == "read"
     ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
     current_path = ocr_dir / "current.json"
     current = json.loads(current_path.read_bytes())
@@ -1970,7 +2309,7 @@ def test_recovery_rename_rechecks_root_before_mutation(
         return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
-    assert _invoke(data_root, work_id).stage == "canonicalize"
+    assert _invoke(data_root, work_id).stage == "read"
     ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
     current = json.loads((ocr_dir / "current.json").read_bytes())
     runs_dir = ocr_dir / "runs"
@@ -2076,7 +2415,7 @@ def test_partial_staging_is_quarantined_and_never_used_as_success(
 
     stopped = _invoke(data_root, work_id)
 
-    assert stopped.stage == "canonicalize"
+    assert stopped.stage == "read"
     assert partial.is_dir()
     assert (partial / "partial.bin").read_bytes() == b"do not reuse"
     current = json.loads((staging_dir.parent.parent / "current.json").read_bytes())
@@ -2117,7 +2456,7 @@ def test_deeply_nested_staging_document_is_quarantined(
 
     stopped = _invoke(data_root, work_id)
 
-    assert stopped.stage == "canonicalize"
+    assert stopped.stage == "read"
     assert partial.is_dir()
     current = json.loads((staging_dir.parent.parent / "current.json").read_bytes())
     assert current["run_id"] != partial.name
@@ -2139,7 +2478,7 @@ def test_corrupt_current_is_asset_integrity_lost_and_does_not_rerun(
         return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
-    assert _invoke(data_root, work_id).stage == "canonicalize"
+    assert _invoke(data_root, work_id).stage == "read"
     current_path = (
         data_root
         / "works"
@@ -2183,7 +2522,7 @@ def test_deeply_nested_current_is_asset_integrity_lost(
         return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
-    assert _invoke(data_root, work_id).stage == "canonicalize"
+    assert _invoke(data_root, work_id).stage == "read"
     current_path = (
         data_root
         / "works"
@@ -2220,7 +2559,7 @@ def test_unhashable_corrupt_selection_is_classified_as_asset_integrity_lost(
         return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
-    assert _invoke(data_root, work_id).stage == "canonicalize"
+    assert _invoke(data_root, work_id).stage == "read"
     ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
     current = json.loads((ocr_dir / "current.json").read_bytes())
     selection_path = ocr_dir / "runs" / current["run_id"] / "selection.json"
@@ -2258,7 +2597,7 @@ def test_semantically_forged_attempt_receipt_is_asset_integrity_lost(
         return OcrAttemptResultV1(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(resume, "_run_ocr_attempt_v1", succeed)
-    assert _invoke(data_root, work_id).stage == "canonicalize"
+    assert _invoke(data_root, work_id).stage == "read"
     ocr_dir = data_root / "works" / work_id / "sources" / source_id / "ocr"
     current_path = ocr_dir / "current.json"
     current = json.loads(current_path.read_bytes())
@@ -2440,7 +2779,7 @@ def test_private_ocr_input_is_gated_before_copy_or_parse(
         staging = source_path.parent / "ocr" / "runs" / ".staging"
         assert not tuple(staging.iterdir())
     else:
-        assert _invoke(data_root, work_id).stage == "canonicalize"
+        assert _invoke(data_root, work_id).stage == "read"
 
 
 def test_provider_pdf_parser_accepts_exact_file_limit_and_rejects_limit_plus_one(

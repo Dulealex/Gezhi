@@ -47,6 +47,7 @@ _RESUME_STAGE_BLOCKED = {
     "ocr": ("ocr_runtime_unavailable", "ocr_transient_exhausted"),
     "canonicalize": ("canonical_prerequisite_unavailable",),
     "read": (
+        "reader_prerequisite_unavailable",
         "reader_input_too_large",
         "model_context_limit",
         "codex_runtime_unavailable",

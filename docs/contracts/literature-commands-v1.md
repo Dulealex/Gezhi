@@ -300,7 +300,7 @@ T04 V1不定义 supplemental Literature diagnostic。成功 `diagnostics=[]`；b
 | `literature.resume.stage_failed.v1` | failed | `{"reason":"<closed>","stage":"<stage>"}` | non-null |
 | `literature.resume.recovery_failed.v1` | failed | `{}` | null |
 
-三个 Resume Data Root primary 的 context 都是且只能是 `{"data_root":"literature"}` 或 `{"data_root":"knowledge"}` 两个 exact object 的 closed one-of；不得出现合并字符串、其他 value、其他 key 或 additional property。三个 `literature` variant 均阻止 result seal 并返回 null；三个 `knowledge` variant 只在到达 `knowledge_import` 后出现，均返回第 5.3 节冻结的 non-null sealed result，`stop_stage=knowledge_import`，且不属于下方 42 个 stage/reason pair。Knowledge root fault 不暗示 Literature root 同时失去可信性。
+三个 Resume Data Root primary 的 context 都是且只能是 `{"data_root":"literature"}` 或 `{"data_root":"knowledge"}` 两个 exact object 的 closed one-of；不得出现合并字符串、其他 value、其他 key 或 additional property。三个 `literature` variant 均阻止 result seal 并返回 null；三个 `knowledge` variant 只在到达 `knowledge_import` 后出现，均返回第 5.3 节冻结的 non-null sealed result，`stop_stage=knowledge_import`，且不属于下方 43 个 stage/reason pair。Knowledge root fault 不暗示 Literature root 同时失去可信性。
 
 `stage_blocked` closed matrix：
 
@@ -309,7 +309,7 @@ T04 V1不定义 supplemental Literature diagnostic。成功 `diagnostics=[]`；b
 | `ingest` | `identity_review_required` | 1 |
 | `ocr` | `ocr_runtime_unavailable`, `ocr_transient_exhausted` | 2 |
 | `canonicalize` | `canonical_prerequisite_unavailable` | 1 |
-| `read` | `reader_input_too_large`, `model_context_limit`, `codex_runtime_unavailable`, `codex_timeout_exhausted`, `codex_network_exhausted`, `codex_rate_limit_exhausted`, `codex_server_error_exhausted`, `codex_transient_exhausted` | 8 |
+| `read` | `reader_prerequisite_unavailable`, `reader_input_too_large`, `model_context_limit`, `codex_runtime_unavailable`, `codex_timeout_exhausted`, `codex_network_exhausted`, `codex_rate_limit_exhausted`, `codex_server_error_exhausted`, `codex_transient_exhausted` | 9 |
 | `review` | `awaiting_review` | 1 |
 | `handoff` | `handoff_blocked` | 1 |
 | `knowledge_import` | `registry_unavailable`, `registry_busy`, `import_blocked` | 3 |
@@ -326,7 +326,7 @@ T04 V1不定义 supplemental Literature diagnostic。成功 `diagnostics=[]`；b
 | `handoff` | `revision_conflict`, `asset_integrity_lost`, `commit_failed`, `handoff_failed` | 4 |
 | `knowledge_import` | `revision_conflict`, `registry_conflict`, `commit_failed`, `import_failed` | 4 |
 
-Stage/reason 必须来自表中 ASCII enum，不能拼内部 error/provider/exception。两张表精确展开为 17 个 blocked pair 与 25 个 failed pair，共 42 个 retained pair；没有隐含组合。每个 retained pair 都必须有独立可达见证：先通过 Literature root、Work、Active Source 与唯一初始 Continuation Point 的 result-presence 前置条件，再把执行推进到表中 stage 并注入该 reason，最终形成 non-null sealed result，且 `stop_stage` 精确等于该 stage。`ingest` 的三个 retained pair 只覆盖一个已验证 Active Source 的 ingest identity/current repair：可恢复 identity ambiguity 是 blocked，确定 identity conflict 或 repair commit failure 是 failed。Active Source 本身缺失/不可证明与确定 invalid 分别提前映射到 `active_source_unavailable` 与 `active_source_invalid`，不得出现在这 42 个 pair 中。
+Stage/reason 必须来自表中 ASCII enum，不能拼内部 error/provider/exception。两张表精确展开为 18 个 blocked pair 与 25 个 failed pair，共 43 个 retained pair；没有隐含组合。每个 retained pair 都必须有独立可达见证：先通过 Literature root、Work、Active Source 与唯一初始 Continuation Point 的 result-presence 前置条件，再把执行推进到表中 stage 并注入该 reason，最终形成 non-null sealed result，且 `stop_stage` 精确等于该 stage。`ingest` 的三个 retained pair 只覆盖一个已验证 Active Source 的 ingest identity/current repair：可恢复 identity ambiguity 是 blocked，确定 identity conflict 或 repair commit failure 是 failed。Active Source 本身缺失/不可证明与确定 invalid 分别提前映射到 `active_source_unavailable` 与 `active_source_invalid`，不得出现在这 43 个 pair 中。`reader_prerequisite_unavailable` 只表示 Reader-owned prompt、Schema、input projection 或执行 adapter 尚未随当前构建提供且尚未启动 Codex attempt；它不能替代 Reader 输入、模型或 Codex 的实际故障。
 
 ADR 0121 的映射按闭合层级执行：实际消费 Data Root 的 physical gate 先选择 context-specific root primary，不能改写为 stage pair；Resume 的 Registry unavailable/busy 分别只选择 `knowledge_import/registry_unavailable` 或 `knowledge_import/registry_busy`，与 `import_blocked` 互斥；Handoff 的 revision conflict、asset integrity lost、commit failure，以及 Knowledge import 的 revision conflict、Registry conflict、commit failure，分别只选择对应 specific `stage_failed` reason，并与 generic failed reason 互斥。Specific reason 一律优先；`handoff_blocked`/`import_blocked` 只接收 Handoff/`KnowledgeIntake` interface 的其余已批准 typed recoverable prerequisite，`handoff_failed`/`import_failed` 只接收其余已批准 deterministic typed interface failure。Unknown、untyped、commit-uncertain 不得选择任一 pair。
 
@@ -606,11 +606,11 @@ Review catalog 的 `<data_root>` 逐字取胜出 root primary context 中的 `da
 
 - 七阶段每个 valid success跳过；directory committed/pointer missing只补 pointer；从 ingest自动推进到 pending review并返回 IDs，不写 Decision。
 - Zero Candidate完成 no-op；全部有 decision时补 Handoff/Import；有已授权 backlog和其他 pending时先补 backlog再 awaiting_review。对 `handoff` 与 `knowledge_import` 的每个 retained blocked/failed reason 都必须有 backlog+pending 见证：`start_stage=review`，`pending_candidate_ids` 非空且 Work 全局 Continuation Point 仍为 `review`，但 `stop_stage` 精确等于该 blocked/failed primary context 的 stage；backlog 全部成功后才允许以 `stop_stage=review`、`awaiting_review` 呈现。
-- Resume result seal逐 variant覆盖：17 个 `stage_blocked` pair 与 25 个 `stage_failed` pair 逐项具有可达见证并返回 non-null，42 个 stage pair 的可达性与计数不变；三条 ADR 0121 相关 reason 列表逐字验证 specific 在前、generic 在末，并证明第 7.4 节同 stage 仲裁优先选择 specific。七个固定 null code 加三个 Literature root variant 恰好形成十个 null variants，三个 Knowledge root variant 均形成 non-null sealed result、`stop_stage=knowledge_import` 并保留已明确提交的进度。Active Source 的缺失/identity-unprovable 与确定 invalidity 分别由 seal 前的 `active_source_unavailable` 与 `active_source_invalid` 闭合，不进入 ingest matrix；`commit_failed` 不把当前 stage列入 `advanced_stages`，uncertain commit不形成 handled receipt。
+- Resume result seal逐 variant覆盖：18 个 `stage_blocked` pair 与 25 个 `stage_failed` pair 逐项具有可达见证并返回 non-null，43 个 stage pair 的可达性与计数不变；三条 ADR 0121 相关 reason 列表逐字验证 specific 在前、generic 在末，并证明第 7.4 节同 stage 仲裁优先选择 specific。七个固定 null code 加三个 Literature root variant 恰好形成十个 null variants，三个 Knowledge root variant 均形成 non-null sealed result、`stop_stage=knowledge_import` 并保留已明确提交的进度。Active Source 的缺失/identity-unprovable 与确定 invalidity 分别由 seal 前的 `active_source_unavailable` 与 `active_source_invalid` 闭合，不进入 ingest matrix；`commit_failed` 不把当前 stage列入 `advanced_stages`，uncertain commit不形成 handled receipt。
 - Awaiting-review redirected Human完整匹配 witness：N 项 Candidate array 按外层 Candidate 顺序、内层 accept/reject/defer 顺序输出恰好 `3N` 条完整命令，最多 36 条且命令不含 raw `|`；命令位于 `Work ID` 后、`原因` 前，全 receipt 恰好一个最终 `下一步` 行。
 - 每阶段 blocked/failed、历史 interrupted、遗留 running、partial/invalid orphan、target conflict、uncertain均无 partial success/overwrite。
 - OCR缺失只在 ocr阻塞；Codex缺失只在 read；Knowledge root只在 import；已完成阶段仍可读。
-- Resume 三个 root code 各覆盖 `literature`、`knowledge` 两个 exact context，合计六个 context variants：Literature variant 为 null，Knowledge variant 为 non-null 且不属于 42 个 stage pair；Knowledge root fault 不要求 Literature root 同时失信。Active Source unavailable/invalid 分别覆盖 blocked/failed 且都在 seal 前返回 null。
+- Resume 三个 root code 各覆盖 `literature`、`knowledge` 两个 exact context，合计六个 context variants：Literature variant 为 null，Knowledge variant 为 non-null 且不属于 43 个 stage pair；Knowledge root fault 不要求 Literature root 同时失信。Active Source unavailable/invalid 分别覆盖 blocked/failed 且都在 seal 前返回 null。
 
 ### Review
 
