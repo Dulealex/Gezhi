@@ -17,6 +17,11 @@ from gezhi._bounded_probe import (
     ProbeUnavailableError,
     run_bounded_probe_v1,
 )
+from gezhi._codex_runtime import (
+    CodexRuntimeDescriptorErrorV1,
+    CodexRuntimeResolutionErrorV1,
+    resolve_codex_runtime_v1,
+)
 from gezhi._configuration import ConfigurationError, resolve_configuration_v1
 from gezhi._windows_data_root import (
     DataRootInspectionV1,
@@ -48,17 +53,6 @@ _CORE_DEPENDENCIES = (
     ("rich", "15.0.0", "rich"),
     ("tenacity", "9.1.4", "tenacity"),
     ("typer", "0.27.0", "typer"),
-)
-_CODEX_EXECUTABLE_PARTS = (
-    "runtimes",
-    "codex",
-    "node_modules",
-    "@openai",
-    "codex-win32-x64",
-    "vendor",
-    "x86_64-pc-windows-msvc",
-    "bin",
-    "codex.exe",
 )
 _OCR_PYTHON_PARTS = (
     "runtimes",
@@ -184,67 +178,35 @@ def _read_json_object(path: Path) -> dict[str, object]:
 
 
 def probe_codex_runtime_v1(*, project_root: Path) -> ProbeStatus:
-    runtime_root = project_root / "runtimes" / "codex"
     try:
-        package = _read_json_object(runtime_root / "package.json")
-        lock = _read_json_object(runtime_root / "package-lock.json")
-        packages = lock["packages"]
-        if type(packages) is not dict:
-            raise RuntimeDescriptorError("Codex lock package table is malformed")
-        root_lock = packages[""]
-        main_lock = packages["node_modules/@openai/codex"]
-        native_lock = packages["node_modules/@openai/codex-win32-x64"]
-        if not all(type(item) is dict for item in (root_lock, main_lock, native_lock)):
-            raise RuntimeDescriptorError("Codex lock package entry is malformed")
-        dependencies = root_lock["dependencies"]
-        if type(dependencies) is not dict:
-            raise RuntimeDescriptorError("Codex lock dependencies are malformed")
-        if package.get("dependencies") != {"@openai/codex": "0.146.0"}:
-            return "blocked"
-        if dependencies != {"@openai/codex": "0.146.0"}:
-            return "blocked"
-        if main_lock.get("version") != "0.146.0":
-            return "blocked"
-        if native_lock.get("version") != "0.146.0-win32-x64":
-            return "blocked"
-
-        installed_root = runtime_root / "node_modules" / "@openai"
-        installed_main = _read_json_object(installed_root / "codex" / "package.json")
-        installed_native_root = installed_root / "codex-win32-x64"
-        installed_native = _read_json_object(installed_native_root / "package.json")
-        if installed_main.get("version") != "0.146.0":
-            return "blocked"
-        if installed_native.get("version") != "0.146.0-win32-x64":
-            return "blocked"
-        with (
-            open_validated_data_root_v1(str(project_root)) as project,
-            project.open_relative_file_v1(_CODEX_EXECUTABLE_PARTS) as executable,
-        ):
-            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            version = run_bounded_probe_v1(
-                (executable.canonical_path, "--version"),
-                timeout_seconds=15,
-                output_limit=4_096,
-                creation_flags=creation_flags,
-            )
-            login = run_bounded_probe_v1(
-                (executable.canonical_path, "login", "status"),
-                timeout_seconds=15,
-                output_limit=4_096,
-                creation_flags=creation_flags,
-            )
+        runtime = resolve_codex_runtime_v1(project_root)
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        version = run_bounded_probe_v1(
+            (runtime.executable_path, "--version"),
+            timeout_seconds=15,
+            output_limit=4_096,
+            creation_flags=creation_flags,
+        )
+        login = run_bounded_probe_v1(
+            (runtime.executable_path, "login", "status"),
+            timeout_seconds=15,
+            output_limit=4_096,
+            creation_flags=creation_flags,
+        )
+    except CodexRuntimeDescriptorErrorV1 as error:
+        raise RuntimeDescriptorError("Codex runtime descriptor is malformed") from error
     except (
-        DataRootOpenErrorV1,
+        CodexRuntimeResolutionErrorV1,
         ProbeOutputLimitExceeded,
         ProbeUnavailableError,
-        RuntimeUnavailableError,
         subprocess.TimeoutExpired,
     ):
         return "blocked"
 
     if (
         version.returncode != 0
-        or version.stdout.strip() != b"codex-cli 0.146.0"
+        or version.stdout.strip()
+        != f"codex-cli {runtime.cli_version}".encode("ascii")
         or version.stderr
         or login.returncode != 0
         or (login.stdout + login.stderr).strip() != b"Logged in using ChatGPT"

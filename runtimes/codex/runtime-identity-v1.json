@@ -1,0 +1,24 @@
+{
+  "identity_version": 1,
+  "cli_package_name": "@openai/codex",
+  "cli_version": "0.146.0",
+  "native_package_alias": "@openai/codex-win32-x64",
+  "native_package_name": "@openai/codex",
+  "native_package_version": "0.146.0-win32-x64",
+  "main_lock_integrity": "sha512-yG3sPWNda/2YAIQIDq9MrrjoCTIQ7rxYM5IasrG3VBcuhCLTkgeg/JzqmJq1V98RE4MJ5jCxDXXQlOjrditFRw==",
+  "native_lock_integrity": "sha512-b3lxMYeR0+IhstNo4JjX1P9cPc1xwVcCVkPd1lD1wpWPJ0SBhpIkPczwbu3ZRkJcdyl342+rgyf4DUrbZLdrGA==",
+  "optional_dependencies": {
+    "@openai/codex-darwin-arm64": "npm:@openai/codex@0.146.0-darwin-arm64",
+    "@openai/codex-darwin-x64": "npm:@openai/codex@0.146.0-darwin-x64",
+    "@openai/codex-linux-arm64": "npm:@openai/codex@0.146.0-linux-arm64",
+    "@openai/codex-linux-x64": "npm:@openai/codex@0.146.0-linux-x64",
+    "@openai/codex-win32-arm64": "npm:@openai/codex@0.146.0-win32-arm64",
+    "@openai/codex-win32-x64": "npm:@openai/codex@0.146.0-win32-x64"
+  },
+  "executable_relative_parts": [
+    "vendor",
+    "x86_64-pc-windows-msvc",
+    "bin",
+    "codex.exe"
+  ]
+}

@@ -361,6 +361,81 @@ class ValidatedDataRootV1:
             raise RuntimeError("validated Data Root is closed")
         return self._handles[-1]
 
+    def open_relative_data_root_v1(
+        self,
+        parts: tuple[str, ...],
+    ) -> ValidatedDataRootV1:
+        """Open one no-follow descendant root from this held capability."""
+
+        if self._closed:
+            raise RuntimeError("validated Data Root is closed")
+        normalized = validate_relative_parts_v1(parts)
+        if not normalized:
+            raise ValueError("a relative directory path is required")
+        expected_root = self.inspection.canonical_path
+        root_identity = self.inspection.identity
+        if expected_root is None or root_identity is None:
+            raise RuntimeError("validated Data Root facts are incomplete")
+
+        held: list[int] = []
+        identities: list[FileIdentity] = []
+        expected_paths: list[str] = []
+        parent = self.borrowed_handle()
+        current = expected_root
+        try:
+            for component in normalized:
+                current = ntpath.join(current, component)
+                handle = _open_relative_handle(parent, component, directory=True)
+                held.append(handle)
+                facts = _handle_facts(handle, directory=True)
+                _validate_expected_facts(facts, current, root_identity[0])
+                _reject_hidden_short_alias(parent, component)
+                if facts.identity in {
+                    *self.inspection.ancestor_identities,
+                    *identities,
+                }:
+                    raise DataRootOpenErrorV1("unsafe")
+                identities.append(facts.identity)
+                expected_paths.append(current)
+                parent = handle
+
+            parent_handles = (self.borrowed_handle(), *held[:-1])
+            final_facts: _HandleFacts | None = None
+            for component, expected_path, parent_handle, handle, identity in zip(
+                normalized,
+                expected_paths,
+                parent_handles,
+                held,
+                identities,
+                strict=True,
+            ):
+                facts = _handle_facts(handle, directory=True)
+                _validate_expected_facts(facts, expected_path, root_identity[0])
+                _reject_hidden_short_alias(parent_handle, component)
+                if facts.identity != identity:
+                    raise DataRootOpenErrorV1("unavailable")
+                final_facts = facts
+            if final_facts is None:
+                raise DataRootOpenErrorV1("unavailable")
+        except BaseException as error:
+            try:
+                _close_handles(tuple(held))
+            except Exception as close_error:
+                raise close_error from error
+            raise
+        return ValidatedDataRootV1(
+            inspection=DataRootInspectionV1(
+                status="ready",
+                canonical_path=final_facts.canonical_path,
+                identity=identities[-1],
+                ancestor_identities=(
+                    *self.inspection.ancestor_identities,
+                    *identities,
+                ),
+            ),
+            handles=tuple(held),
+        )
+
     def open_relative_file_v1(self, parts: tuple[str, ...]) -> ValidatedFileV1:
         if self._closed:
             raise RuntimeError("validated Data Root is closed")
@@ -401,6 +476,20 @@ class ValidatedDataRootV1:
             size=size,
             handles=tuple(held),
         )
+
+    def relative_entry_names_v1(self) -> tuple[str, ...]:
+        """List the held root's immediate, non-reparse children."""
+
+        if self._closed:
+            raise RuntimeError("validated Data Root is closed")
+        observed: list[str] = []
+        for entry in _enumerate_directory(self.borrowed_handle()):
+            if len(observed) >= _MAX_ENUMERATED_ENTRIES:
+                raise DataRootOpenErrorV1("unavailable")
+            if entry.attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+                raise DataRootOpenErrorV1("unsafe")
+            observed.append(entry.name)
+        return tuple(sorted(observed))
 
     def relative_file_paths_v1(self) -> tuple[str, ...]:
         if self._closed:

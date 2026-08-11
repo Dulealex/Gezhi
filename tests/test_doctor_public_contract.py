@@ -11,6 +11,21 @@ from gezhi import _doctor_runtime as doctor_runtime
 
 DEPLOYMENT_ROOT = Path(r"E:\Gezhi")
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+_RUNTIME_IDENTITY = json.loads(
+    (
+        Path(__file__).resolve().parents[1]
+        / "runtimes"
+        / "codex"
+        / "runtime-identity-v1.json"
+    ).read_text(encoding="utf-8")
+)
+_CODEX_EXECUTABLE = DEPLOYMENT_ROOT.joinpath(
+    "runtimes",
+    "codex",
+    "node_modules",
+    *_RUNTIME_IDENTITY["native_package_alias"].split("/"),
+    *_RUNTIME_IDENTITY["executable_relative_parts"],
+)
 _CORE_IMPORT_SCRIPT = ";".join(
     f"import {module}"
     for _distribution, _version, module in doctor_runtime._CORE_DEPENDENCIES
@@ -19,9 +34,7 @@ _CORE_IMPORT_SCRIPT = ";".join(
 
 def _read_only_doctor_site_customize(marker: Path) -> str:
     ocr_python = DEPLOYMENT_ROOT.joinpath(*doctor_runtime._OCR_PYTHON_PARTS)
-    codex_executable = DEPLOYMENT_ROOT.joinpath(
-        *doctor_runtime._CODEX_EXECUTABLE_PARTS
-    )
+    codex_executable = _CODEX_EXECUTABLE
     return (
         "import os\n"
         "import pathlib\n"
@@ -458,7 +471,7 @@ def test_real_doctor_runtime_is_read_only_through_both_launchers(
         "import subprocess; subprocess.Popen(['uv.exe','sync'])",
         (
             "import subprocess; subprocess.Popen(["
-            f"{str(DEPLOYMENT_ROOT.joinpath(*doctor_runtime._CODEX_EXECUTABLE_PARTS))!r},"
+            f"{str(_CODEX_EXECUTABLE)!r},"
             "'exec','semantic request'])"
         ),
     ),

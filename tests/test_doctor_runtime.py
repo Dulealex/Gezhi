@@ -10,11 +10,19 @@ from launcher_support import REPOSITORY_ROOT
 
 from gezhi import _doctor_runtime as runtime
 from gezhi import _windows_data_root as windows_root
-from gezhi._bounded_probe import ProbeLifecycleError, ProbeUnavailableError
+from gezhi._bounded_probe import (
+    BoundedProbeResultV1,
+    ProbeLifecycleError,
+    ProbeUnavailableError,
+)
+from gezhi._codex_runtime import _freeze_test_codex_runtime_v1
 from gezhi._doctor_runtime import (
     probe_codex_runtime_v1,
     probe_core_environment_v1,
     probe_ocr_runtime_v1,
+)
+from tests.support.codex_runtime_fixture_v1 import (
+    build_project_codex_runtime_fixture_v1,
 )
 
 
@@ -131,6 +139,30 @@ def test_core_probe_reports_a_job_lifecycle_fault_as_failed(
 
 
 def test_project_locked_codex_identity_and_login_are_ready() -> None:
+    assert probe_codex_runtime_v1(project_root=Path(r"E:\Gezhi")) == "ready"
+
+
+def test_codex_probe_uses_the_resolver_proof_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof = _freeze_test_codex_runtime_v1(
+        executable_path=r"C:\codex-double.exe",
+        executable_identity=(7, 11),
+        executable_size=1,
+        executable_sha256="0" * 64,
+    )
+    monkeypatch.setattr(runtime, "resolve_codex_runtime_v1", lambda _root: proof)
+
+    def probe(argv: tuple[str, ...], **_kwargs: object) -> BoundedProbeResultV1:
+        stdout = (
+            f"codex-cli {proof.cli_version}".encode("ascii")
+            if argv[1] == "--version"
+            else b"Logged in using ChatGPT"
+        )
+        return BoundedProbeResultV1(returncode=0, stdout=stdout, stderr=b"")
+
+    monkeypatch.setattr(runtime, "run_bounded_probe_v1", probe)
+
     assert probe_codex_runtime_v1(project_root=Path(r"E:\Gezhi")) == "ready"
 
 
@@ -432,9 +464,14 @@ def test_malformed_project_codex_descriptor_is_an_inspection_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        windows_root,
+        "_reject_hidden_short_alias",
+        lambda _parent, _component: None,
+    )
     literature_root, knowledge_root = _prepare_observer_project(tmp_path)
+    build_project_codex_runtime_fixture_v1(tmp_path)
     codex_root = tmp_path / "runtimes" / "codex"
-    codex_root.mkdir(parents=True)
     (codex_root / "package.json").write_text("{", encoding="utf-8")
     monkeypatch.setattr(
         runtime,
