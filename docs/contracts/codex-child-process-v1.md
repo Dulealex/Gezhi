@@ -12,7 +12,7 @@ V1 的 production target 只能是项目 resolver 已经证明并为本 invocati
 
 | role | 共享本合同的部分 | role-owned overlay |
 |---|---|---|
-| `literature_reader_v1` | 进程创建、stdio、handle allowlist、同步 pipe、Job、polling、stop、资源归零 | Literature Run 的条件式 `final_message.txt`、`attempt.json`、usage、终态与持久化规则 |
+| `literature_reader_v1` | 进程创建、stdio、handle allowlist、同步 pipe、Job、polling、stop、资源归零 | 条件式 `final_message.txt`、独立逐文件 cap、exact prefix、overflow、`attempt.json`、usage、终态与持久化规则 |
 | `knowledge_answerer_v1` | 同上 | 固定双 capture、逐文件 cap、exact prefix、overflow、usage gate、attempt item 与 Answer 提交规则 |
 
 未来 Bot 只有在自己的版本化 role contract 明确采用 `CodexChildProcessV1` 并冻结 capture overlay 后才能接入；本合同预留组合点，但不会让未知 Bot 自动继承 Knowledge 或 Literature 的持久语义。
@@ -38,6 +38,7 @@ OCR **不继承** `CodexChildProcessV1`。OCR executable、GPU/runtime、stdio�
 - retry 与 attempt 序列：[ADR 0028](../adr/0028-retry-only-classified-transient-failures.md)、[ADR 0065](../adr/0065-model-codex-attempts-as-an-ordered-launch-sequence.md)、[ADR 0066](../adr/0066-use-a-closed-ten-field-knowledge-attempt-record.md)、[ADR 0067](../adr/0067-scope-the-95-minute-window-to-codex-synthesis.md) 与 [ADR 0068](../adr/0068-arbitrate-attempt-terminal-signals-in-two-stages.md)。
 - Knowledge usage：[ADR 0069](../adr/0069-read-attempt-usage-only-from-turn-completed.md)、[ADR 0070](../adr/0070-use-independent-checked-answer-usage-totals.md) 与 [ADR 0081](../adr/0081-project-knowledge-usage-only-from-sub-cap-events.md)。
 - Knowledge capture：[ADR 0071](../adr/0071-use-closed-stage-prefixes-and-atomic-pairs-for-answer-root-assets.md)、[ADR 0072](../adr/0072-use-a-fixed-two-file-capture-for-every-knowledge-attempt.md)、[ADR 0073](../adr/0073-use-octet-stream-for-knowledge-attempt-captures.md)、[ADR 0074](../adr/0074-decode-knowledge-attempt-semantics-as-strict-utf-8.md)、[ADR 0075](../adr/0075-frame-knowledge-events-on-raw-lf-with-an-optional-eof-tail.md)、[ADR 0076](../adr/0076-scope-knowledge-capture-retention-to-committed-assets.md)、[ADR 0077](../adr/0077-cap-knowledge-attempt-captures-per-file.md)、[ADR 0078](../adr/0078-retain-exact-cap-prefixes-on-knowledge-capture-overflow.md)、[ADR 0079](../adr/0079-stop-the-knowledge-job-after-confirmed-capture-overflow.md) 与 [ADR 0080](../adr/0080-classify-knowledge-capture-overflow-as-an-unretryable-process-failure.md)。
+- Literature capture：[ADR 0132](../adr/0132-bound-literature-reader-attempt-captures.md)。
 - cancellation 与 no-commit safe finalization：[ADR 0097](../adr/0097-prioritize-uncommitted-knowledge-ask-outcomes-as-failed-interrupted-blocked.md)、[ADR 0098](../adr/0098-use-one-cancellation-latch-and-an-atomic-pre-id-barrier.md)、[ADR 0099](../adr/0099-prove-no-commit-safety-with-a-zero-live-resource-ledger.md)、[ADR 0100](../adr/0100-seal-the-handled-cancellation-window-before-presentation.md)、[ADR 0101](../adr/0101-use-a-project-owned-native-win32-ctrl-c-bridge.md)、[ADR 0102](../adr/0102-normalize-inherited-ctrl-c-ignore-before-activation.md)、[ADR 0103](../adr/0103-require-a-read-only-conin-processed-input-capability-gate.md)、[ADR 0104](../adr/0104-continue-with-a-no-source-cancellation-profile-when-capability-is-absent.md) 与 [ADR 0105](../adr/0105-use-the-no-source-profile-when-the-current-process-is-being-debugged.md)。
 - 完整角色语义：[Literature Reader v1](./literature-reader-v1.md) 与 [Knowledge Answerer v1](./knowledge-answerer-v1.md)。
 
@@ -103,8 +104,10 @@ pipe I/O、Job、polling、final spool generation 与 resource ledger 是一个 
 | `CODEX_JOB_STOP_EXIT_DWORD_V1` | `0x475A0001`（`1,197,080,577`） | `TerminateJobObject` 和 assignment-failure `TerminateProcess` 的内部 DWORD |
 | `KNOWLEDGE_EVENTS_CAPTURE_CAP_V1` | `16,777,216` | 只属于 `knowledge_answerer_v1` |
 | `KNOWLEDGE_FINAL_CAPTURE_CAP_V1` | `1,048,576` | 只属于 `knowledge_answerer_v1` |
+| `LITERATURE_EVENTS_CAPTURE_CAP_V1` | `16,777,216` | 只属于 `literature_reader_v1` |
+| `LITERATURE_FINAL_CAPTURE_CAP_V1` | `1,048,576` | 只属于 `literature_reader_v1` |
 
-前四项不是用户配置，不进入 TOML、environment、manifest、provenance 或 CLI output。任何修改都需要新合同版本。Job stop DWORD 不得使用 `130` 或 `259`；数值偶合、进程自然返回同值或读取到该值，都不能反推 stop 原因。
+以上常量都不是用户配置，不进入 TOML、environment、manifest、provenance 或 CLI output。前四项 mechanics 常量的任何修改都需要新的 child-process 合同版本；任一角色 cap 的修改需要该角色的新合同版本。两组 cap 数值相同不表示共享所有权，也不允许一个角色通过修改另一个角色的常量改变行为。Job stop DWORD 不得使用 `130` 或 `259`；数值偶合、进程自然返回同值或读取到该值，都不能反推 stop 原因。
 
 ## 5. 进程与 handle 建立
 
@@ -243,7 +246,7 @@ orchestrator 是 attempt state、stop latch、deadline observation、Job query�
 2. 读取 cancellation observation 与同一 clock domain 的 `now`。
 3. 用 zero-time wait观察 root process；root signal后恰好一次取得最终 DWORD，之后不再用 `STILL_ACTIVE` 判活。
 4. assignment 成功后调用 `QueryInformationJobObject(JobObjectBasicAccountingInformation)` 读取 `ActiveProcesses`。
-5. 对 Knowledge final spool执行一次 best-effort active overflow probe。
+5. 对当前角色的 final spool执行一次 best-effort active overflow probe。
 6. 串行计算 stop transition、readiness 与分类 facts。
 7. 若尚未 ready，调用 `WaitForMultipleObjects(..., bWaitAll=FALSE)` 等待 `[root-process-if-not-yet-signaled, wake_event]`；timeout 为 `min(50 ms, ceil(nearest_active_absolute_deadline - now))`；尚无 active deadline 时为 `50 ms`，已经到期则为 `0`。每次 wait后都重新读取 absolute monotonic time；不得以 tick 计数累计 timeout。
 
@@ -283,7 +286,7 @@ monotonic clock/cancellation observation 自身也属于受审计的 syscall sea
 
 ### 9.1 唯一 stop latch
 
-cancel、attempt/shared deadline、Knowledge overflow、stdin/stdout lifecycle failure、Job/wait failure或外层显式 abort都只提交事实。orchestrator在第一次需要停止且 Job尚未证明为空时执行唯一 `stop_requested: false -> true` transition；worker、monitor和role classifier不得直接终止进程。
+cancel、attempt/shared deadline、role capture overflow、stdin/stdout lifecycle failure、Job/wait failure或外层显式 abort都只提交事实。orchestrator在第一次需要停止且 Job尚未证明为空时执行唯一 `stop_requested: false -> true` transition；worker、monitor和role classifier不得直接终止进程。
 
 后续 stop facts可追加审计事实，但不能再次转换状态、重写 first stop observation或竞争第二种 termination primitive。自然完成与 stop request竞态最终都用 root signal、Job empty、pipe EOF和capture finalization收敛。
 
@@ -329,25 +332,25 @@ stdout与 final source均按 binary bytes处理。transport不添加 BOM、LF、
 
 `--output-last-message` 的路径属于当前 attempt 的 fresh、唯一、writer-private staging namespace；launch前 pathname不得已有任何 entry，且不得跨 attempt复用。该文件不作为 inherited handle传给 child，Codex只通过冻结 argv得到 path。stdout绝不能补造 final，final也不能补造 events。
 
-### 10.2 Knowledge events cap
+### 10.2 角色自有 events cap
 
-Knowledge collector对每个非空 chunk依次执行：
+collector 先从 frozen capture profile 选择角色自有的 `role_events_cap`；Knowledge 与 Literature 当前分别为 `KNOWLEDGE_EVENTS_CAPTURE_CAP_V1` 和 `LITERATURE_EVENTS_CAPTURE_CAP_V1`。它对每个非空 chunk依次执行：
 
 ```text
-keep = min(len(chunk), 16,777,216 - retained_length)
+keep = min(len(chunk), role_events_cap - retained_length)
 sink.write_all(chunk[0:keep])
 if len(chunk) > keep:
     events_overflow_latch = true
 ```
 
-sink恰到 cap后仍继续 read；只有下一次实际非空 byte才锁存 overflow。锁存后继续 mechanical drain到 EOF，但 tail不解析、不hash、不进入正式资产。正式 `events.jsonl` 只能是完整实际 bytes（长度低于或等于 cap）或已证明 overflow时长度恰为 cap的 exact prefix。
+sink恰到角色 cap后仍继续 read；只有下一次实际非空 byte才锁存 overflow。锁存后继续 mechanical drain到 EOF，但 tail不解析、不hash、不进入正式资产。正式 `events.jsonl` 只能是完整实际 bytes（长度低于或等于角色 cap）或已证明 overflow时长度恰为该 cap的 exact prefix。
 
-### 10.3 Knowledge final active probe 与权威复验
+### 10.3 角色自有 final active probe 与权威复验
 
-orchestrator每个 50 ms loop至多执行一次 active probe：
+orchestrator 从 frozen capture profile 选择角色自有的 `role_final_cap`；Knowledge 与 Literature 当前分别为 `KNOWLEDGE_FINAL_CAPTURE_CAP_V1` 和 `LITERATURE_FINAL_CAPTURE_CAP_V1`。每个 50 ms loop至多执行一次 active probe：
 
 - pathname不存在、sharing violation或暂时打不开只表示“本次无可靠 observation”，不是 failure，也不证明未 overflow；
-- 成功打开时，用 `GetFileInformationByHandleEx(FileIdInfo)` 记录 generation identity，并实际读取 offset `1,048,576` 的一个 byte；只有读到该 byte才锁存 final overflow；
+- 成功打开时，用 `GetFileInformationByHandleEx(FileIdInfo)` 记录 generation identity，并实际读取 offset `role_final_cap` 的一个 byte；只有读到该 byte才锁存 final overflow；
 - metadata length只能帮助决定是否尝试，不能代替 cap+1 witness；
 - probe不读取/保留 tail，也不从 pathname拼接不同 generation。
 
@@ -355,11 +358,11 @@ Job `ActiveProcesses=0` 后，对 final pathname执行一次权威 finalization�
 
 1. 不存在且没有early overflow witness：Knowledge正式 final为0 bytes；Literature按其合同表示为“不存在条件式资产”。
 2. 存在时，以普通文件、non-reparse、exclusive read/delete handle打开；成功exclusive open是writer source已关闭的证明。取得 FileId与实际size，从offset 0以65,536-byte chunks读取。
-3. Knowledge size小于等于cap时读完全部 bytes并验证 EOF；大于cap时读取exact cap prefix与offset cap witness，锁存overflow。
+3. size小于等于角色 cap时读完全部 bytes并验证 EOF；大于角色 cap时读取exact cap prefix与offset cap witness，锁存overflow。
 4. early witness的generation与最终generation不同，旧latch不能被清除；最终generation必须独立证明overflow，否则不能形成terminal capture。early witness后source缺失、不可读或最终generation缩至不大于cap也只能留staging。
 5. authoritative handle绑定当前generation完成删除（例如以delete-on-close语义），关闭后验证private pathname不再存在；不能close后按pathname误删replacement。
 
-Knowledge formal final在overflow时恰为前1,048,576 bytes；witness与tail不进入资产。非overflow时为完整source bytes。任何final prefix都不进入Answer validation。
+任一角色的 formal final在overflow时恰为该角色 cap的 exact prefix；witness与tail不进入资产。非overflow时为完整source bytes。任何overflow final prefix都不能进入角色成功结果验证。
 
 ### 10.4 Knowledge pair、overflow与role-owned usage seam
 
@@ -382,14 +385,15 @@ usage缺失本身不产生process failure；event编码/framing/结构或collect
 
 ### 10.5 Literature capture差异
 
-Literature Reader v1现有合同要求`events.jsonl`保留实际原始bytes，并让`final_message.txt`只在attempt实际产生final时存在；它没有采用Knowledge的固定双文件、16 MiB/1 MiB retention cap、exact-prefix overflow或exact-cap usage gate。因此：
+Literature Reader v1依据 ADR 0132采用自己独立版本化的 16 MiB events cap与1 MiB final cap。它们虽然与Knowledge现值相同，却不继承Knowledge常量、固定双文件或exact-cap usage gate。因此：
 
-- 共享collector仍以65,536-byte chunks流式写private events sink，但不得套用Knowledge cap或主动截断。
-- post-close final存在时流式复制完整source；不存在时不得补0-byte `final_message.txt`。
+- 共享collector按10.2使用 `LITERATURE_EVENTS_CAPTURE_CAP_V1`；恰到 cap不是overflow，第cap+1个实际byte才锁存overflow并只保留exact prefix。
+- final存在时按10.3使用 `LITERATURE_FINAL_CAPTURE_CAP_V1`；不存在时不得补0-byte `final_message.txt`。
+- 任一Reader overflow都具有最高机械优先级；Job仍非空时只请求一次stop，安全收敛后形成不可重试`process_error`，公开Reader映射为`failed: codex_process_failed`。
 - Reader `attempt.json`、usage与failure/retry由Literature Reader v1拥有。
 - 若磁盘/capture I/O失败，仍须stop并drain；能否形成terminal Reader Run只按Reader现有持久化合同判断。
 
-这是有意防止跨bounded-context语义泄漏，不是鼓励unbounded设计。是否为Literature另设capture cap需要单独ADR/角色版本，本文不代替该决策。
+独立常量和独立验收防止跨bounded-context语义泄漏；以后改变任一 Reader cap、overflow mapping或缺失final语义，都必须升级Reader角色/合同版本，不能通过Knowledge决策旁路改变。
 
 ## 11. attempt 状态机
 
@@ -434,7 +438,7 @@ Literature Reader v1现有合同要求`events.jsonl`保留实际原始bytes，�
 所有成功取得的时间事实都属于同一 monotonic clock domain并冻结为非负 integer nanoseconds，且只有orchestrator可以冻结`classification_ready_at`。clock observation fault 按第8.2节锁存结构性 failure；缺失时间戳不得由 wall clock 或内部 fallback 冒充。每个attempt恰好执行一次以下算法：
 
 1. 若capture-finalization/lifecycle完整性门禁不成立：不分类、不返回，继续安全收尾或进入`UNSAFE_HOLD`。
-2. 任一Knowledge overflow latch为true：`process_error`。
+2. 任一适用角色的 overflow latch为true：`process_error`。
 3. 任一结构性进程/Job/wait/exit/capture/event failure为true：`process_error`。
 4. 若`cancel_observed_at <= classification_ready_at`，且`active_deadline`不存在或`cancel_observed_at <= active_deadline`：`interrupted`；相等时cancel赢。
 5. 否则若`active_deadline`存在且`active_deadline <= classification_ready_at`：`timeout`。
@@ -546,7 +550,7 @@ D01 另行冻结 test-only `CodexPipeCapacityObserverV1`。它的实现只位于
 | D25 | lifecycle failure与cancel/deadline并存且安全收尾 | process_error优先且只冻结一次 |
 | D26 | pre-commit pipe/worker/final gate fault | 无CreateProcess调用、无attempt、所有temp撤销、ledger=0 |
 | D27 | Literature无final pathname | 不补0-byte final；其余attempt资产按Reader合同形成 |
-| D28 | Literature stdout/final超过Knowledge caps | 不套用Knowledge overflow；完整流式capture或按Reader I/O failure处理 |
+| D28 | Literature events/final分别恰到Reader cap及达到Reader cap+1 | 恰到cap完整保留且无overflow；cap+1只保留Reader exact-cap prefix并锁存overflow，活跃Job只stop一次，`process_error`且不重试 |
 | D29 | 内部worker完成与wake reset以fresh Win32 wake event及fresh ledger交错一万次barrier迭代；另至少一次公开 executable attempt覆盖同一reset观察点 | 无lost wakeup、无hang、每次barrier ledger=0；公开attempt完整收敛且terminal ledger=0。这里的一万次是wake-state barrier迭代，不是一万次child launch |
 | D30 | parent有多个额外inheritable sentinel objects并并发launch两个attempt | 每个child只得到自己的三项stdio；cross-attempt无继承、prompt/capture不串线；parent authoritative sentinels全程unsignaled，且不以child裸handle数值是否复用作身份判断 |
 | D31 | real CreateProcess/Assign调用边界分别由barrier跨过cancel或既存shared deadline；另含cancel时间恰等于deadline | root始终suspended、writer只ABORT、Resume调用数为0、唯一Job stop后完整收敛；attempt保留且无started anchor，cancel同刻赢 |
@@ -563,10 +567,10 @@ D01 另行冻结 test-only `CodexPipeCapacityObserverV1`。它的实现只位于
 
 以下内容是明确边界，不允许实现静默填空：
 
-- Literature Reader v1尚未冻结capture retention cap与overflow策略；本合同只保证固定chunk流式I/O，不把Knowledge常量跨上下文传播。这是后续若要限制Reader磁盘增长时需要单独ADR/角色版本的真实缺口。
+- Literature Reader v1的独立capture retention cap与overflow策略已由 [ADR 0132](../adr/0132-bound-literature-reader-attempt-captures.md) 冻结；相同数值不构成与Knowledge共享所有权，未来Bot也不自动继承。
 - Knowledge capture-overflow 的外部 supplemental diagnostic 已由 [Knowledge Ask Observable v1](./knowledge-ask-observable-v1.md) 冻结为 `knowledge.ask.capture_overflow.v1`；本文仍只冻结内部 latch、stop 与既有 primary mapping，不拥有或扩展 diagnostic/Human 字段与 code。
 - `CreatePipe.nSize`不保证实际buffer大小；验收必须覆盖更小实际capacity。
-- final active probe是best-effort，sharing policy可使物理spool在Job退出前超过1 MiB；ADR 0076/0079本就不承诺spool物理硬上限。
+- final active probe是best-effort，sharing policy可使物理spool在Job退出前暂时超过当前角色的1 MiB cap；ADR 0076/0079与ADR 0132都只冻结正式资产上限、witness、stop和收敛语义，不承诺writer-private spool的瞬时物理硬上限。
 - plan formation到commitment之间的runtime executable、Schema与关键directory replacement/原地修改由held capability、FileIdentity、size/hash与entry-set复验拒绝。最后一次复验后，attempt-private namespace仍依赖composition提供的exclusive trusted owner；同权限外部进程的主动注入不在supported baseline，generation checks不构成对抗性sandbox。
 - Windows kernel API持续失败、assignment-failure suspended root无法终止、Job永不为空、pipe无法证明EOF、final source无法exclusive open或任一handle ownership进入`uncertain`时，模块不能伪造正常结果；它保持`UNSAFE_HOLD`/fail-safe路径，最终进程异常退出时才由`KILL_ON_JOB_CLOSE`兜底。
 - 本合同没有用Job阻止不受信任descendant主动`AllocConsole`或创建breakaway process；锁定Codex runtime不做这些行为是ADR 0106的supported baseline。

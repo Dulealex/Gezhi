@@ -20,6 +20,8 @@ from gezhi._codex_child_process import (
     CODEX_JOB_STOP_EXIT_DWORD_V1,
     KNOWLEDGE_EVENTS_CAPTURE_CAP_V1,
     KNOWLEDGE_FINAL_CAPTURE_CAP_V1,
+    LITERATURE_EVENTS_CAPTURE_CAP_V1,
+    LITERATURE_FINAL_CAPTURE_CAP_V1,
     CodexChildTestHooksV1,
     CodexChildUnsafeHoldErrorV1,
     CodexChildWin32ErrorV1,
@@ -478,25 +480,71 @@ def test_active_final_overflow_witness_requests_one_job_stop(tmp_path: Path) -> 
     assert evidence.mechanical_outcome == "process_error"
 
 
-def test_literature_does_not_inherit_knowledge_events_cap(tmp_path: Path) -> None:
-    length = KNOWLEDGE_EVENTS_CAPTURE_CAP_V1 + 1
+def test_literature_active_final_overflow_stops_before_its_deadline(
+    tmp_path: Path,
+) -> None:
     plan = _plan(
         tmp_path,
-        "events-bytes",
+        "final-overflow-hang",
+        value=LITERATURE_FINAL_CAPTURE_CAP_V1 + 1,
+        timeout_seconds=10,
+        capture_profile="literature",
+    )
+    started = time.monotonic()
+
+    evidence = run_codex_child_v1(plan, NeverCancelledV1())
+
+    assert time.monotonic() - started < 5
+    assert evidence.final_message is not None
+    assert (
+        evidence.final_message.byte_length
+        == LITERATURE_FINAL_CAPTURE_CAP_V1
+    )
+    assert evidence.final_message.overflow
+    assert evidence.stop_calls == 1
+    assert evidence.mechanical_outcome == "process_error"
+
+
+@pytest.mark.parametrize(
+    ("length", "overflow"),
+    [
+        (LITERATURE_EVENTS_CAPTURE_CAP_V1, False),
+        (LITERATURE_EVENTS_CAPTURE_CAP_V1 + 1, True),
+    ],
+)
+def test_literature_events_overflow_latches_only_on_cap_plus_one(
+    tmp_path: Path,
+    length: int,
+    overflow: bool,
+) -> None:
+    plan = _plan(
+        tmp_path,
+        "events-overflow-hang" if overflow else "events-bytes",
         value=length,
-        timeout_seconds=30,
+        timeout_seconds=5,
         capture_profile="literature",
     )
 
     evidence = run_codex_child_v1(plan, NeverCancelledV1())
 
-    assert evidence.events.byte_length == length
-    assert not evidence.events.overflow
-    assert evidence.mechanical_outcome == "clean"
+    assert evidence.events.byte_length == LITERATURE_EVENTS_CAPTURE_CAP_V1
+    assert evidence.events.overflow is overflow
+    assert evidence.stop_calls == int(overflow)
+    assert evidence.mechanical_outcome == ("process_error" if overflow else "clean")
 
 
-def test_literature_does_not_inherit_knowledge_final_cap(tmp_path: Path) -> None:
-    length = KNOWLEDGE_FINAL_CAPTURE_CAP_V1 + 1
+@pytest.mark.parametrize(
+    ("length", "overflow"),
+    [
+        (LITERATURE_FINAL_CAPTURE_CAP_V1, False),
+        (LITERATURE_FINAL_CAPTURE_CAP_V1 + 1, True),
+    ],
+)
+def test_literature_final_overflow_retains_the_exact_prefix(
+    tmp_path: Path,
+    length: int,
+    overflow: bool,
+) -> None:
     plan = _plan(
         tmp_path,
         "final-bytes",
@@ -507,9 +555,12 @@ def test_literature_does_not_inherit_knowledge_final_cap(tmp_path: Path) -> None
     evidence = run_codex_child_v1(plan, NeverCancelledV1())
 
     assert evidence.final_message is not None
-    assert evidence.final_message.byte_length == length
-    assert not evidence.final_message.overflow
-    assert evidence.mechanical_outcome == "clean"
+    assert (
+        evidence.final_message.byte_length
+        == LITERATURE_FINAL_CAPTURE_CAP_V1
+    )
+    assert evidence.final_message.overflow is overflow
+    assert evidence.mechanical_outcome == ("process_error" if overflow else "clean")
 
 
 def test_stdout_chunk_boundaries_do_not_change_raw_bytes(tmp_path: Path) -> None:

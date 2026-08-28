@@ -390,6 +390,61 @@ reader._wait_before_retry_v1 = reject_retry
     (site_root / "sitecustomize.py").write_text(source, encoding="utf-8")
 
 
+def _capture_overflow_sitecustomize(site_root: Path) -> None:
+    source = """
+import os
+import sys
+from pathlib import Path
+
+import gezhi._literature_reader as reader
+from gezhi._codex_child_process import AttemptTerminalEvidenceV1
+from gezhi._codex_child_process import NeverCancelledV1
+from gezhi._codex_child_process import _run_codex_child_test_double_v1
+from gezhi._codex_role_plan import _freeze_test_double_launch_v1
+
+
+def run_overflow(request):
+    capture_parent = request.attempt_root / "captures"
+    capture = capture_parent / f"{request.attempt_ordinal:02d}"
+    staging = capture_parent / f".{request.attempt_ordinal:02d}.codex-stage"
+    plan = _freeze_test_double_launch_v1(
+        executable=Path(sys.executable),
+        arguments=(
+            "-I",
+            "-B",
+            os.environ["READER_DOUBLE_EXE"],
+            "final-overflow-hang",
+            "--final",
+            str(staging / ".final_message.spool"),
+            "--value",
+            "1048577",
+        ),
+        prompt=request.prompt,
+        attempt_ordinal=request.attempt_ordinal,
+        working_directory=request.attempt_root / "working",
+        capture_directory=capture,
+        staging_directory=staging,
+        temporary_directory=request.attempt_root / "temporary",
+        source_environment={"SystemRoot": os.environ["SystemRoot"]},
+        timeout_seconds=10,
+        capture_profile="literature",
+    )
+    result = _run_codex_child_test_double_v1(plan, NeverCancelledV1())
+    assert isinstance(result, AttemptTerminalEvidenceV1), result
+    return result
+
+
+def reject_retry(_seconds):
+    raise AssertionError("capture overflow must not use retry backoff")
+
+
+reader._run_role_attempt_v1 = run_overflow
+reader._prepare_role_invocation_v1 = lambda: object()
+reader._wait_before_retry_v1 = reject_retry
+"""
+    (site_root / "sitecustomize.py").write_text(source, encoding="utf-8")
+
+
 def _pre_attempt_rejected_sitecustomize(site_root: Path) -> None:
     source = """
 import gezhi._literature_reader as reader
@@ -1139,6 +1194,113 @@ def test_public_resume_does_not_retry_or_guess_from_provider_error_messages(
         for line in (attempt_dir / "events.jsonl").read_bytes().splitlines()
     ]
     assert events[-1]["error"]["message"] == message
+
+
+def test_public_resume_preserves_a_bounded_capture_overflow_without_retry(
+    reader_workspace: tuple[Path, Path, Path, Path],
+) -> None:
+    literature_root, knowledge_root, pdf_path, runtime_base = reader_workspace
+    write_text_pdf(pdf_path, "Capture overflow remains bounded audit evidence.")
+    added = _run_add(literature_root, pdf_path)
+
+    canonical_site = runtime_base / "canonical-site"
+    canonical_site.mkdir()
+    _canonicalize_only_sitecustomize(canonical_site)
+    first_resume = run_launcher(
+        launcher_commands(
+            (
+                "--literature-data-root",
+                str(literature_root),
+                "literature",
+                "resume",
+                str(added["work_id"]),
+                "--json",
+            )
+        )[1],
+        pythonpath_roots=(canonical_site, SOURCE_ROOT),
+    )
+    assert first_resume.returncode == 2
+
+    site_root = runtime_base / "capture-overflow-site"
+    site_root.mkdir()
+    _capture_overflow_sitecustomize(site_root)
+    codex_home = runtime_base / "home"
+    temporary = runtime_base / "temp"
+    codex_home.mkdir()
+    temporary.mkdir()
+    completed = run_launcher(
+        launcher_commands(
+            (
+                "--literature-data-root",
+                str(literature_root),
+                "--knowledge-data-root",
+                str(knowledge_root),
+                "literature",
+                "resume",
+                str(added["work_id"]),
+                "--json",
+            )
+        )[1],
+        pythonpath_roots=(site_root, SOURCE_ROOT),
+        environment_updates={
+            "CODEX_HOME": str(codex_home),
+            "READER_DOUBLE_EXE": str(_DOUBLE),
+            "TEMP": str(temporary),
+            "TMP": str(temporary),
+        },
+        timeout=30,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stderr == b""
+    assert json.loads(completed.stdout) == {
+        "command": "literature.resume",
+        "diagnostics": [
+            {
+                "code": "literature.resume.stage_failed.v1",
+                "context": {
+                    "reason": "codex_process_failed",
+                    "stage": "read",
+                },
+            }
+        ],
+        "outcome": "failed",
+        "result": {
+            "active_source_id": added["source_id"],
+            "advanced_stages": [],
+            "pending_candidate_ids": [],
+            "pipeline_complete": False,
+            "schema_version": "gezhi.literature_resume_result.v1",
+            "start_stage": "read",
+            "stop_stage": "read",
+            "work_id": added["work_id"],
+        },
+        "schema_version": "gezhi.cli_result.v1",
+    }
+
+    source_dir = (
+        literature_root
+        / "works"
+        / str(added["work_id"])
+        / "sources"
+        / str(added["source_id"])
+    )
+    semantic = source_dir / "semantic"
+    assert not (semantic / "current.json").exists()
+    run_dirs = [path for path in (semantic / "runs").iterdir() if path.is_dir()]
+    assert len(run_dirs) == 1
+    run_dir = run_dirs[0]
+    manifest = json.loads((run_dir / "manifest.json").read_bytes())
+    assert manifest["status"] == "failed"
+    assert manifest["reason"] == "codex_process_failed"
+    assert manifest["attempt_count"] == 1
+    assert not (run_dir / "result").exists()
+    attempt_dir = run_dir / "attempts" / "01"
+    attempt = json.loads((attempt_dir / "attempt.json").read_bytes())
+    assert attempt["failure_class"] == "process_error"
+    assert (attempt_dir / "final_message.txt").read_bytes() == (
+        b"f" * 1_048_576
+    )
 
 
 @pytest.mark.parametrize("failure_case", ["invalid_json", "out_of_scope_evidence"])
