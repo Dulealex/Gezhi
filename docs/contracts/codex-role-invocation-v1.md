@@ -163,13 +163,14 @@ entries 按 canonical name 的 Unicode casefold ascending 排序，以 `name=val
 
 本合同只形成 [Codex Child Process v1](./codex-child-process-v1.md) 所需的 frozen launch plan。child module先完成 raw capture、Job tree settlement、timeout/cancel/overflow/lifecycle evidence 与 ledger=0，再返回 immutable evidence。
 
-Codex `0.146.0` raw JSONL event type/field 到 `runtime_unavailable`、`rate_limit`、`server_error`、`network` 的适配不在本文中。T14 Literature Reader 与 T22 Knowledge retry/capture adapter 必须在自己的 versioned role adapter 中：
+Codex `0.146.0` 的 `exec --json` 会把 Core 的结构化错误信息投影成只有 `message` 的 `error` / `turn.failed`，因此没有可供 role adapter 稳定区分 `runtime_unavailable`、`rate_limit`、`server_error`、`network` 或上下文不足的 machine discriminator。[ADR 0129](../adr/0129-retry-only-mechanically-classified-codex-timeouts.md) 要求 T14 Literature Reader adapter：
 
 - 只消费已经安装并冻结的 raw capture；
 - 禁止从 stderr、自然语言、exit `130`、`259` 或内部 Job DWORD猜测；
-- 遵守既有 priority/retry 合同；
-- 将未知 nonzero exit 最终映射为 `process_error`。
+- 只把 T13 terminal evidence 已机械证明的 `timeout` 作为可重试 failure class；
+- 不解析 `message`、stderr、自然语言或退出码来猜测 provider 类别；
+- 将已安全收尾的其他 provider terminal、未知 nonzero exit 与事件结构失败最终映射为 `process_error`，且不重试。
 
-因此 T13 terminal evidence 只拥有 raw capture、mechanical outcome、lifecycle facts 与可用的 monotonic anchors，不包含 role usage/metadata receipt。Literature receipt 由 T14 形成；Knowledge 的 provider/usage projection、`null`/`usage_unavailable` 与 retry receipt 由 T22 在已安装 capture 上形成。Issue T13 中的“usage/metadata receipt”交付项由这个显式的 role-owned post-capture seam 满足，而不是把 provider Schema 泄漏进共享 child module。
+因此 T13 terminal evidence 只拥有 raw capture、mechanical outcome、lifecycle facts 与可用的 monotonic anchors，不包含 role usage/metadata receipt。Literature receipt 由 T14 形成；Commitment 前由 resolver、认证或 launch-plan preflight 确认的 runtime failure 仍不创建 attempt，并保留 Reader 的 `codex_runtime_unavailable` blocked 路径。Knowledge 的 provider/usage/retry receipt 仍由 T22 拥有，但其既有 manifest Schema 与 diagnostic union 已单独冻结；T22 必须先以版本化决策解决相同 projection gap，不能从本合同推导 message parsing 或自动继承 Reader 的枚举变更。Issue T13 中的“usage/metadata receipt”交付项由这个显式的 role-owned post-capture seam 满足，而不是把 provider Schema 泄漏进共享 child module。
 
 未来 Bot 不能因复用 invocation/process module 而自动继承任一现有 role 的 provider、usage、retry、capture cap 或领域结果语义。

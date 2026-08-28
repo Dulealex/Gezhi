@@ -4,7 +4,7 @@
 
 ## 职责
 
-`literature_reader_v1` 从一个 Canonical Reading Asset 生成一个 Reading Result 与一组 Candidate Draft。它们在一次逻辑 semantic read 中由相同的 `input.jsonl`、提示词与 Schema 产生，经 Python 整体验证并转换成 Candidate Knowledge 后一起发布；任何合同或证据错误都不得部分发布。网络中断、429、5xx 或超时触发的有限 attempt 是同一次逻辑 read 的传输重试，不是第二次语义阅读。
+`literature_reader_v1` 从一个 Canonical Reading Asset 生成一个 Reading Result 与一组 Candidate Draft。它们在一次逻辑 semantic read 中由相同的 `input.jsonl`、提示词与 Schema 产生，经 Python 整体验证并转换成 Candidate Knowledge 后一起发布；任何合同或证据错误都不得部分发布。只有 T13 terminal evidence 已机械证明的超时可以触发有限 attempt；它仍是同一次逻辑 read 的传输重试，不是第二次语义阅读。
 
 相关决策：[ADR 0015](../adr/0015-normalize-reading-input-into-a-canonical-asset-bundle.md)、[ADR 0016](../adr/0016-combine-semantic-reading-and-candidate-drafting.md)、[ADR 0033](../adr/0033-use-two-isolated-codex-runtime-roles.md)、[ADR 0034](../adr/0034-version-and-snapshot-codex-prompts-and-schemas.md)。正式 Candidate 的共同合同见 [Candidate Knowledge v1](./candidate-knowledge-v1.md)。
 
@@ -98,7 +98,7 @@ json.dumps(
 
 确定性生成后的 `input.jsonl` 必须同时满足：最终实际文件大小不超过 524288 bytes（512 KiB），block record 不超过 4096 条；metadata record 不计入 block 数量。`actual_bytes=len(final_bytes)`，包含 metadata、JSON 转义、所有记录 LF 和末尾 LF；中文与 emoji 按实际 UTF-8 bytes 而不是字符数计算。524288 bytes 与 4096 blocks 合法，任一多 1 即超限。Python 在启动 Codex 前以同一份最终字节计算大小和 SHA-256，并记录两项实际值与限制值；任一超限都返回 `blocked: reader_input_too_large`，不创建 Codex attempt，也不重试。
 
-首版禁止截断、删除尾部、只取摘要、自动分块、Map-Reduce、多次语义阅读、切换模型或降低阅读质量。若输入在项目上限内但 Codex 仍报告上下文不足，则返回 `blocked: model_context_limit`，保留原始事件并等待显式 `resume`；后续长文档能力必须以独立角色版本设计，调整上限也必须升级角色版本，但无需迁移既有资产。
+首版禁止截断、删除尾部、只取摘要、自动分块、Map-Reduce、多次语义阅读、切换模型或降低阅读质量。Codex CLI `0.146.0` 不在 `exec --json` 中提供可机器判别的 context-window error；项目上限内发生的这类 attempted provider failure 与其他无结构化 discriminator 的 provider terminal 一样保守返回 `failed: codex_process_failed` 并保留原始事件，不解析错误 message。后续长文档能力必须以独立角色版本设计，调整上限或恢复专属 `model_context_limit` 都必须升级角色版本，但无需迁移既有资产。
 
 相关决策：[ADR 0042](../adr/0042-block-oversized-reader-input-without-chunking-or-truncation.md)。
 
@@ -242,8 +242,10 @@ Gezhi 自有领域 payload JSON 顶层带 `schema_version`；Gezhi 自有 JSONL 
 
 每个 Literature Codex attempt 必须满足 [ADR 0106](../adr/0106-run-command-owned-children-without-a-console.md)：commitment 前由项目 resolver 证明唯一 native CLI，随后用 no-console/no-process-group、三项 stdio handle allowlist 与 suspended→attempt-exclusive Job→resume 的唯一顺序直接创建该 root，不经 `tools/codex.ps1`、PowerShell、shell 或隐藏 `--version` child。Prompt 通过专用 stdin pipe，`--json` 原始 bytes 通过专用 stdout pipe 形成 `events.jsonl`，stderr 唯一导向 `NUL`，`--output-last-message` 仍形成本合同的 `final_message.txt`；timeout/interruption 只通过 Job-owned tree stop，child exit 不反向生成父 cancellation。
 
-每个 Codex attempt 的 wall-clock 超时为 30 分钟；首次调用后只对网络中断、429、5xx 或超时最多重试两次，退避依次为 10 秒和 30 秒，因此最多 3 个 attempt，整个 read 阶段 wall-clock 安全上限为 95 分钟。每次 attempt 必须使用完全相同且已哈希的 `input.jsonl`、`prompt.txt` 与 `schema.json`，启动全新进程和临时目录；任何 attempt 的部分输出都不进入下一次。超时必须终止整个 Codex 子进程树并保留已有 JSONL。
+每个 Codex attempt 的 wall-clock 超时为 30 分钟；首次调用后只对 T13 terminal evidence 已机械证明的 `timeout` 最多重试两次，退避依次为 10 秒和 30 秒，因此最多 3 个 attempt，整个 read 阶段 wall-clock 安全上限为 95 分钟。每次 attempt 必须使用完全相同且已哈希的 `input.jsonl`、`prompt.txt` 与 `schema.json`，启动全新进程和临时目录；任何 attempt 的部分输出都不进入下一次。超时必须终止整个 Codex 子进程树并保留已有 JSONL。
 
-三次同类瞬时故障耗尽时分别返回 `blocked: codex_timeout_exhausted`、`codex_network_exhausted`、`codex_rate_limit_exhausted` 或 `codex_server_error_exhausted`；混合瞬时故障耗尽返回 `blocked: codex_transient_exhausted`，并在 manifest 记录每次 `failure_class` 与最后一次分类。用户主动中断返回 `interrupted` 且不自动重试。未被明确分类为瞬时故障的非零退出返回 `failed: codex_process_failed`；登录、CLI/模型能力不可用继续按既定依赖规则返回 blocked，Schema、证据、Descriptor、身份或预算错误返回 failed，均不自动重试。
+实际 timeout attempts 耗尽时返回 `blocked: codex_timeout_exhausted`，manifest 记录每次 `failure_class=timeout`。用户主动中断返回 `interrupted` 且不自动重试。已安全收尾的其他 provider terminal、未知非零退出、capture overflow 或事件结构故障统一使用 `failure_class=process_error` 与 `failed: codex_process_failed`，不自动重试，也不得从 message、stderr 或退出码猜测 network、429、5xx、runtime 或 context-window 类别。Commitment 前由 project resolver、认证或 launch-plan preflight 明确确认的 CLI/模型/能力不可用仍返回 `blocked: codex_runtime_unavailable` 且不创建 attempt；Schema、证据、Descriptor、身份或预算错误返回 failed，均不自动重试。
+
+该保守分类由 [ADR 0129](../adr/0129-retry-only-mechanically-classified-codex-timeouts.md) 冻结。V1 不再拥有 `model_context_limit`、`codex_network_exhausted`、`codex_rate_limit_exhausted`、`codex_server_error_exhausted` 或 `codex_transient_exhausted` 终态。
 
 只有 Codex 正常退出、最终 JSON 存在且 Schema、Evidence Block、Descriptor 与 Candidate 校验全部通过，semantic run 才能发布成功结果；超时前即使产生看似完整的 JSON 也不得发布。每个 attempt 记录 `input_tokens`、`cached_input_tokens`、`output_tokens`、`reasoning_output_tokens`、`started_at`、`finished_at`、`elapsed_ms`、`exit_code` 与 `failure_class`，manifest 同时保存逐次值与总计。CLI 未提供的 token 字段记为 `null` 并设置 `usage_unavailable`，不得因此使有效结果失败；首版不估算金额，也不依据模型自报 token 数中途终止。

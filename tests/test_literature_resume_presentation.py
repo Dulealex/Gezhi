@@ -100,13 +100,13 @@ def test_resume_null_result_primary_has_only_catalog_reason_and_next_action() ->
     ]
 
 
-def test_resume_stage_matrix_has_18_blocked_and_25_failed_sealed_witnesses() -> None:
+def test_resume_stage_matrix_has_13_blocked_and_25_failed_sealed_witnesses() -> None:
     matrices = (
         (
             "blocked",
             "literature.resume.stage_blocked.v1",
             commands._RESUME_STAGE_BLOCKED,
-            18,
+            13,
         ),
         (
             "failed",
@@ -154,6 +154,13 @@ def test_resume_stage_matrix_has_18_blocked_and_25_failed_sealed_witnesses() -> 
                 "reason": reason,
                 "stage": stage,
             }
+    read_blocked = set(commands._RESUME_STAGE_BLOCKED["read"])
+    assert read_blocked == {
+        "reader_prerequisite_unavailable",
+        "reader_input_too_large",
+        "codex_runtime_unavailable",
+        "codex_timeout_exhausted",
+    }
 
 
 def test_awaiting_review_can_follow_successful_authorized_backlog() -> None:

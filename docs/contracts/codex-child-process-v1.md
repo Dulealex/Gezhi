@@ -438,8 +438,8 @@ Literature Reader v1现有合同要求`events.jsonl`保留实际原始bytes，�
 3. 任一结构性进程/Job/wait/exit/capture/event failure为true：`process_error`。
 4. 若`cancel_observed_at <= classification_ready_at`，且`active_deadline`不存在或`cancel_observed_at <= active_deadline`：`interrupted`；相等时cancel赢。
 5. 否则若`active_deadline`存在且`active_deadline <= classification_ready_at`：`timeout`。
-6. 否则按既有role provider priority分类；Knowledge为`runtime_unavailable > rate_limit > server_error > network`。
-7. 否则unknown nonzero exit：`process_error`；exit 0且无failure：`null`。
+6. 否则只允许 role adapter 消费其版本化合同明确批准的结构化 provider discriminator；Codex CLI `0.146.0` 的 V1 role 没有这类字段，因此本步不产生分类。
+7. 否则已安全收尾的 provider terminal或unknown nonzero exit：`process_error`；exit 0且无failure：`null`。
 
 `active_deadline`是可选值：成功 resume 后取派生 attempt deadline 与既存/新建 shared absolute deadline 中较早者；成功 resume 前只能是 plan 已携带的既存 shared deadline；两者都不存在时 deadline 条件视为不成立，而 cancel 与 `classification_ready_at` 仍可独立裁决。poll晚到不会移动deadline，也不会令晚观察的自然exit倒赢。
 

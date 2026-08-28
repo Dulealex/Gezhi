@@ -11,7 +11,7 @@ import subprocess
 import time
 import uuid
 import zlib
-from collections.abc import Collection, Iterable, Iterator
+from collections.abc import Collection, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -356,11 +356,7 @@ def _recovery_name_sha256_v1(name: str) -> int:
         raise _RecoveryCertaintyLostV1(
             "OCR recovery namespace name is invalid"
         ) from error
-    framed = (
-        b"gezhi.ocr.recovery-name.v1\0"
-        + len(encoded).to_bytes(8, "big")
-        + encoded
-    )
+    framed = b"gezhi.ocr.recovery-name.v1\0" + len(encoded).to_bytes(8, "big") + encoded
     return int.from_bytes(hashlib.sha256(framed).digest(), "big")
 
 
@@ -446,26 +442,18 @@ def _inventory_current_namespace_v1(path: Path) -> _CurrentNamespaceInventoryV1:
     for name in _iter_recovery_entry_names_v1(path):
         if name == "runs":
             if has_runs:
-                raise _RecoveryCertaintyLostV1(
-                    "OCR current namespace is ambiguous"
-                )
+                raise _RecoveryCertaintyLostV1("OCR current namespace is ambiguous")
             has_runs = True
         elif name == "current.json":
             if has_current:
-                raise _RecoveryCertaintyLostV1(
-                    "OCR current namespace is ambiguous"
-                )
+                raise _RecoveryCertaintyLostV1("OCR current namespace is ambiguous")
             has_current = True
         elif _CURRENT_TEMP_NAME.fullmatch(name) is not None:
             if temporary_name is not None:
-                raise _RecoveryCertaintyLostV1(
-                    "OCR current namespace is ambiguous"
-                )
+                raise _RecoveryCertaintyLostV1("OCR current namespace is ambiguous")
             temporary_name = name
         else:
-            raise _RecoveryCertaintyLostV1(
-                "OCR current namespace is ambiguous"
-            )
+            raise _RecoveryCertaintyLostV1("OCR current namespace is ambiguous")
         digest = _recovery_name_sha256_v1(name)
         count += 1
         xor_digest ^= digest
@@ -525,9 +513,7 @@ def _copy_source_to_private_input(
     try:
         with (
             open_validated_data_root_v1(str(destination.parent)),
-            open_validated_local_file_v1(
-                str(authority.original_pdf_path)
-            ) as source,
+            open_validated_local_file_v1(str(authority.original_pdf_path)) as source,
             destination.open("xb", buffering=0) as target,
         ):
             for chunk in source.iter_verified_chunks_v1():
@@ -682,8 +668,7 @@ def _stage_for_provider_output(output_root: Path) -> Path | None:
 
 def _provider_budget_roots(stage: Path) -> tuple[Path, ...]:
     attempts = tuple(
-        stage / "attempts" / attempt / "provider_output"
-        for attempt in ("1", "2")
+        stage / "attempts" / attempt / "provider_output" for attempt in ("1", "2")
     )
     return attempts + (stage / "output" / "mineru",)
 
@@ -714,9 +699,7 @@ def _scan_ocr_artifact_tree(root: Path) -> tuple[int, int]:
                 or not stat.S_ISDIR(directory_stat.st_mode)
                 or identity in seen
             ):
-                raise _OcrArtifactBudgetExceededV1(
-                    "OCR artifact namespace is unsafe"
-                )
+                raise _OcrArtifactBudgetExceededV1("OCR artifact namespace is unsafe")
             seen.add(identity)
         except _OcrArtifactBudgetExceededV1:
             raise
@@ -850,9 +833,7 @@ def _run_ocr_attempt_v1(
         output_limit=_OCR_OUTPUT_LIMIT,
         creation_flags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         progress_guard=(
-            None
-            if stage is None
-            else lambda: _enforce_ocr_artifact_budget_v1(stage)
+            None if stage is None else lambda: _enforce_ocr_artifact_budget_v1(stage)
         ),
     )
     return OcrAttemptResultV1(
@@ -1089,9 +1070,8 @@ def _valid_v1_content_payload(
     if item_type in _CONTENT_LIST_TEXT_TYPES:
         return type(item.get("text")) is str
     if item_type == "list":
-        return (
-            type(item.get("sub_type")) is str
-            and _valid_string_list(item.get("list_items"))
+        return type(item.get("sub_type")) is str and _valid_string_list(
+            item.get("list_items")
         )
     if item_type == "equation":
         return _valid_provider_image_path(item.get("img_path"), provider_paths) and (
@@ -1108,9 +1088,7 @@ def _valid_v1_content_payload(
             type(item.get("sub_type")) is str
             and _valid_string_list(item.get("code_caption"))
             and _valid_string_list(item.get("code_footnote"))
-            and (
-                "code_body" not in item or type(item.get("code_body")) is str
-            )
+            and ("code_body" not in item or type(item.get("code_body")) is str)
         )
     return False
 
@@ -1176,19 +1154,13 @@ def _valid_v2_content_payload(
             _valid_v2_span_list(content.get(f"{item_type}_caption"))
             and _valid_v2_span_list(content.get(f"{item_type}_content"))
             and _valid_v2_span_list(content.get(f"{item_type}_footnote"))
-            and (
-                item_type != "code"
-                or type(content.get("code_language")) is str
-            )
+            and (item_type != "code" or type(content.get("code_language")) is str)
         )
     if item_type in {"list", "index"}:
         return (
             content.get("list_type") in {"reference_list", "text_list"}
             and _valid_v2_list_items(content.get("list_items"))
-            and (
-                "attribute" not in content
-                or type(content.get("attribute")) is str
-            )
+            and ("attribute" not in content or type(content.get("attribute")) is str)
         )
     return False
 
@@ -1199,22 +1171,15 @@ def _valid_middle_span_v1(
 ) -> bool:
     if (
         type(value) is not dict
-        or value.get("type")
-        not in _MIDDLE_TEXT_SPAN_TYPES | _MIDDLE_IMAGE_SPAN_TYPES
+        or value.get("type") not in _MIDDLE_TEXT_SPAN_TYPES | _MIDDLE_IMAGE_SPAN_TYPES
         or not _valid_provider_bbox(value.get("bbox"))
     ):
         return False
     span = cast(dict[str, object], value)
     span_type = cast(str, span["type"])
     if span_type in _MIDDLE_IMAGE_SPAN_TYPES:
-        if (
-            not _valid_middle_image_path_v1(
-                span.get("image_path"), provider_paths
-            )
-            or (
-                "score" in span
-                and not _valid_unit_score(span.get("score"))
-            )
+        if not _valid_middle_image_path_v1(span.get("image_path"), provider_paths) or (
+            "score" in span and not _valid_unit_score(span.get("score"))
         ):
             return False
     elif type(span.get("content")) is not str or not _valid_unit_score(
@@ -1225,9 +1190,8 @@ def _valid_middle_span_v1(
         return False
     if "width" not in span and "height" not in span:
         return True
-    return (
-        _valid_positive_dimension(span.get("width"))
-        and _valid_positive_dimension(span.get("height"))
+    return _valid_positive_dimension(span.get("width")) and _valid_positive_dimension(
+        span.get("height")
     )
 
 
@@ -1322,9 +1286,7 @@ def _validate_middle_document(
             or len(size) != 2
             or not all(_valid_positive_dimension(item) for item in size)
             or not _valid_middle_blocks_v1(page.get("para_blocks"), provider_paths)
-            or not _valid_middle_blocks_v1(
-                page.get("discarded_blocks"), provider_paths
-            )
+            or not _valid_middle_blocks_v1(page.get("discarded_blocks"), provider_paths)
         ):
             raise _OcrOutputInvalidV1("MinerU middle page is invalid")
     return len(pages)
@@ -1447,9 +1409,7 @@ def _pdf_matrix_v1(
         )
     except (TypeError, ValueError) as error:
         raise _OcrOutputInvalidV1("MinerU PDF Form matrix is invalid") from error
-    if len(coordinates) != 6 or not all(
-        math.isfinite(item) for item in coordinates
-    ):
+    if len(coordinates) != 6 or not all(math.isfinite(item) for item in coordinates):
         raise _OcrOutputInvalidV1("MinerU PDF Form matrix is invalid")
     return cast(tuple[float, float, float, float, float, float], coordinates)
 
@@ -1509,9 +1469,7 @@ def _decoded_pdf_stream_hashes_v1(
     if type(payload) is not bytes:
         raise _OcrOutputInvalidV1("MinerU PDF content stream is invalid")
     filter_value = _single_pdf_filter_value_v1(resolved.get("/Filter"))
-    decode_parameters = _single_pdf_filter_value_v1(
-        resolved.get("/DecodeParms")
-    )
+    decode_parameters = _single_pdf_filter_value_v1(resolved.get("/DecodeParms"))
     if filter_value is None:
         if decode_parameters is not None:
             raise _OcrOutputInvalidV1("MinerU PDF decode parameters are invalid")
@@ -1529,10 +1487,7 @@ def _decoded_pdf_stream_hashes_v1(
         raise _OcrOutputInvalidV1("MinerU PDF content filter is unsupported")
     budget[0] += 1
     budget[1] += len(decoded)
-    if (
-        budget[0] > _OCR_ARTIFACT_FILE_COUNT_LIMIT
-        or budget[1] > _OCR_PDF_FILE_LIMIT
-    ):
+    if budget[0] > _OCR_ARTIFACT_FILE_COUNT_LIMIT or budget[1] > _OCR_PDF_FILE_LIMIT:
         raise _OcrOutputInvalidV1("MinerU PDF content exceeds its limit")
     return (hashlib.sha256(decoded).hexdigest(),)
 
@@ -1583,9 +1538,7 @@ def _pdf_xobject_evidence_v1(
                     raise _OcrOutputInvalidV1("MinerU PDF Form is invalid")
                 stream_sha256 = decoded[0]
                 bbox = _pdf_form_bbox_v1(xobject.get("/BBox"))
-                matrix = _pdf_matrix_v1(
-                    xobject.get("/Matrix", [1, 0, 0, 1, 0, 0])
-                )
+                matrix = _pdf_matrix_v1(xobject.get("/Matrix", [1, 0, 0, 1, 0, 0]))
                 form_type_value = xobject.get("/FormType", 1)
                 if (
                     not isinstance(form_type_value, int)
@@ -1611,9 +1564,7 @@ def _pdf_xobject_evidence_v1(
                     or type(height_value) is bool
                     or int(height_value) <= 0
                 ):
-                    raise _OcrOutputInvalidV1(
-                        "MinerU PDF Image dimensions are invalid"
-                    )
+                    raise _OcrOutputInvalidV1("MinerU PDF Image dimensions are invalid")
                 width = int(width_value)
                 height = int(height_value)
             else:
@@ -1691,10 +1642,7 @@ def _validate_pdf_output(
         with open_validated_local_file_v1(str(path)) as stable:
             if stable.size > _OCR_PDF_FILE_LIMIT:
                 raise _OcrOutputInvalidV1("MinerU PDF exceeds its limit")
-            if (
-                expected_byte_length is not None
-                and stable.size != expected_byte_length
-            ):
+            if expected_byte_length is not None and stable.size != expected_byte_length:
                 raise _OcrOutputInvalidV1("MinerU source PDF length differs")
             payload = stable.read_bytes_v1(limit=_OCR_PDF_FILE_LIMIT)
         if (
@@ -1724,8 +1672,7 @@ def _validate_provider_images(leaf: Path, paths: Collection[str]) -> None:
         payload = _read_safe_bytes(leaf / Path(path), limit=_OCR_IMAGE_FILE_LIMIT)
         suffix = Path(path).suffix.casefold()
         if (
-            suffix in {".jpg", ".jpeg"}
-            and not payload.startswith(b"\xff\xd8\xff")
+            suffix in {".jpg", ".jpeg"} and not payload.startswith(b"\xff\xd8\xff")
         ) or (suffix == ".png" and not payload.startswith(b"\x89PNG\r\n\x1a\n")):
             raise _OcrOutputInvalidV1("MinerU image output is invalid")
 
@@ -1856,10 +1803,14 @@ def _media_type(path: str) -> str:
 
 
 def _is_provider_asset(path: str) -> bool:
-    return path.startswith("output/mineru/") or re.match(
-        r"^attempts/[12]/provider_output/",
-        path,
-    ) is not None
+    return (
+        path.startswith("output/mineru/")
+        or re.match(
+            r"^attempts/[12]/provider_output/",
+            path,
+        )
+        is not None
+    )
 
 
 def _asset_entries(run_dir: Path) -> list[dict[str, object]]:
@@ -1964,9 +1915,7 @@ def _write_terminal_receipt(
 ) -> dict[str, object]:
     receipt = {
         "attempt_count": attempt_count,
-        "input_fingerprint_sha256": input_document[
-            "input_fingerprint_sha256"
-        ],
+        "input_fingerprint_sha256": input_document["input_fingerprint_sha256"],
         "method": selection.method,
         "reason": reason,
         "run_id": run_id,
@@ -2043,9 +1992,7 @@ def _validate_selection(value: dict[str, object]) -> OcrMethod:
             type(page_count) is not int
             or page_count <= 0
             or len(frozen_counts) != page_count
-            or not any(
-                count < _MINIMUM_NON_WHITESPACE for count in frozen_counts
-            )
+            or not any(count < _MINIMUM_NON_WHITESPACE for count in frozen_counts)
         ):
             raise _RunInvalidV1("low-text OCR selection is invalid")
     elif reason == "native_text_proof_unavailable":
@@ -2080,16 +2027,16 @@ def _validate_input(
         or type(profile) is not str
         or _SHA256.fullmatch(profile) is None
         or value["schema_version"] != "gezhi.literature_ocr_input.v1"
-        or value["selection_sha256"]
-        != hashlib.sha256(selection_bytes).hexdigest()
+        or value["selection_sha256"] != hashlib.sha256(selection_bytes).hexdigest()
         or value["source_id"] != authority.source_id
-        or value["source_manifest_sha256"]
-        != authority.source_manifest_sha256
+        or value["source_manifest_sha256"] != authority.source_manifest_sha256
         or value["source_sha256"] != authority.source_sha256
         or value["work_id"] != authority.work_id
     ):
         raise _RunInvalidV1("OCR input is invalid")
-    identity = {key: item for key, item in value.items() if key != "input_fingerprint_sha256"}
+    identity = {
+        key: item for key, item in value.items() if key != "input_fingerprint_sha256"
+    }
     if hashlib.sha256(_canonical_json_bytes(identity)).hexdigest() != fingerprint:
         raise _RunInvalidV1("OCR input fingerprint is invalid")
     return cast(str, fingerprint), cast(str, profile)
@@ -2140,9 +2087,7 @@ def _validate_attempts(
             raise _RunInvalidV1("OCR attempt capture is unsafe") from error
         if "provider_output" in names:
             try:
-                with open_validated_data_root_v1(
-                    str(attempt_dir / "provider_output")
-                ):
+                with open_validated_data_root_v1(str(attempt_dir / "provider_output")):
                     pass
             except DataRootOpenErrorV1 as error:
                 raise _RunInvalidV1("OCR partial output is unsafe") from error
@@ -2165,8 +2110,7 @@ def _validate_attempts(
                 "succeeded",
                 "timed_out",
             }
-            or document.get("schema_version")
-            != "gezhi.literature_ocr_attempt.v1"
+            or document.get("schema_version") != "gezhi.literature_ocr_attempt.v1"
             or (
                 outcome in {"process_failed", "succeeded", "output_invalid"}
                 and type(returncode) is not int
@@ -2184,8 +2128,7 @@ def _validate_attempts(
             or (outcome == "output_invalid" and returncode != 0)
             or (outcome == "process_failed" and returncode == 0)
             or (
-                outcome == "output_limit_exceeded"
-                and capture_size != _OCR_OUTPUT_LIMIT
+                outcome == "output_limit_exceeded" and capture_size != _OCR_OUTPUT_LIMIT
             )
         ):
             raise _RunInvalidV1("OCR attempt receipt is invalid")
@@ -2221,9 +2164,7 @@ def _load_run(
 ) -> _ValidatedRunV1:
     if _RUN_ID.fullmatch(run_id) is None:
         raise _RunInvalidV1("OCR run ID is invalid")
-    selection, selection_bytes = _read_canonical_document(
-        run_dir / "selection.json"
-    )
+    selection, selection_bytes = _read_canonical_document(run_dir / "selection.json")
     method = _validate_selection(selection)
     input_value, _input_bytes = _read_canonical_document(run_dir / "input.json")
     fingerprint, profile = _validate_input(
@@ -2255,8 +2196,7 @@ def _load_run(
         or receipt["input_fingerprint_sha256"] != fingerprint
         or receipt["method"] != method
         or receipt["run_id"] != run_id
-        or receipt["schema_version"]
-        != "gezhi.literature_ocr_run_receipt.v1"
+        or receipt["schema_version"] != "gezhi.literature_ocr_run_receipt.v1"
         or receipt["source_id"] != authority.source_id
         or receipt["work_id"] != authority.work_id
         or (reason is not None and type(reason) is not str)
@@ -2322,8 +2262,7 @@ def _load_run(
                     or page.get("page_index") != index
                     or type(page.get("text")) is not str
                     or sum(
-                        not character.isspace()
-                        for character in cast(str, page["text"])
+                        not character.isspace() for character in cast(str, page["text"])
                     )
                     != counts[index]
                 ):
@@ -2431,16 +2370,16 @@ def _replace_current_from_preserved_link_v1(
 ) -> None:
     try:
         os.replace(replacement, ocr_dir / "current.json")
-        if _read_safe_bytes(
-            ocr_dir / "current.json",
-            limit=len(payload),
-        ) != payload:
+        if (
+            _read_safe_bytes(
+                ocr_dir / "current.json",
+                limit=len(payload),
+            )
+            != payload
+        ):
             raise OSError("OCR current readback differs")
         inventory = _inventory_current_namespace_v1(ocr_dir)
-        if (
-            not inventory.has_current
-            or inventory.temporary_name != temporary.name
-        ):
+        if not inventory.has_current or inventory.temporary_name != temporary.name:
             raise OSError("OCR current namespace differs after replacement")
         with open_validated_data_root_v1(str(ocr_dir)):
             temporary.unlink()
@@ -2462,9 +2401,7 @@ def _atomic_replace_current(
     _write_current_staging_v1(temporary, payload)
     inventory = _inventory_current_namespace_v1(ocr_dir)
     if inventory.temporary_name != temporary.name:
-        raise _RecoveryCertaintyLostV1(
-            "OCR current replacement evidence is ambiguous"
-        )
+        raise _RecoveryCertaintyLostV1("OCR current replacement evidence is ambiguous")
     replacement = _create_current_replace_copy_v1(
         ocr_dir / "runs" / ".staging",
         payload,
@@ -2510,8 +2447,7 @@ def _load_current_document_run_v1(
     run_id = cast(str, current["run_id"])
     run = _load_run(runs_dir / run_id, run_id, authority)
     if (
-        current.get("input_fingerprint_sha256")
-        != run.input_fingerprint_sha256
+        current.get("input_fingerprint_sha256") != run.input_fingerprint_sha256
         or current.get("manifest_sha256") != run.manifest_sha256
         or run.status != "succeeded"
     ):
@@ -2531,23 +2467,15 @@ def _load_current_run(
     temporary_name = inventory.temporary_name
     if temporary_name is None:
         if not inventory.has_current:
-            if (
-                _inventory_current_namespace_v1(ocr_dir).snapshot
-                != inventory.snapshot
-            ):
-                raise _RecoveryCertaintyLostV1(
-                    "OCR current namespace changed"
-                )
+            if _inventory_current_namespace_v1(ocr_dir).snapshot != inventory.snapshot:
+                raise _RecoveryCertaintyLostV1("OCR current namespace changed")
             return None, False
         run, _current_bytes = _load_current_document_run_v1(
             ocr_dir / "current.json",
             runs_dir,
             authority,
         )
-        if (
-            _inventory_current_namespace_v1(ocr_dir).snapshot
-            != inventory.snapshot
-        ):
+        if _inventory_current_namespace_v1(ocr_dir).snapshot != inventory.snapshot:
             raise _RecoveryCertaintyLostV1("OCR current namespace changed")
         return run, False
 
@@ -2568,9 +2496,7 @@ def _load_current_run(
         or matching_successes[0].run_id != temporary_run.run_id
         or matching_successes[0].manifest_sha256 != temporary_run.manifest_sha256
     ):
-        raise _RecoveryCertaintyLostV1(
-            "OCR current staging success is not unique"
-        )
+        raise _RecoveryCertaintyLostV1("OCR current staging success is not unique")
     if inventory.has_current:
         try:
             current_run, current_bytes = _load_current_document_run_v1(
@@ -2587,23 +2513,15 @@ def _load_current_run(
             or current_run.run_id != temporary_run.run_id
             or current_run.manifest_sha256 != temporary_run.manifest_sha256
         ):
-            raise _RecoveryCertaintyLostV1(
-                "OCR current and staging evidence conflict"
-            )
-    if (
-        _inventory_current_namespace_v1(ocr_dir).snapshot
-        != inventory.snapshot
-    ):
+            raise _RecoveryCertaintyLostV1("OCR current and staging evidence conflict")
+    if _inventory_current_namespace_v1(ocr_dir).snapshot != inventory.snapshot:
         raise _RecoveryCertaintyLostV1("OCR current namespace changed")
     replacement = _create_current_replace_copy_v1(
         runs_dir / ".staging",
         temporary_bytes,
     )
     _fresh_authority_or_stop(authority, root)
-    if (
-        _inventory_current_namespace_v1(ocr_dir).snapshot
-        != inventory.snapshot
-    ):
+    if _inventory_current_namespace_v1(ocr_dir).snapshot != inventory.snapshot:
         raise _RecoveryCertaintyLostV1("OCR current namespace changed")
     _replace_current_from_preserved_link_v1(
         ocr_dir,
@@ -2695,17 +2613,13 @@ def _inventory_matching_successes(
     staged: tuple[_ValidatedRunV1, ...],
     formal_snapshot: _RecoveryNamespaceSnapshotV1,
 ) -> tuple[_ValidatedRunV1, ...]:
-    if (
-        _snapshot_formal_run_namespace_v1(runs_dir) != formal_snapshot
-    ):
+    if _snapshot_formal_run_namespace_v1(runs_dir) != formal_snapshot:
         raise _RecoveryCertaintyLostV1("OCR formal namespace changed")
     formal, first_invalid = _matching_success_runs(
         runs_dir,
         authority,
     )
-    if (
-        _snapshot_formal_run_namespace_v1(runs_dir) != formal_snapshot
-    ):
+    if _snapshot_formal_run_namespace_v1(runs_dir) != formal_snapshot:
         raise _RecoveryCertaintyLostV1("OCR formal namespace changed")
     matches = formal + staged
     if len(matches) > 1:
@@ -2725,10 +2639,9 @@ def _recover_unique_staged_success(
     if run.path.parent != staging_dir:
         return run
     _fresh_authority_or_stop(authority, root)
-    if (
-        not _recovery_name_exists_v1(staging_dir, run.run_id)
-        or _recovery_name_exists_v1(runs_dir, run.run_id)
-    ):
+    if not _recovery_name_exists_v1(
+        staging_dir, run.run_id
+    ) or _recovery_name_exists_v1(runs_dir, run.run_id):
         raise _RecoveryCertaintyLostV1("OCR recovery namespace changed")
     target = runs_dir / run.run_id
     try:
@@ -2750,9 +2663,8 @@ def _create_unique_stage(
     staging_dir: Path,
     runs_dir: Path,
 ) -> None:
-    if (
-        _recovery_name_exists_v1(staging_dir, stage.name)
-        or _recovery_name_exists_v1(runs_dir, stage.name)
+    if _recovery_name_exists_v1(staging_dir, stage.name) or _recovery_name_exists_v1(
+        runs_dir, stage.name
     ):
         raise _RecoveryCertaintyLostV1("OCR run ID collides with its namespace")
     try:
@@ -2878,9 +2790,7 @@ def _commit_run(
     try:
         return _load_run(target, run_id, authority)
     except _RunInvalidV1 as error:
-        raise _RecoveryCertaintyLostV1(
-            "OCR committed run cannot be proven"
-        ) from error
+        raise _RecoveryCertaintyLostV1("OCR committed run cannot be proven") from error
 
 
 def _publish_native_success(
@@ -3308,6 +3218,8 @@ def resume_work(
     work_id: str,
     *,
     root: ValidatedDataRootV1,
+    knowledge_root: Path | None = None,
+    source_environment: Mapping[str, str] | None = None,
 ) -> ResumeWorkResultV1:
     if type(work_id) is not str or _WORK_ID.fullmatch(work_id) is None:
         raise ResumeStoppedV1("blocked", "work_invalid")
@@ -3344,9 +3256,7 @@ def resume_work(
                     method=ocr_run.method,
                     run_id=ocr_run.run_id,
                     run_directory=ocr_run.path,
-                    input_fingerprint_sha256=(
-                        ocr_run.input_fingerprint_sha256
-                    ),
+                    input_fingerprint_sha256=(ocr_run.input_fingerprint_sha256),
                     manifest_sha256=ocr_run.manifest_sha256,
                 ),
                 root=root,
@@ -3388,20 +3298,55 @@ def resume_work(
             *(("canonicalize",) if canonical.advanced else ()),
         )
         start_stage: ResumeStage = (
-            "ocr"
-            if ocr_advanced
-            else "canonicalize"
-            if canonical.advanced
-            else "read"
+            "ocr" if ocr_advanced else "canonicalize" if canonical.advanced else "read"
         )
-        _stop_stage(
-            authority,
-            root,
-            start_stage=start_stage,
-            advanced_stages=advanced_stages,
-            outcome="blocked",
-            stage="read",
-            reason="reader_prerequisite_unavailable",
+        if knowledge_root is None or source_environment is None:
+            _stop_stage(
+                authority,
+                root,
+                start_stage=start_stage,
+                advanced_stages=advanced_stages,
+                outcome="blocked",
+                stage="read",
+                reason="reader_prerequisite_unavailable",
+            )
+        from gezhi._literature_reader import (
+            ReaderRecoveryUncertainV1,
+            ReaderStageStoppedV1,
+            advance_reader_v1,
+        )
+
+        try:
+            reader = advance_reader_v1(
+                authority,
+                canonical.current,
+                root=root,
+                knowledge_root=knowledge_root,
+                source_environment=source_environment,
+            )
+        except ReaderStageStoppedV1 as error:
+            _stop_stage(
+                authority,
+                root,
+                start_stage=start_stage,
+                advanced_stages=advanced_stages,
+                outcome=error.outcome,
+                stage="read",
+                reason=error.reason,
+            )
+        except ReaderRecoveryUncertainV1 as error:
+            raise ResumeStoppedV1("failed", "recovery_failed") from error
+        return ResumeWorkResultV1(
+            active_source_id=authority.source_id,
+            advanced_stages=(
+                *advanced_stages,
+                *(("read",) if reader.advanced else ()),
+            ),
+            pending_candidate_ids=reader.pending_candidate_ids,
+            pipeline_complete=not reader.pending_candidate_ids,
+            start_stage=start_stage if reader.advanced else "complete",
+            stop_stage=("review" if reader.pending_candidate_ids else "complete"),
+            work_id=authority.work_id,
         )
     finally:
         owner.close()

@@ -49,13 +49,8 @@ _RESUME_STAGE_BLOCKED = {
     "read": (
         "reader_prerequisite_unavailable",
         "reader_input_too_large",
-        "model_context_limit",
         "codex_runtime_unavailable",
         "codex_timeout_exhausted",
-        "codex_network_exhausted",
-        "codex_rate_limit_exhausted",
-        "codex_server_error_exhausted",
-        "codex_transient_exhausted",
     ),
     "review": ("awaiting_review",),
     "handoff": ("handoff_blocked",),
@@ -376,9 +371,7 @@ def run_add(
         receipt = _stopped_receipt("blocked", "configuration_invalid")
     else:
         try:
-            root = open_validated_data_root_v1(
-                configuration.literature_data_root
-            )
+            root = open_validated_data_root_v1(configuration.literature_data_root)
         except DataRootOpenErrorV1 as error:
             receipt = _stopped_receipt(
                 "blocked",
@@ -483,9 +476,7 @@ def _validate_resume_result(value: object) -> dict[str, object]:
         if not returned_from_review_backlog and (
             start_index > stop_index
             or any(
-                not start_index
-                <= _RESUME_STAGES.index(cast(str, stage))
-                <= stop_index
+                not start_index <= _RESUME_STAGES.index(cast(str, stage)) <= stop_index
                 for stage in advanced
             )
         ):
@@ -765,8 +756,7 @@ def build_resume_human_buffer_v1(receipt: ResumeReceiptV1) -> bytes:
             for candidate_id in cast(list[str], result["pending_candidate_ids"]):
                 for action in ("accept", "reject", "defer"):
                     lines.append(
-                        "审核命令：gezhi literature review "
-                        f"{candidate_id} --{action}"
+                        f"审核命令：gezhi literature review {candidate_id} --{action}"
                     )
         reason, next_action = _RESUME_HUMAN_CATALOG[code]
         if "data_root" in context:
@@ -835,9 +825,7 @@ def run_resume(
         receipt = _resume_stopped_receipt("blocked", "configuration_invalid")
     else:
         try:
-            root = open_validated_data_root_v1(
-                configuration.literature_data_root
-            )
+            root = open_validated_data_root_v1(configuration.literature_data_root)
         except DataRootOpenErrorV1 as error:
             receipt = _resume_stopped_receipt(
                 "blocked",
@@ -851,7 +839,12 @@ def run_resume(
 
             with root:
                 try:
-                    result = resume_work(work_id, root=root)
+                    result = resume_work(
+                        work_id,
+                        root=root,
+                        knowledge_root=Path(configuration.knowledge_data_root),
+                        source_environment=os.environ.copy(),
+                    )
                 except ResumeStoppedV1 as error:
                     receipt = _resume_stopped_receipt(
                         error.outcome,
