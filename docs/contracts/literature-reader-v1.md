@@ -4,9 +4,9 @@
 
 ## 职责
 
-`literature_reader_v1` 从一个 Canonical Reading Asset 生成一个 Reading Result 与一组 Candidate Draft。它们在一次逻辑 semantic read 中由相同的 `input.jsonl`、提示词与 Schema 产生，经 Python 整体验证并转换成 Candidate Knowledge 后一起发布；任何合同或证据错误都不得部分发布。只有 T13 terminal evidence 已机械证明的超时可以触发有限 attempt；它仍是同一次逻辑 read 的传输重试，不是第二次语义阅读。
+`literature_reader_v1` 从一个 Canonical Reading Asset 生成一个 Reading Result 与一组 Candidate Draft。它们在一次逻辑 semantic read 中由相同的 `input.jsonl`、提示词与 Schema 产生，经 Python 完成 closed Schema、Evidence、locator 与预算验证后作为同一个不可变 Reader bundle 发布；任何合同或证据错误都不得部分发布。T14 不把 Draft 转换成正式 Candidate Knowledge；规范化、内容身份与 Review Queue 物化属于 T15 的确定性 successor publication。只有 T13 terminal evidence 已机械证明的超时可以触发有限 attempt；它仍是同一次逻辑 read 的传输重试，不是第二次语义阅读。
 
-相关决策：[ADR 0015](../adr/0015-normalize-reading-input-into-a-canonical-asset-bundle.md)、[ADR 0016](../adr/0016-combine-semantic-reading-and-candidate-drafting.md)、[ADR 0033](../adr/0033-use-two-isolated-codex-runtime-roles.md)、[ADR 0034](../adr/0034-version-and-snapshot-codex-prompts-and-schemas.md)。正式 Candidate 的共同合同见 [Candidate Knowledge v1](./candidate-knowledge-v1.md)。
+相关决策：[ADR 0015](../adr/0015-normalize-reading-input-into-a-canonical-asset-bundle.md)、[ADR 0016](../adr/0016-combine-semantic-reading-and-candidate-drafting.md)、[ADR 0033](../adr/0033-use-two-isolated-codex-runtime-roles.md)、[ADR 0034](../adr/0034-version-and-snapshot-codex-prompts-and-schemas.md)、[ADR 0130](../adr/0130-publish-reader-drafts-before-candidate-materialization.md)。正式 Candidate 的共同合同见 [Candidate Knowledge v1](./candidate-knowledge-v1.md)。
 
 ## 输入边界
 
@@ -151,7 +151,7 @@ Codex 在 `CandidateDraftV1.descriptor_refs` 中只输出临时 `DescriptorLocat
 - `kind`：`method`、`object`、`dataset`、`experiment` 或 `metric`；
 - `index`：对应 Reading Result 数组中的 0-based 位置。
 
-Python 必须先验证 kind、数组和 index，再解析完整 Method 或 Study Descriptor；随后按照 [Candidate Knowledge v1](./candidate-knowledge-v1.md) 构造 `DescriptorPayloadV1`，计算完整 SHA-256 与 `desc_<前24位>`，检查短 ID 和完整 hash 碰撞，并把 Locator 替换为正式 `DescriptorReferenceV1`。正式 Candidate 不保存数组位置或复制 Descriptor 正文；重复描述符映射到同一内容身份，不同描述符不做模糊合并。未知 kind、越界 index、无法解析的引用或碰撞会使整个 semantic run 校验失败。
+T14 必须验证 kind、目标数组和 index，确保每个 locator 都能解析到同一 Reading Result 的完整 Method 或 Study Descriptor；未知 kind 或越界 index 使整个 Reader run 校验失败。T15 随后按照 [Candidate Knowledge v1](./candidate-knowledge-v1.md) 构造 `DescriptorPayloadV1`，计算完整 SHA-256 与 `desc_<前24位>`，检查短 ID 和完整 hash 碰撞，并把 Locator 替换为正式 `DescriptorReferenceV1`。正式 Candidate 不保存数组位置或复制 Descriptor 正文；重复描述符映射到同一内容身份，不同描述符不做模糊合并。
 
 相关决策：[ADR 0039](../adr/0039-resolve-temporary-descriptor-locators-to-content-addressed-references.md)。
 
@@ -164,7 +164,7 @@ Python 必须先验证 kind、数组和 index，再解析完整 Method 或 Study
 - `descriptor_refs`：可为空，但每项必须解析到同一 Reading Result 中的 Method 或 Study Descriptor；
 - `research_interest_id`：为未来 Relevance Candidate 保留，对其他类型禁止。
 
-首个可执行切片禁止输出 `candidate_type=relevance`，也禁止任何 `research_interest_id`。Codex 不生成 `candidate_id`、Work/Source 身份、哈希、通用 subtype、自由结构 attributes、标题、推荐理由、重要性分数、自由标签或重复摘要。Comparison 使用 Claim 正文与 `comparative_claim` 风险标记表达。Python 完成校验后按 [Candidate Knowledge v1](./candidate-knowledge-v1.md) 生成正式 `EvidencePointerV1`、Candidate payload、完整 `payload_sha256` 与 `candidate_id`。
+首个可执行切片禁止输出 `candidate_type=relevance`，也禁止任何 `research_interest_id`。Codex 不生成 `candidate_id`、Work/Source 身份、哈希、通用 subtype、自由结构 attributes、标题、推荐理由、重要性分数、自由标签或重复摘要。Comparison 使用 Claim 正文与 `comparative_claim` 风险标记表达。T14 只发布通过 Reader 合同与证据验证的 Draft；T15 才按 [Candidate Knowledge v1](./candidate-knowledge-v1.md) 生成正式 `EvidencePointerV1`、Candidate payload、完整 `payload_sha256` 与 `candidate_id`。
 
 相关决策：[ADR 0017](../adr/0017-reduce-candidate-taxonomy-to-five-types.md)、[ADR 0018](../adr/0018-content-address-candidate-knowledge.md)、[ADR 0038](../adr/0038-use-a-minimal-typed-candidate-draft.md)、[ADR 0040](../adr/0040-defer-research-interest-and-relevance-from-the-first-slice.md)。
 
@@ -205,7 +205,7 @@ Python 必须先验证 kind、数组和 index，再解析完整 Method 或 Study
 | `relevance` | 首个切片为 0；未来最多 2，且每个 Research Interest 最多 1 |
 | `open_question` | 2 |
 
-候选必须优先保留证据更直接、可独立审核、可跨 Work 检索且不重复的内容。原始 `candidate_drafts` 先做 Schema 校验且总数最多 12，再规范化、验证证据、解析 Descriptor 并构造正式 payload；只有完整 hash 与 CanonicalJsonV1 bytes 都相同的 Candidate 才在预算计算前确定性合并。合并后的唯一集合执行逐类型预算，超限使整个 semantic run 失败；相似但 payload 不同的候选不得自动合并。完整顺序以 [Candidate Knowledge v1](./candidate-knowledge-v1.md) 为准。调整预算必须升级 Codex 角色版本，但不迁移既有 Candidate。
+候选必须优先保留证据更直接、可独立审核、可跨 Work 检索且不重复的内容。T14 对原始 `candidate_drafts` 执行 Schema、总数上限、Evidence 与 Descriptor locator 验证；超限使整个 Reader run 失败。T15 再规范化并构造正式 payload，只有完整 hash 与 CanonicalJsonV1 bytes 都相同的 Candidate 才在正式集合中确定性合并，然后对合并后的唯一集合执行逐类型预算；相似但 payload 不同的候选不得自动合并。完整顺序以 [Candidate Knowledge v1](./candidate-knowledge-v1.md) 为准。调整模型输出总数上限必须升级 Codex 角色版本；正式逐类型预算的演进由 Candidate Knowledge/T15 合同拥有。
 
 ## 原子发布与重建
 
@@ -232,9 +232,9 @@ semantic/
 
 `final_message.txt` 只在该 attempt 实际产生最终输出时存在，并保持 Codex 提供的原始字节，无论它能否解析为有效 JSON；`result/` 只允许在完整成功时存在。运行先在同一卷的 `.staging/<run_id>/` 写入并关闭文件，再写 `manifest.json`；manifest 记录终态、角色/模型/reasoning、Codex CLI 与 Git revision、有效配置和输入哈希，并列出除自身外每个文件的相对路径、字节数、SHA-256 与 Schema identity 或 media type。随后目录原子改名为 `runs/<run_id>/`；只有 `status=succeeded` 且完整结果校验通过的 manifest 才有资格原子替换 `current.json`，指针只含 Schema 版本、run ID 与 manifest SHA-256。
 
-若在目录发布后、指针替换前中断，`resume` 必须复用该有效成功 run 并只完成指针，不再次调用 Codex。blocked、failed 与 interrupted run 也以终态 manifest 保存 attempt 审计，但没有 `result/` 且不得更新 `current.json`；崩溃遗留的 staging 在恢复时标为 interrupted 后终态化，不能被当成成功资产。
+若在目录发布后、指针替换前中断，`resume` 必须复用该有效成功 run 并只完成指针，不再次调用 Codex。blocked、failed 与 interrupted run 也以终态 manifest 保存 attempt 审计，但没有 `result/` 且不得更新 `current.json`；崩溃遗留的 staging 只有在输入、Schema、prompt、namespace 及已有 attempt/capture 都能完整证明时，才在恢复时标为 interrupted 后终态化，不能被当成成功资产。歧义、reparse、foreign entry、partial result 或已有 terminal manifest 一律保持原位并停止恢复。
 
-`reading_result.json`、`candidate_drafts.json`、`candidate_knowledge.jsonl` 与 `review_queue.json` 是一个不可分割的成功结果；前三者分别使用版本化的 Gezhi wrapper 或独立记录。Review Queue 只是待审核投影，固定包含 `schema_version=gezhi.review_queue.v1`、Work/Source/Canonical 内容身份、semantic run ID，以及按 `candidate_id` 排序的 `{candidate_id, payload_sha256}` 数组，不是审核权威状态。`catalog.sqlite3` 通过扫描有效 terminal run manifest、正式 Candidate、Work-owned Review 与 Handoff 重建；忽略 staging、无效 manifest 和未提交结果。
+T14 的 `reading_result.json`、`candidate_drafts.json`、精确零字节 `candidate_knowledge.jsonl` 与空 `review_queue.json` 是一个不可分割的成功 Reader 结果；前两者使用版本化 Gezhi wrapper，manifest 记录实际 `candidate_draft_count`，同时固定 `candidate_count=0`。空 Candidate/Queue 文件只是固定清单中的“尚未物化”证据，不表示 T15 完成，也不允许后续原地填充。T15 必须从完整有效 Reader bundle 发布新的不可变 successor；精确 successor layout、Schema 与 current 规则由 T15 冻结。正式 Review Queue 仍只是待审核投影而不是审核权威状态；`catalog.sqlite3` 通过扫描有效 terminal authority、正式 Candidate、Work-owned Review 与 Handoff 重建，并忽略 staging、无效 manifest 和未提交结果。
 
 Gezhi 自有领域 payload JSON 顶层带 `schema_version`；Gezhi 自有 JSONL 由首条 header/metadata 或每条独立记录提供 Schema identity，标准 `schema.json` 使用 JSON Schema `$id` 标识版本。Codex `events.jsonl` 与 `final_message.txt` 保持提供方原始字节，`prompt.txt` 也不是 JSON；三者不注入 Gezhi 字段。所有文件的实际 SHA-256 统一由 manifest 记录，manifest 不保存自己的自哈希，其 SHA-256 由 `current.json`、Review 或 Handoff provenance 记录。
 
@@ -244,8 +244,8 @@ Gezhi 自有领域 payload JSON 顶层带 `schema_version`；Gezhi 自有 JSONL 
 
 每个 Codex attempt 的 wall-clock 超时为 30 分钟；首次调用后只对 T13 terminal evidence 已机械证明的 `timeout` 最多重试两次，退避依次为 10 秒和 30 秒，因此最多 3 个 attempt，整个 read 阶段 wall-clock 安全上限为 95 分钟。每次 attempt 必须使用完全相同且已哈希的 `input.jsonl`、`prompt.txt` 与 `schema.json`，启动全新进程和临时目录；任何 attempt 的部分输出都不进入下一次。超时必须终止整个 Codex 子进程树并保留已有 JSONL。
 
-实际 timeout attempts 耗尽时返回 `blocked: codex_timeout_exhausted`，manifest 记录每次 `failure_class=timeout`。用户主动中断返回 `interrupted` 且不自动重试。已安全收尾的其他 provider terminal、未知非零退出、capture overflow 或事件结构故障统一使用 `failure_class=process_error` 与 `failed: codex_process_failed`，不自动重试，也不得从 message、stderr 或退出码猜测 network、429、5xx、runtime 或 context-window 类别。Commitment 前由 project resolver、认证或 launch-plan preflight 明确确认的 CLI/模型/能力不可用仍返回 `blocked: codex_runtime_unavailable` 且不创建 attempt；Schema、证据、Descriptor、身份或预算错误返回 failed，均不自动重试。
+实际 timeout attempts 耗尽时返回 `blocked: codex_timeout_exhausted`，manifest 记录每次 `failure_class=timeout`。公开 Literature adapter 不安装 Knowledge Ask 的 Ctrl+C cancellation bridge；外部终止不承诺形成 handled CLI 结果，下次 `resume` 才把可完整证明的遗留 staging 终态化为 `interrupted` audit run，且不自动重试该旧 attempt。共享 child 的 mechanical `interrupted` 组合能力不因此成为 T14 产品路径。已安全收尾的其他 provider terminal、未知非零退出、capture overflow 或事件结构故障统一使用 `failure_class=process_error` 与 `failed: codex_process_failed`，不自动重试，也不得从 message、stderr 或退出码猜测 network、429、5xx、runtime 或 context-window 类别。Commitment 前由 project resolver、认证或 launch-plan preflight 明确确认的 CLI/模型/能力不可用仍返回 `blocked: codex_runtime_unavailable` 且不创建 attempt；Schema、证据、Descriptor、身份或预算错误返回 failed，均不自动重试。
 
-该保守分类由 [ADR 0129](../adr/0129-retry-only-mechanically-classified-codex-timeouts.md) 冻结。V1 不再拥有 `model_context_limit`、`codex_network_exhausted`、`codex_rate_limit_exhausted`、`codex_server_error_exhausted` 或 `codex_transient_exhausted` 终态。
+该保守分类由 [ADR 0129](../adr/0129-retry-only-mechanically-classified-codex-timeouts.md) 冻结，外部终止恢复边界由 [ADR 0131](../adr/0131-recover-literature-termination-on-the-next-resume.md) 冻结。V1 不再拥有 `model_context_limit`、`codex_network_exhausted`、`codex_rate_limit_exhausted`、`codex_server_error_exhausted` 或 `codex_transient_exhausted` 终态。
 
 只有 Codex 正常退出、最终 JSON 存在且 Schema、Evidence Block、Descriptor 与 Candidate 校验全部通过，semantic run 才能发布成功结果；超时前即使产生看似完整的 JSON 也不得发布。每个 attempt 记录 `input_tokens`、`cached_input_tokens`、`output_tokens`、`reasoning_output_tokens`、`started_at`、`finished_at`、`elapsed_ms`、`exit_code` 与 `failure_class`，manifest 同时保存逐次值与总计。CLI 未提供的 token 字段记为 `null` 并设置 `usage_unavailable`，不得因此使有效结果失败；首版不估算金额，也不依据模型自报 token 数中途终止。

@@ -3311,6 +3311,7 @@ def resume_work(
                 reason="reader_prerequisite_unavailable",
             )
         from gezhi._literature_reader import (
+            ReaderAuthorityStoppedV1,
             ReaderRecoveryUncertainV1,
             ReaderStageStoppedV1,
             advance_reader_v1,
@@ -3334,6 +3335,27 @@ def resume_work(
                 stage="read",
                 reason=error.reason,
             )
+        except ReaderAuthorityStoppedV1 as error:
+            if error.reason == "data_root_integrity_lost":
+                raise ResumeStoppedV1(
+                    "failed",
+                    "data_root_integrity_lost",
+                    data_root="literature",
+                ) from error
+            if error.reason in {
+                "active_source_unavailable",
+                "active_source_invalid",
+            }:
+                _stop_stage(
+                    authority,
+                    root,
+                    start_stage=start_stage,
+                    advanced_stages=advanced_stages,
+                    outcome="failed",
+                    stage="read",
+                    reason="asset_integrity_lost",
+                )
+            raise ResumeStoppedV1("failed", "recovery_failed") from error
         except ReaderRecoveryUncertainV1 as error:
             raise ResumeStoppedV1("failed", "recovery_failed") from error
         return ResumeWorkResultV1(

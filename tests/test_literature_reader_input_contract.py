@@ -11,7 +11,12 @@ import pytest
 
 from gezhi._literature_canonical import CurrentCanonicalAssetV1
 from gezhi._literature_intake import ActiveSourceAuthorityV1
-from gezhi._literature_reader import ReaderStageStoppedV1, _reader_input
+from gezhi._literature_reader import (
+    LiteratureReaderOutputV1,
+    ReaderStageStoppedV1,
+    _reader_input,
+    _validate_evidence,
+)
 
 _WORK_ID = "wrk_12345678-1234-4abc-8abc-1234567890ab"
 _SOURCE_SHA256 = "a" * 64
@@ -184,3 +189,53 @@ def test_reader_input_uses_final_utf8_bytes_for_the_inclusive_limit(
 
     assert stopped.value.outcome == "blocked"
     assert stopped.value.reason == "reader_input_too_large"
+
+
+def test_reader_source_term_must_occur_inside_one_cited_evidence_block() -> None:
+    first_id = "blk_" + "a" * 24
+    second_id = "blk_" + "b" * 24
+    synopsis = {
+        "evidence_block_ids": [first_id],
+        "risk_flags": [],
+        "source_terms": ["alpha"],
+        "support_kind": "direct",
+        "text": "概述。",
+    }
+    crossing = {
+        "evidence_block_ids": [first_id, second_id],
+        "risk_flags": [],
+        "source_terms": ["alpha\nbeta"],
+        "support_kind": "direct",
+        "text": "该术语不能跨证据块边界拼接。",
+    }
+    output = LiteratureReaderOutputV1.model_validate(
+        {
+            "candidate_drafts": [],
+            "reading_result": {
+                "findings": [crossing],
+                "limitations": [],
+                "methods": [],
+                "open_questions": [],
+                "relevance": [],
+                "research_problems": [],
+                "study_descriptors": {
+                    "datasets": [],
+                    "experiments": [],
+                    "metrics": [],
+                    "objects": [],
+                },
+                "synopsis": synopsis,
+            },
+            "schema_version": "gezhi.literature_reader_output.v1",
+        },
+        strict=True,
+    )
+
+    with pytest.raises(ReaderStageStoppedV1) as stopped:
+        _validate_evidence(
+            output,
+            {first_id: "alpha", second_id: "beta"},
+        )
+
+    assert stopped.value.outcome == "failed"
+    assert stopped.value.reason == "reader_output_invalid"

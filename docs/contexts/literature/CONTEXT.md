@@ -65,7 +65,7 @@ _Avoid_: Array Position, Free-form Attribute, Tag, Copied Description
 _Avoid_: Candidate Registry, Promoted Knowledge, Section-by-section Report
 
 **Candidate Draft**:
-语义模型从 Reading Result 与可追溯证据中提出、值得跨 Work 检索和审核但尚未通过确定性合同与证据校验的候选草稿。
+语义模型从 Reading Result 与可追溯证据中提出、已通过 Reader shape、证据范围和 locator 边界验证，但尚未完成 Candidate Knowledge 规范化、内容身份、碰撞检查与 Review Queue 物化的候选草稿。
 _Avoid_: Candidate Knowledge, Model Fact, Reading Item
 
 **Candidate Knowledge**:
