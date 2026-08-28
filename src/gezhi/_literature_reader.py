@@ -24,6 +24,8 @@ from pydantic import (
 )
 
 from gezhi._codex_child_process import (
+    LITERATURE_EVENTS_CAPTURE_CAP_V1,
+    LITERATURE_FINAL_CAPTURE_CAP_V1,
     AttemptTerminalEvidenceV1,
     NeverCancelledV1,
     PreAttemptRejectedV1,
@@ -1062,6 +1064,8 @@ def _attempt_documents_from_run_v1(
 ) -> list[dict[str, object]]:
     attempts_dir = run_dir / "attempts"
     entries = _entry_names(attempts_dir)
+    if len(entries) > 3:
+        raise ValueError("Reader attempt count is invalid")
     documents: list[dict[str, object]] = []
     for expected_ordinal, attempt_name in enumerate(entries, start=1):
         expected_name = f"{expected_ordinal:02d}"
@@ -1078,6 +1082,17 @@ def _attempt_documents_from_run_v1(
         attempt_path = attempt_dir / "attempt.json"
         if "attempt.json" not in children:
             raise ValueError("Reader attempt document is missing")
+        if "events.jsonl" not in children:
+            raise ValueError("Reader attempt events are missing")
+        events = _read_safe_bytes(
+            attempt_dir / "events.jsonl",
+            limit=LITERATURE_EVENTS_CAPTURE_CAP_V1,
+        )
+        if "final_message.txt" in children:
+            _read_safe_bytes(
+                attempt_dir / "final_message.txt",
+                limit=LITERATURE_FINAL_CAPTURE_CAP_V1,
+            )
         document, _payload = _read_canonical_object_v1(attempt_path)
         expected_keys = {
             "attempt_ordinal",
@@ -1102,6 +1117,14 @@ def _attempt_documents_from_run_v1(
         )
         elapsed_ms = document.get("elapsed_ms")
         exit_code = document.get("exit_code")
+        usage, events_valid = _usage(events)
+        expected_usage = {
+            "input_tokens": usage[0],
+            "cached_input_tokens": usage[1],
+            "output_tokens": usage[2],
+            "reasoning_output_tokens": usage[3],
+        }
+        failure_class = document.get("failure_class")
         if (
             set(document) != expected_keys
             or document.get("attempt_ordinal") != expected_ordinal
@@ -1134,13 +1157,28 @@ def _attempt_documents_from_run_v1(
                 )
                 for name in token_names
             )
+            or any(
+                document.get(name) != expected_usage[name]
+                for name in token_names
+            )
             or document["usage_unavailable"]
-            is not any(document.get(name) is None for name in token_names)
+            is not any(value is None for value in usage)
+            or (
+                failure_class is None
+                and (
+                    exit_code != 0
+                    or "final_message.txt" not in children
+                    or not events_valid
+                )
+            )
         ):
             raise ValueError("Reader attempt document is invalid")
-        if "events.jsonl" not in children:
-            raise ValueError("Reader attempt events are missing")
         documents.append(document)
+    if any(
+        document.get("failure_class") != "timeout"
+        for document in documents[:-1]
+    ):
+        raise ValueError("Reader retry sequence is invalid")
     return documents
 
 

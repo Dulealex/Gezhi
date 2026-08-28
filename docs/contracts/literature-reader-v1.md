@@ -234,6 +234,8 @@ semantic/
 
 若在目录发布后、指针替换前中断，`resume` 必须复用该有效成功 run 并只完成指针，不再次调用 Codex。blocked、failed 与 interrupted run 也以终态 manifest 保存 attempt 审计，但没有 `result/` 且不得更新 `current.json`；崩溃遗留的 staging 只有在输入、Schema、prompt、namespace 及已有 attempt/capture 都能完整证明时，才在恢复时标为 interrupted 后终态化，不能被当成成功资产。歧义、reparse、foreign entry、partial result 或已有 terminal manifest 一律保持原位并停止恢复。
 
+Interrupted recovery 允许 `0..3` 个严格连续的 attempt：`0` 表示首次 commitment 前终止；非末次 attempt 只能是机械 `timeout`。每个 attempt 必须重读并验证 canonical `attempt.json`、必有且不超过 16,777,216 bytes 的 `events.jsonl`、条件存在且不超过 1,048,576 bytes 的 `final_message.txt`，并从原始 events 重算四项 token 与 `usage_unavailable`。`failure_class=null` 还必须同时证明 `exit_code=0`、final 存在且 events framing有效；timeout/process_error不要求 final，也不从 capture内容猜测更细故障。任一矩阵不成立都属于无法证明的 staging，保持原位并停止恢复。
+
 T14 的 `reading_result.json`、`candidate_drafts.json`、精确零字节 `candidate_knowledge.jsonl` 与空 `review_queue.json` 是一个不可分割的成功 Reader 结果；前两者使用版本化 Gezhi wrapper，manifest 记录实际 `candidate_draft_count`，同时固定 `candidate_count=0`。空 Candidate/Queue 文件只是固定清单中的“尚未物化”证据，不表示 T15 完成，也不允许后续原地填充。T15 必须从完整有效 Reader bundle 发布新的不可变 successor；精确 successor layout、Schema 与 current 规则由 T15 冻结。正式 Review Queue 仍只是待审核投影而不是审核权威状态；`catalog.sqlite3` 通过扫描有效 terminal authority、正式 Candidate、Work-owned Review 与 Handoff 重建，并忽略 staging、无效 manifest 和未提交结果。
 
 这个“成功 Reader 结果”只描述Reader子模块的不可变publication，不等于七阶段`read`已成功。T15 materializer尚不可用时，公开Resume按ADR 0133返回`blocked: reader_prerequisite_unavailable`，保持`stop_stage=read`、`pipeline_complete=false`且不把`read`列入`advanced_stages`；后续调用验证并复用bundle，不再次调用Codex。

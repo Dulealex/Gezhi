@@ -9,11 +9,16 @@ from pathlib import Path
 
 import pytest
 
+from gezhi._codex_child_process import (
+    LITERATURE_EVENTS_CAPTURE_CAP_V1,
+    LITERATURE_FINAL_CAPTURE_CAP_V1,
+)
 from gezhi._literature_canonical import CurrentCanonicalAssetV1
 from gezhi._literature_intake import ActiveSourceAuthorityV1
 from gezhi._literature_reader import (
     LiteratureReaderOutputV1,
     ReaderStageStoppedV1,
+    _attempt_documents_from_run_v1,
     _reader_input,
     _source_environment,
     _validate_evidence,
@@ -51,6 +56,48 @@ def _canonical_bytes(value: object) -> bytes:
         ).encode("utf-8")
         + b"\n"
     )
+
+
+def _attempt_run(base: Path, name: str) -> Path:
+    run = base / name
+    (run / "attempts").mkdir(parents=True)
+    return run
+
+
+def _write_recovery_attempt(
+    run: Path,
+    ordinal: int,
+    *,
+    failure_class: str | None,
+    exit_code: int | None,
+    events: bytes = b'{"type":"thread.started"}\n',
+    final: bytes | None = None,
+    token_value: int | None = None,
+) -> None:
+    attempt = run / "attempts" / f"{ordinal:02d}"
+    attempt.mkdir()
+    (attempt / "attempt.json").write_bytes(
+        _canonical_bytes(
+            {
+                "attempt_ordinal": ordinal,
+                "cached_input_tokens": token_value,
+                "elapsed_ms": 25,
+                "exit_code": exit_code,
+                "failure_class": failure_class,
+                "finished_at": "2026-08-28T12:00:01.000Z",
+                "input_tokens": token_value,
+                "output_tokens": token_value,
+                "reasoning_output_tokens": token_value,
+                "resource_ledger_count": 0,
+                "schema_version": "gezhi.literature_codex_attempt.v1",
+                "started_at": "2026-08-28T12:00:00.000Z",
+                "usage_unavailable": token_value is None,
+            }
+        )
+    )
+    (attempt / "events.jsonl").write_bytes(events)
+    if final is not None:
+        (attempt / "final_message.txt").write_bytes(final)
 
 
 def _reader_fixture(
@@ -315,3 +362,138 @@ def test_reader_validates_the_complete_source_environment_before_filtering(
 ) -> None:
     with pytest.raises(ValueError):
         _source_environment(source)
+
+
+def test_reader_recovery_accepts_only_a_bounded_retry_sequence(
+    reader_input_base: Path,
+) -> None:
+    too_many = _attempt_run(reader_input_base, "too-many")
+    for ordinal in range(1, 5):
+        _write_recovery_attempt(
+            too_many,
+            ordinal,
+            failure_class="timeout",
+            exit_code=None,
+        )
+    with pytest.raises(ValueError):
+        _attempt_documents_from_run_v1(too_many)
+
+    impossible_retry = _attempt_run(reader_input_base, "impossible-retry")
+    _write_recovery_attempt(
+        impossible_retry,
+        1,
+        failure_class="process_error",
+        exit_code=1,
+    )
+    _write_recovery_attempt(
+        impossible_retry,
+        2,
+        failure_class="timeout",
+        exit_code=None,
+    )
+    with pytest.raises(ValueError):
+        _attempt_documents_from_run_v1(impossible_retry)
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "events", "final"),
+    [
+        (0, b'{"type":"thread.started"}\n', None),
+        (1, b'{"type":"thread.started"}\n', b"{}"),
+        (0, b"not-json\n", b"{}"),
+    ],
+)
+def test_reader_recovery_rejects_an_impossible_clean_attempt(
+    reader_input_base: Path,
+    exit_code: int,
+    events: bytes,
+    final: bytes | None,
+) -> None:
+    run = _attempt_run(reader_input_base, "impossible-clean")
+    _write_recovery_attempt(
+        run,
+        1,
+        failure_class=None,
+        exit_code=exit_code,
+        events=events,
+        final=final,
+    )
+
+    with pytest.raises(ValueError):
+        _attempt_documents_from_run_v1(run)
+
+
+def test_reader_recovery_recomputes_usage_from_captured_events(
+    reader_input_base: Path,
+) -> None:
+    run = _attempt_run(reader_input_base, "usage-mismatch")
+    _write_recovery_attempt(
+        run,
+        1,
+        failure_class="process_error",
+        exit_code=1,
+        events=(
+            b'{"type":"turn.completed","usage":{"cached_input_tokens":1,'
+            b'"input_tokens":1,"output_tokens":1,'
+            b'"reasoning_output_tokens":1}}\n'
+        ),
+    )
+
+    with pytest.raises(ValueError):
+        _attempt_documents_from_run_v1(run)
+
+
+@pytest.mark.parametrize(
+    ("asset_name", "byte_length"),
+    [
+        ("events.jsonl", LITERATURE_EVENTS_CAPTURE_CAP_V1 + 1),
+        ("final_message.txt", LITERATURE_FINAL_CAPTURE_CAP_V1 + 1),
+    ],
+)
+def test_reader_recovery_rejects_an_oversized_attempt_capture(
+    reader_input_base: Path,
+    asset_name: str,
+    byte_length: int,
+) -> None:
+    run = _attempt_run(reader_input_base, "oversized-" + asset_name.split(".")[0])
+    _write_recovery_attempt(
+        run,
+        1,
+        failure_class="process_error",
+        exit_code=1,
+    )
+    (run / "attempts" / "01" / asset_name).write_bytes(b"x" * byte_length)
+
+    with pytest.raises(ValueError):
+        _attempt_documents_from_run_v1(run)
+
+
+def test_reader_recovery_accepts_zero_attempts_and_a_legal_retry_sequence(
+    reader_input_base: Path,
+) -> None:
+    empty = _attempt_run(reader_input_base, "zero-attempts")
+    assert _attempt_documents_from_run_v1(empty) == []
+
+    retried = _attempt_run(reader_input_base, "legal-retry")
+    for ordinal in (1, 2):
+        _write_recovery_attempt(
+            retried,
+            ordinal,
+            failure_class="timeout",
+            exit_code=None,
+            events=b"not-json\n",
+        )
+    _write_recovery_attempt(
+        retried,
+        3,
+        failure_class=None,
+        exit_code=0,
+        final=b"{}",
+    )
+
+    documents = _attempt_documents_from_run_v1(retried)
+    assert [document["failure_class"] for document in documents] == [
+        "timeout",
+        "timeout",
+        None,
+    ]

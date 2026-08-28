@@ -82,7 +82,7 @@ Blocked、failed 与 interrupted run 可以作为不可变审计资产提交，�
 | `ingest` | 显式 PDF bytes、身份别名和既有 Work/Source assets | Source manifest、原始 Source Asset 与唯一 Active Source pointer | `add_local_pdf`；`resume` 只验证/修复确定提交间隙 |
 | `ocr` | 当前 Active Source 完整身份 | 与 Source/config/tool identity 绑定的 OCR run/current | `resume_work` OCR adapter |
 | `canonicalize` | 当前有效 OCR success | Canonical Reading Asset run/current 与 content hash | `resume_work` canonicalizer |
-| `read` | 当前 Canonical asset 与固定 Reader inputs | Literature Reader v1 完整 semantic result/current | `resume_work` Reader adapter |
+| `read` | 当前 Canonical asset 与固定 Reader inputs | Literature Reader v1 完整 semantic result/current，以及完成 Candidate 物化的确定性 successor/current | `resume_work` Reader adapter 与 Candidate materializer |
 | `review` | 完整有效 Candidate payload | append-only Review Decision/current；无 Candidate 时为 no-op | 仅显式 `review_candidate`；`resume` 只观察 |
 | `handoff` | 已提交 Review Decision 与 Handoff history | matching accept/withdraw Handoff 或 no-action receipt | review；resume 只续行已授权 revision |
 | `knowledge_import` | 有效 Handoff/no-action receipt | Registry transaction/no-action receipt | 仅 `KnowledgeIntake.apply`，由 review/resume 编排 |
