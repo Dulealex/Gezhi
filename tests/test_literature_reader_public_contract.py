@@ -276,7 +276,18 @@ def freeze_workspace(**values):
     return SimpleNamespace(attempt_root=values["attempt_root"])
 
 
-def freeze_launch(*, prompt, attempt_ordinal, workspace, **_values):
+def freeze_launch(
+    *,
+    prompt,
+    attempt_ordinal,
+    workspace,
+    existing_shared_deadline_monotonic_ns=None,
+    **_values,
+):
+    with Path(os.environ["READER_DEADLINE_LOG"]).open(
+        "a", encoding="ascii"
+    ) as target:
+        target.write(f"{existing_shared_deadline_monotonic_ns}\\n")
     attempt_root = workspace.attempt_root
     capture_parent = attempt_root / "captures"
     capture = capture_parent / f"{attempt_ordinal:02d}"
@@ -316,6 +327,9 @@ def freeze_launch(*, prompt, attempt_ordinal, workspace, **_values):
         source_environment={"SystemRoot": os.environ["SystemRoot"]},
         timeout_seconds=timeout_seconds,
         capture_profile="literature",
+        existing_shared_deadline_monotonic_ns=(
+            existing_shared_deadline_monotonic_ns
+        ),
     )
 
 
@@ -602,6 +616,7 @@ def test_public_resume_retries_once_and_publishes_an_evidence_bound_draft(
     temporary.mkdir()
     resolve_count = runtime_base / "resolve-count.txt"
     wait_log = runtime_base / "wait-log.txt"
+    deadline_log = runtime_base / "deadline-log.txt"
 
     completed = run_launcher(
         launcher_commands(
@@ -621,6 +636,7 @@ def test_public_resume_retries_once_and_publishes_an_evidence_bound_draft(
             "CODEX_HOME": str(codex_home),
             "READER_DOUBLE_EXE": str(_DOUBLE),
             "READER_DOUBLE_FINAL": str(final_path),
+            "READER_DEADLINE_LOG": str(deadline_log),
             "READER_RESOLVE_COUNT": str(resolve_count),
             "READER_WAIT_LOG": str(wait_log),
             "TEMP": str(temporary),
@@ -629,23 +645,35 @@ def test_public_resume_retries_once_and_publishes_an_evidence_bound_draft(
         timeout=30,
     )
 
-    assert completed.returncode == 0, (
+    assert completed.returncode == 2, (
         completed.stdout + completed.stderr
     ).decode(errors="replace")
     assert completed.stderr == b""
+    deadline_values = deadline_log.read_text(encoding="ascii").splitlines()
+    assert deadline_values[0] == "None"
+    assert len(deadline_values) == 2
+    assert deadline_values[1].isdigit()
     document = json.loads(completed.stdout)
     assert document == {
         "command": "literature.resume",
-        "diagnostics": [],
-        "outcome": "succeeded",
+        "diagnostics": [
+            {
+                "code": "literature.resume.stage_blocked.v1",
+                "context": {
+                    "reason": "reader_prerequisite_unavailable",
+                    "stage": "read",
+                },
+            }
+        ],
+        "outcome": "blocked",
         "result": {
             "active_source_id": added["source_id"],
-            "advanced_stages": ["read"],
+            "advanced_stages": [],
             "pending_candidate_ids": [],
-            "pipeline_complete": True,
+            "pipeline_complete": False,
             "schema_version": "gezhi.literature_resume_result.v1",
             "start_stage": "read",
-            "stop_stage": "complete",
+            "stop_stage": "read",
             "work_id": added["work_id"],
         },
         "schema_version": "gezhi.cli_result.v1",
@@ -796,21 +824,29 @@ def test_public_resume_retries_once_and_publishes_an_evidence_bound_draft(
     )
     assert json.loads(resumed.stdout) == {
         "command": "literature.resume",
-        "diagnostics": [],
-        "outcome": "succeeded",
+        "diagnostics": [
+            {
+                "code": "literature.resume.stage_blocked.v1",
+                "context": {
+                    "reason": "reader_prerequisite_unavailable",
+                    "stage": "read",
+                },
+            }
+        ],
+        "outcome": "blocked",
         "result": {
             "active_source_id": added["source_id"],
             "advanced_stages": [],
             "pending_candidate_ids": [],
-            "pipeline_complete": True,
+            "pipeline_complete": False,
             "schema_version": "gezhi.literature_resume_result.v1",
-            "start_stage": "complete",
-            "stop_stage": "complete",
+            "start_stage": "read",
+            "stop_stage": "read",
             "work_id": added["work_id"],
         },
         "schema_version": "gezhi.cli_result.v1",
     }
-    assert resumed.returncode == 0
+    assert resumed.returncode == 2
     assert resumed.stderr == b""
     assert (semantic / "current.json").read_bytes() == current_bytes
     assert [path.name for path in (semantic / "runs").iterdir()] == [
@@ -834,7 +870,7 @@ def test_public_resume_retries_once_and_publishes_an_evidence_bound_draft(
         pythonpath_roots=(reuse_site, SOURCE_ROOT),
     )
     assert json.loads(recovered.stdout) == json.loads(resumed.stdout)
-    assert recovered.returncode == 0
+    assert recovered.returncode == 2
     assert recovered.stderr == b""
     assert (semantic / "current.json").read_bytes() == current_bytes
     assert [path.name for path in (semantic / "runs").iterdir()] == [
@@ -1641,7 +1677,7 @@ def test_public_resume_commits_a_runtime_block_and_recovers_attempted_staging(
         },
         timeout=30,
     )
-    assert resumed.returncode == 0, (
+    assert resumed.returncode == 2, (
         resumed.stdout + resumed.stderr
     ).decode(errors="replace")
     assert resumed.stderr == b""
@@ -1661,6 +1697,54 @@ def test_public_resume_commits_a_runtime_block_and_recovers_attempted_staging(
         "reasoning_output_tokens": None,
     }
     assert not (recovered_orphan / "result").exists()
+
+    partial_run_id = "semrun_33333333-3333-4333-8333-333333333333"
+    partial_stage = semantic / ".staging" / partial_run_id
+    partial_attempt = partial_stage / "attempts" / "01"
+    partial_attempt.mkdir(parents=True)
+    successful_run = semantic / "runs" / current["run_id"]
+    for name in ("input.jsonl", "prompt.txt", "schema.json"):
+        shutil.copyfile(successful_run / name, partial_stage / name)
+    (partial_attempt / "events.jsonl").write_bytes(
+        b'{"type":"thread.started"}\n'
+    )
+    reject_partial_site = runtime_base / "reject-partial-site"
+    reject_partial_site.mkdir()
+    _reject_reader_attempt_sitecustomize(reject_partial_site)
+    partial = run_launcher(
+        launcher_commands(
+            (
+                "--literature-data-root",
+                str(literature_root),
+                "--knowledge-data-root",
+                str(knowledge_root),
+                "literature",
+                "resume",
+                str(added["work_id"]),
+                "--json",
+            )
+        )[1],
+        pythonpath_roots=(reject_partial_site, SOURCE_ROOT),
+        timeout=30,
+    )
+    assert json.loads(partial.stdout) == {
+        "command": "literature.resume",
+        "diagnostics": [
+            {
+                "code": "literature.resume.recovery_failed.v1",
+                "context": {},
+            }
+        ],
+        "outcome": "failed",
+        "result": None,
+        "schema_version": "gezhi.cli_result.v1",
+    }
+    assert partial.returncode == 1
+    assert partial.stderr == b""
+    assert partial_stage.is_dir()
+    assert not (partial_stage / "manifest.json").exists()
+    assert json.loads((semantic / "current.json").read_bytes()) == current
+    shutil.rmtree(partial_stage)
 
     ambiguous_names = (
         "semrun_11111111-1111-4111-8111-111111111111",

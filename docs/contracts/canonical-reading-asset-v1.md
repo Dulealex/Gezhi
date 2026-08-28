@@ -188,4 +188,4 @@ Canonical input fingerprint 绑定 Work、Source、OCR run ID、OCR manifest SHA
 
 确定性正文或资源语义无效为 `canonicalization_failed`；已知写入失败且结果仍可证明为 `commit_failed`；namespace/rename/replace 结果无法证明时抛 recovery uncertainty，不伪装成 handled receipt。
 
-Canonicalize 成功后，当前构建按 [ADR 0127](../adr/0127-expose-an-explicit-reader-prerequisite-frontier.md) 停在 `read/reader_prerequisite_unavailable`；Reader slice 接入后正常路径不得继续使用该原因。
+Canonicalize 成功后，若当前构建尚缺 `read` obligation 的下一项必要能力，则按 [ADR 0127](../adr/0127-expose-an-explicit-reader-prerequisite-frontier.md) 停在 `read/reader_prerequisite_unavailable`。T14 Reader 接入后，Canonicalize 不再因缺少 Reader-owned prompt、Schema、input projection 或执行 adapter 走该正常分支；但有效 T14 bundle 后缺少 T15 Candidate materializer 时，仍按 [ADR 0133](../adr/0133-keep-t14-reader-bundles-inside-the-read-stage.md) 使用同一 blocked reason。

@@ -32,6 +32,7 @@ from gezhi._codex_child_process import (
 from gezhi._codex_role_plan import (
     freeze_codex_attempt_workspace_v1,
     freeze_codex_role_launch_v1,
+    validate_codex_source_environment_v1,
 )
 from gezhi._codex_runtime import (
     CodexRuntimeResolutionErrorV1,
@@ -306,15 +307,6 @@ class ReadingResultV1(_ClosedModelV1):
 
     @model_validator(mode="after")
     def _validate_statement_groups(self) -> ReadingResultV1:
-        non_interpretive = (
-            self.synopsis,
-            *self.research_problems,
-            *self.methods,
-            *self.findings,
-            *self.limitations,
-        )
-        if any(item.support_kind == "interpretive" for item in non_interpretive):
-            raise ValueError("Interpretive support is not allowed in this group")
         for values in (
             self.research_problems,
             self.methods,
@@ -363,6 +355,7 @@ class ReaderAttemptRequestV1:
     literature_root: Path
     knowledge_root: Path
     source_environment: Mapping[str, str]
+    existing_shared_deadline_monotonic_ns: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -390,23 +383,13 @@ class ReaderAuthorityStoppedV1(RuntimeError):
         self.reason = reason
 
 
-def _environment_value(source: Mapping[str, str], name: str) -> str | None:
-    direct = source.get(name)
-    if direct:
-        return direct
-    folded_name = name.casefold()
-    for candidate_name, value in source.items():
-        if candidate_name.casefold() == folded_name and value:
-            return value
-    return None
-
-
 def _source_environment(source: Mapping[str, str]) -> dict[str, str]:
-    result = {"SystemRoot": _environment_value(source, "SystemRoot") or ""}
+    indexed = validate_codex_source_environment_v1(source)
+    result = {"SystemRoot": indexed.get("systemroot") or ""}
     if not result["SystemRoot"]:
         raise ReaderStageStoppedV1("blocked", "codex_runtime_unavailable")
-    for name in _OPTIONAL_ENVIRONMENT_NAMES:
-        value = _environment_value(source, name)
+    for name in ("CODEX_HOME", "TEMP", *_OPTIONAL_ENVIRONMENT_NAMES):
+        value = indexed.get(name.casefold())
         if value:
             result[name] = value
     return result
@@ -431,6 +414,9 @@ def _run_role_attempt_v1(
             schema_path=request.schema_path,
             codex_home=request.codex_home,
             source_environment=request.source_environment,
+            existing_shared_deadline_monotonic_ns=(
+                request.existing_shared_deadline_monotonic_ns
+            ),
         )
     except (CodexRuntimeResolutionErrorV1, OSError, ValueError) as error:
         raise ReaderStageStoppedV1("blocked", "codex_runtime_unavailable") from error
@@ -1073,8 +1059,6 @@ def _read_canonical_object_v1(path: Path) -> tuple[dict[str, object], bytes]:
 
 def _attempt_documents_from_run_v1(
     run_dir: Path,
-    *,
-    allow_partial: bool,
 ) -> list[dict[str, object]]:
     attempts_dir = run_dir / "attempts"
     entries = _entry_names(attempts_dir)
@@ -1093,15 +1077,8 @@ def _attempt_documents_from_run_v1(
             raise ValueError("Reader attempt inventory is invalid")
         attempt_path = attempt_dir / "attempt.json"
         if "attempt.json" not in children:
-            if allow_partial:
-                continue
             raise ValueError("Reader attempt document is missing")
-        try:
-            document, _payload = _read_canonical_object_v1(attempt_path)
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            if allow_partial:
-                continue
-            raise
+        document, _payload = _read_canonical_object_v1(attempt_path)
         expected_keys = {
             "attempt_ordinal",
             "cached_input_tokens",
@@ -1160,10 +1137,8 @@ def _attempt_documents_from_run_v1(
             or document["usage_unavailable"]
             is not any(document.get(name) is None for name in token_names)
         ):
-            if allow_partial:
-                continue
             raise ValueError("Reader attempt document is invalid")
-        if "events.jsonl" not in children and not allow_partial:
+        if "events.jsonl" not in children:
             raise ValueError("Reader attempt events are missing")
         documents.append(document)
     return documents
@@ -1232,15 +1207,12 @@ def _recover_staging_v1(
             or prompt_bytes != _effective_prompt(expected_input)
         ):
             raise ValueError("semantic staging input identity differs")
-        attempt_documents = _attempt_documents_from_run_v1(
-            stage,
-            allow_partial=True,
-        )
+        attempt_documents = _attempt_documents_from_run_v1(stage)
         if "result" in stage_entries or "manifest.json" in stage_entries:
             raise ValueError("terminal semantic staging requires exact recovery")
     except (OSError, ReaderStageStoppedV1, ValueError) as error:
         raise ReaderRecoveryUncertainV1(
-            "semantic zero-attempt staging cannot be proven"
+            "semantic interrupted staging cannot be proven"
         ) from error
     assets = _asset_entries(stage)
     manifest = _manifest_document_v1(
@@ -1408,7 +1380,7 @@ def _validated_success_manifest_sha256(
         attempt_count = manifest.get("attempt_count")
         if type(attempt_count) is not int or not 1 <= attempt_count <= 3:
             raise ValueError("semantic attempt count is invalid")
-        attempts = _attempt_documents_from_run_v1(run_dir, allow_partial=False)
+        attempts = _attempt_documents_from_run_v1(run_dir)
         if (
             len(attempts) != attempt_count
             or manifest.get("attempts") != attempts
@@ -1716,14 +1688,21 @@ def advance_reader_v1(
     _write_new_verified(stage / "prompt.txt", prompt_bytes)
     _write_new_verified(stage / "schema.json", schema_bytes)
 
-    temporary_value = _environment_value(source_environment, "TEMP")
     pre_attempt_failure: ReaderStageStoppedV1 | None = None
+    try:
+        effective_environment = _source_environment(source_environment)
+    except (ReaderStageStoppedV1, ValueError):
+        effective_environment = {}
+        pre_attempt_failure = ReaderStageStoppedV1(
+            "blocked", "codex_runtime_unavailable"
+        )
+    temporary_value = effective_environment.get("TEMP")
     if not temporary_value:
         pre_attempt_failure = ReaderStageStoppedV1(
             "blocked", "codex_runtime_unavailable"
         )
     temporary_root = Path(temporary_value) if temporary_value else None
-    codex_home_value = _environment_value(source_environment, "CODEX_HOME")
+    codex_home_value = effective_environment.get("CODEX_HOME")
     codex_home = Path(codex_home_value) if codex_home_value else Path.home() / ".codex"
     literature_path = root.inspection.canonical_path
     if literature_path is None:
@@ -1733,6 +1712,7 @@ def advance_reader_v1(
     semantic_failure: ReaderStageStoppedV1 | None = None
     attempt_documents: list[dict[str, object]] = []
     runtime: FrozenCodexRuntimeV1 | None = None
+    shared_deadline_monotonic_ns: int | None = None
     if pre_attempt_failure is None:
         try:
             runtime = _prepare_role_invocation_v1()
@@ -1766,7 +1746,10 @@ def advance_reader_v1(
                         codex_home=codex_home,
                         literature_root=Path(literature_path),
                         knowledge_root=knowledge_root,
-                        source_environment=_source_environment(source_environment),
+                        source_environment=effective_environment,
+                        existing_shared_deadline_monotonic_ns=(
+                            shared_deadline_monotonic_ns
+                        ),
                     )
                 )
                 if not isinstance(attempt_result, AttemptTerminalEvidenceV1):
@@ -1774,6 +1757,9 @@ def advance_reader_v1(
                         "blocked", "codex_runtime_unavailable"
                     )
                 attempt = attempt_result
+                shared_deadline_monotonic_ns = (
+                    attempt.shared_deadline_monotonic_ns
+                )
             except ReaderStageStoppedV1 as error:
                 if (
                     error.outcome == "blocked"

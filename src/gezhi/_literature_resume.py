@@ -3318,7 +3318,7 @@ def resume_work(
         )
 
         try:
-            reader = advance_reader_v1(
+            advance_reader_v1(
                 authority,
                 canonical.current,
                 root=root,
@@ -3358,17 +3358,14 @@ def resume_work(
             raise ResumeStoppedV1("failed", "recovery_failed") from error
         except ReaderRecoveryUncertainV1 as error:
             raise ResumeStoppedV1("failed", "recovery_failed") from error
-        return ResumeWorkResultV1(
-            active_source_id=authority.source_id,
-            advanced_stages=(
-                *advanced_stages,
-                *(("read",) if reader.advanced else ()),
-            ),
-            pending_candidate_ids=reader.pending_candidate_ids,
-            pipeline_complete=not reader.pending_candidate_ids,
-            start_stage=start_stage if reader.advanced else "complete",
-            stop_stage=("review" if reader.pending_candidate_ids else "complete"),
-            work_id=authority.work_id,
+        _stop_stage(
+            authority,
+            root,
+            start_stage=start_stage,
+            advanced_stages=advanced_stages,
+            outcome="blocked",
+            stage="read",
+            reason="reader_prerequisite_unavailable",
         )
     finally:
         owner.close()

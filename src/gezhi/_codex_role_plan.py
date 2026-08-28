@@ -369,7 +369,11 @@ def _future_private_paths(
     return capture, staging
 
 
-def _source_environment(source: Mapping[str, str]) -> dict[str, str]:
+def validate_codex_source_environment_v1(
+    source: Mapping[str, str],
+) -> dict[str, str]:
+    """Validate every source entry before returning a case-folded index."""
+
     observed: dict[str, tuple[str, str]] = {}
     for name, value in source.items():
         if type(name) is not str or type(value) is not str:
@@ -392,7 +396,7 @@ def _environment_block(
     temporary_directory: str,
     sqlite_home: str,
 ) -> tuple[str, tuple[str, ...]]:
-    indexed = _source_environment(source)
+    indexed = validate_codex_source_environment_v1(source)
     system_root = indexed.get("systemroot")
     if not system_root or "\0" in system_root:
         raise CodexRolePlanErrorV1("SystemRoot is required")
@@ -795,7 +799,7 @@ def _freeze_test_double_launch_v1(
         )
     )
     capture, staging = _future_private_paths(capture_directory, staging_directory)
-    indexed = _source_environment(source_environment)
+    indexed = validate_codex_source_environment_v1(source_environment)
     system_root = indexed.get("systemroot")
     if not system_root:
         raise CodexRolePlanErrorV1("SystemRoot is required")

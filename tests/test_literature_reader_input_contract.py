@@ -15,6 +15,7 @@ from gezhi._literature_reader import (
     LiteratureReaderOutputV1,
     ReaderStageStoppedV1,
     _reader_input,
+    _source_environment,
     _validate_evidence,
 )
 
@@ -239,3 +240,78 @@ def test_reader_source_term_must_occur_inside_one_cited_evidence_block() -> None
 
     assert stopped.value.outcome == "failed"
     assert stopped.value.reason == "reader_output_invalid"
+
+
+@pytest.mark.parametrize(
+    "group",
+    ["synopsis", "research_problems", "methods", "findings", "limitations"],
+)
+def test_reading_result_allows_interpretive_evidence_support(group: str) -> None:
+    block_id = "blk_" + "a" * 24
+    direct = {
+        "evidence_block_ids": [block_id],
+        "risk_flags": [],
+        "source_terms": ["evidence"],
+        "support_kind": "direct",
+        "text": "直接陈述。",
+    }
+    interpretive = {
+        **direct,
+        "support_kind": "interpretive",
+        "text": "解释性陈述。",
+    }
+    reading_result: dict[str, object] = {
+        "findings": [],
+        "limitations": [],
+        "methods": [],
+        "open_questions": [],
+        "relevance": [],
+        "research_problems": [],
+        "study_descriptors": {
+            "datasets": [],
+            "experiments": [],
+            "metrics": [],
+            "objects": [],
+        },
+        "synopsis": direct,
+    }
+    if group == "synopsis":
+        reading_result[group] = interpretive
+    else:
+        reading_result[group] = [interpretive]
+
+    output = LiteratureReaderOutputV1.model_validate(
+        {
+            "candidate_drafts": [],
+            "reading_result": reading_result,
+            "schema_version": "gezhi.literature_reader_output.v1",
+        },
+        strict=True,
+    )
+
+    if group == "synopsis":
+        assert output.reading_result.synopsis.support_kind == "interpretive"
+    else:
+        statements = getattr(output.reading_result, group)
+        assert statements[0].support_kind == "interpretive"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        {
+            "SystemRoot": r"C:\Windows",
+            "HTTPS_PROXY": "https://one.invalid",
+            "https_proxy": "https://two.invalid",
+        },
+        {
+            "SystemRoot": r"C:\Windows",
+            "UNRELATED=INVALID": "must still be validated",
+        },
+    ],
+)
+def test_reader_validates_the_complete_source_environment_before_filtering(
+    source: dict[str, str],
+) -> None:
+    with pytest.raises(ValueError):
+        _source_environment(source)

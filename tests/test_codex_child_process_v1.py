@@ -2456,15 +2456,23 @@ def test_precommit_cleanup_refuses_an_unknown_staging_entry(
     assert staging.exists()
 
 
+@pytest.mark.parametrize("capture_profile", ["knowledge", "literature"])
+@pytest.mark.parametrize(
+    "replacement_length",
+    [5, KNOWLEDGE_FINAL_CAPTURE_CAP_V1 + 1],
+)
 def test_final_generation_replacement_after_witness_is_unsafe_hold(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capture_profile: str,
+    replacement_length: int,
 ) -> None:
     plan = _plan(
         tmp_path,
         "final-overflow-hang",
         value=KNOWLEDGE_FINAL_CAPTURE_CAP_V1 + 1,
         timeout_seconds=60,
+        capture_profile=capture_profile,
     )
     real_probe = child_process._active_final_probe
     replaced = False
@@ -2479,7 +2487,7 @@ def test_final_generation_replacement_after_witness_is_unsafe_hold(
         identity = real_probe(path, cap=cap, ledger=ledger)
         if identity is not None and not replaced:
             replacement = Path(path).with_name("replacement.tmp")
-            replacement.write_bytes(b"small")
+            replacement.write_bytes(b"r" * replacement_length)
             deadline = time.monotonic() + 1
             while True:
                 try:

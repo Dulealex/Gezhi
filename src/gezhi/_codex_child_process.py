@@ -1827,11 +1827,16 @@ def _read_final_source(
             overflow = read.value == 1
         elif retained < int(size.value):
             raise CodexChildUnsafeHoldErrorV1("final source truncated during read")
-        if early_overflow_identity is not None and not overflow:
+        if (
+            early_overflow_identity is not None
+            and identity != early_overflow_identity
+        ):
             raise CodexChildUnsafeHoldErrorV1(
                 "final generation changed after overflow witness"
-                if identity != early_overflow_identity
-                else "final overflow was not independently confirmed"
+            )
+        if early_overflow_identity is not None and not overflow:
+            raise CodexChildUnsafeHoldErrorV1(
+                "final overflow was not independently confirmed"
             )
     finally:
         if fd is not None and not fd.closed:

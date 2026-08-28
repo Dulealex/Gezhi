@@ -359,7 +359,7 @@ Job `ActiveProcesses=0` 后，对 final pathname执行一次权威 finalization�
 1. 不存在且没有early overflow witness：Knowledge正式 final为0 bytes；Literature按其合同表示为“不存在条件式资产”。
 2. 存在时，以普通文件、non-reparse、exclusive read/delete handle打开；成功exclusive open是writer source已关闭的证明。取得 FileId与实际size，从offset 0以65,536-byte chunks读取。
 3. size小于等于角色 cap时读完全部 bytes并验证 EOF；大于角色 cap时读取exact cap prefix与offset cap witness，锁存overflow。
-4. early witness的generation与最终generation不同，旧latch不能被清除；最终generation必须独立证明overflow，否则不能形成terminal capture。early witness后source缺失、不可读或最终generation缩至不大于cap也只能留staging。
+4. 存在early witness时，最终generation identity必须与其逐字相同；pathname替换成任何另一generation都不能形成terminal capture，即使replacement也独立超过cap。同一generation仍必须在权威读取中再次证明overflow；source缺失、不可读或缩至不大于cap也只能留staging。
 5. authoritative handle绑定当前generation完成删除（例如以delete-on-close语义），关闭后验证private pathname不再存在；不能close后按pathname误删replacement。
 
 任一角色的 formal final在overflow时恰为该角色 cap的 exact prefix；witness与tail不进入资产。非overflow时为完整source bytes。任何overflow final prefix都不能进入角色成功结果验证。
@@ -538,7 +538,7 @@ D01 另行冻结 test-only `CodexPipeCapacityObserverV1`。它的实现只位于
 | D13 | events为Knowledge cap+1 | latch只在真实第cap+1 byte；exact-cap prefix；一次Job stop；不可重试process_error |
 | D14 | final为Knowledge cap恰好值 | 无overflow；完整cap资产；T13不产生usage，T22 role adapter只从events形成usage receipt |
 | D15 | final为Knowledge cap+1且active probe读到witness | latch绑定generation；exact prefix；一次Job stop；process_error |
-| D16 | active final witness后pathname替换成小文件 | 不清latch、不拼generation、不提交terminal Answer；保留staging |
+| D16 | active final witness后pathname替换成任意另一generation，分别覆盖小文件与cap+1文件 | 不清latch、不拼generation、不接受replacement的独立overflow；不提交terminal role结果并保留staging |
 | D17 | active probe一直sharing violation，Job空后发现cap+1 | post-close锁存overflow并形成exact prefix；不对空Job调用terminate |
 | D18 | events sink在已写prefix后fault，double继续大量stdout | collector转drain-only并取得EOF；若role资产可安全形成则process_error，否则不terminal；无child block |
 | D19 | `TerminateJobObject`返回FALSE但double/descendant随后自然退出 | API失败事实保留；完整收敛后process_error；不以Job-close杀树 |

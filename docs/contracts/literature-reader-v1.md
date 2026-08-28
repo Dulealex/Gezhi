@@ -6,7 +6,7 @@
 
 `literature_reader_v1` 从一个 Canonical Reading Asset 生成一个 Reading Result 与一组 Candidate Draft。它们在一次逻辑 semantic read 中由相同的 `input.jsonl`、提示词与 Schema 产生，经 Python 完成 closed Schema、Evidence、locator 与预算验证后作为同一个不可变 Reader bundle 发布；任何合同或证据错误都不得部分发布。T14 不把 Draft 转换成正式 Candidate Knowledge；规范化、内容身份与 Review Queue 物化属于 T15 的确定性 successor publication。只有 T13 terminal evidence 已机械证明的超时可以触发有限 attempt；它仍是同一次逻辑 read 的传输重试，不是第二次语义阅读。
 
-相关决策：[ADR 0015](../adr/0015-normalize-reading-input-into-a-canonical-asset-bundle.md)、[ADR 0016](../adr/0016-combine-semantic-reading-and-candidate-drafting.md)、[ADR 0033](../adr/0033-use-two-isolated-codex-runtime-roles.md)、[ADR 0034](../adr/0034-version-and-snapshot-codex-prompts-and-schemas.md)、[ADR 0130](../adr/0130-publish-reader-drafts-before-candidate-materialization.md)、[ADR 0132](../adr/0132-bound-literature-reader-attempt-captures.md)。正式 Candidate 的共同合同见 [Candidate Knowledge v1](./candidate-knowledge-v1.md)。
+相关决策：[ADR 0015](../adr/0015-normalize-reading-input-into-a-canonical-asset-bundle.md)、[ADR 0016](../adr/0016-combine-semantic-reading-and-candidate-drafting.md)、[ADR 0033](../adr/0033-use-two-isolated-codex-runtime-roles.md)、[ADR 0034](../adr/0034-version-and-snapshot-codex-prompts-and-schemas.md)、[ADR 0130](../adr/0130-publish-reader-drafts-before-candidate-materialization.md)、[ADR 0132](../adr/0132-bound-literature-reader-attempt-captures.md)、[ADR 0133](../adr/0133-keep-t14-reader-bundles-inside-the-read-stage.md)。正式 Candidate 的共同合同见 [Candidate Knowledge v1](./candidate-knowledge-v1.md)。
 
 ## 输入边界
 
@@ -236,13 +236,15 @@ semantic/
 
 T14 的 `reading_result.json`、`candidate_drafts.json`、精确零字节 `candidate_knowledge.jsonl` 与空 `review_queue.json` 是一个不可分割的成功 Reader 结果；前两者使用版本化 Gezhi wrapper，manifest 记录实际 `candidate_draft_count`，同时固定 `candidate_count=0`。空 Candidate/Queue 文件只是固定清单中的“尚未物化”证据，不表示 T15 完成，也不允许后续原地填充。T15 必须从完整有效 Reader bundle 发布新的不可变 successor；精确 successor layout、Schema 与 current 规则由 T15 冻结。正式 Review Queue 仍只是待审核投影而不是审核权威状态；`catalog.sqlite3` 通过扫描有效 terminal authority、正式 Candidate、Work-owned Review 与 Handoff 重建，并忽略 staging、无效 manifest 和未提交结果。
 
+这个“成功 Reader 结果”只描述Reader子模块的不可变publication，不等于七阶段`read`已成功。T15 materializer尚不可用时，公开Resume按ADR 0133返回`blocked: reader_prerequisite_unavailable`，保持`stop_stage=read`、`pipeline_complete=false`且不把`read`列入`advanced_stages`；后续调用验证并复用bundle，不再次调用Codex。
+
 Gezhi 自有领域 payload JSON 顶层带 `schema_version`；Gezhi 自有 JSONL 由首条 header/metadata 或每条独立记录提供 Schema identity，标准 `schema.json` 使用 JSON Schema `$id` 标识版本。Codex `events.jsonl` 与 `final_message.txt` 保持提供方原始字节，`prompt.txt` 也不是 JSON；三者不注入 Gezhi 字段。所有文件的实际 SHA-256 统一由 manifest 记录，manifest 不保存自己的自哈希，其 SHA-256 由 `current.json`、Review 或 Handoff provenance 记录。
 
 ## 超时、重试与用量审计
 
 每个 Literature Codex attempt 必须满足 [ADR 0106](../adr/0106-run-command-owned-children-without-a-console.md)：commitment 前由项目 resolver 证明唯一 native CLI，随后用 no-console/no-process-group、三项 stdio handle allowlist 与 suspended→attempt-exclusive Job→resume 的唯一顺序直接创建该 root，不经 `tools/codex.ps1`、PowerShell、shell 或隐藏 `--version` child。Prompt 通过专用 stdin pipe，`--json` 原始 bytes 通过专用 stdout pipe 形成 `events.jsonl`，stderr 唯一导向 `NUL`，`--output-last-message` 仍形成本合同的 `final_message.txt`；timeout/interruption 只通过 Job-owned tree stop，child exit 不反向生成父 cancellation。
 
-每个 Codex attempt 的 wall-clock 超时为 30 分钟；首次调用后只对 T13 terminal evidence 已机械证明的 `timeout` 最多重试两次，退避依次为 10 秒和 30 秒，因此最多 3 个 attempt，整个 read 阶段 wall-clock 安全上限为 95 分钟。每次 attempt 必须使用完全相同且已哈希的 `input.jsonl`、`prompt.txt` 与 `schema.json`，启动全新进程和临时目录；任何 attempt 的部分输出都不进入下一次。超时必须终止整个 Codex 子进程树并保留批准上限内已有的原始 JSONL bytes。
+每个 Codex attempt 的 wall-clock 超时为 30 分钟；首次调用后只对 T13 terminal evidence 已机械证明的 `timeout` 最多重试两次，退避依次为 10 秒和 30 秒，因此最多 3 个 attempt，整个 read 阶段 wall-clock 安全上限为 95 分钟。第一次成功启动形成的absolute `shared_deadline_monotonic_ns`必须从terminal evidence逐字传入后续每个retry plan；不得为第二或第三次attempt重建95分钟窗口，退避时间也自然消耗同一窗口。每次 attempt 必须使用完全相同且已哈希的 `input.jsonl`、`prompt.txt` 与 `schema.json`，启动全新进程和临时目录；任何 attempt 的部分输出都不进入下一次。超时必须终止整个 Codex 子进程树并保留批准上限内已有的原始 JSONL bytes。
 
 Reader 为每个 attempt 独立冻结 `events.jsonl` 16,777,216 bytes与`final_message.txt` 1,048,576 bytes的逐文件cap；两项cap都包含端点，恰好等于cap不是overflow。第cap+1个实际byte才单调锁存`overflow=true`，正式资产只保留exact-cap prefix；若此时Job仍非空，orchestrator只执行一次整棵Job stop。安全收敛后该attempt固定为不可重试`failure_class=process_error`，公开结果为`failed: codex_process_failed`。Reader没有实际final source时仍不创建`final_message.txt`；不能为了形成固定pair补零字节文件。manifest与attempt inventory记录这些有界资产的实际byte length与SHA-256。两项Reader常量虽与Knowledge现值相同，但所有权、测试与演进独立；改变数值、端点、prefix、stop、failure mapping或缺失final语义都必须升级`literature_reader_v1`角色/合同版本。
 
