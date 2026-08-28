@@ -355,7 +355,6 @@ class ReaderAttemptRequestV1:
     schema_path: Path
     codex_home: Path
     literature_root: Path
-    knowledge_root: Path
     source_environment: Mapping[str, str]
     existing_shared_deadline_monotonic_ns: int | None
 
@@ -402,10 +401,10 @@ def _run_role_attempt_v1(
 ) -> PreAttemptRejectedV1 | AttemptTerminalEvidenceV1:
     try:
         workspace = freeze_codex_attempt_workspace_v1(
+            role="literature_reader_v1",
             attempt_root=request.attempt_root,
             attempt_ordinal=request.attempt_ordinal,
             literature_authoritative_root=request.literature_root,
-            knowledge_authoritative_root=request.knowledge_root,
         )
         plan = freeze_codex_role_launch_v1(
             runtime=request.runtime,
@@ -1668,7 +1667,6 @@ def advance_reader_v1(
     canonical: CurrentCanonicalAssetV1,
     *,
     root: ValidatedDataRootV1,
-    knowledge_root: Path,
     source_environment: Mapping[str, str],
 ) -> ReaderAdvanceV1:
     """Publish or reuse one evidence-bound zero-Candidate semantic result."""
@@ -1783,7 +1781,6 @@ def advance_reader_v1(
                         schema_path=stage / "schema.json",
                         codex_home=codex_home,
                         literature_root=Path(literature_path),
-                        knowledge_root=knowledge_root,
                         source_environment=effective_environment,
                         existing_shared_deadline_monotonic_ns=(
                             shared_deadline_monotonic_ns

@@ -188,7 +188,11 @@ def _plan(
     )
 
 
-def _production_plan(tmp_path: Path):  # type: ignore[no-untyped-def]
+def _production_plan(
+    tmp_path: Path,
+    *,
+    role: str = "literature_reader_v1",
+):  # type: ignore[no-untyped-def]
     project = tmp_path / "project"
     project.mkdir()
     build_project_codex_runtime_fixture_v1(project)
@@ -204,15 +208,24 @@ def _production_plan(tmp_path: Path):  # type: ignore[no-untyped-def]
     codex_home = tmp_path / "codex-home"
     for path in (literature, knowledge, codex_home):
         path.mkdir()
-    workspace = freeze_codex_attempt_workspace_v1(
-        attempt_root=attempt,
-        attempt_ordinal=1,
-        literature_authoritative_root=literature,
-        knowledge_authoritative_root=knowledge,
+    workspace = (
+        freeze_codex_attempt_workspace_v1(
+            role="literature_reader_v1",
+            attempt_root=attempt,
+            attempt_ordinal=1,
+            literature_authoritative_root=literature,
+        )
+        if role == "literature_reader_v1"
+        else freeze_codex_attempt_workspace_v1(
+            role="knowledge_answerer_v1",
+            attempt_root=attempt,
+            attempt_ordinal=1,
+            knowledge_authoritative_root=knowledge,
+        )
     )
     plan = freeze_codex_role_launch_v1(
         runtime=resolve_codex_runtime_v1(project),
-        role="literature_reader_v1",
+        role=role,
         prompt=b"production-boundary-test",
         attempt_ordinal=1,
         workspace=workspace,
@@ -2077,15 +2090,19 @@ def test_stale_plan_cannot_launch_after_attempt_root_generation_replacement(
 
 
 @pytest.mark.parametrize(
-    "directory_name",
-    ["literature-authoritative", "knowledge-authoritative"],
+    ("role", "directory_name"),
+    [
+        ("literature_reader_v1", "literature-authoritative"),
+        ("knowledge_answerer_v1", "knowledge-authoritative"),
+    ],
 )
 def test_stale_plan_cannot_launch_after_authoritative_root_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    role: str,
     directory_name: str,
 ) -> None:
-    plan, paths = _production_plan(tmp_path)
+    plan, paths = _production_plan(tmp_path, role=role)
     target = paths[directory_name]
     with windows_root.open_validated_data_root_v1(str(target)) as opened:
         old_identity = opened.inspection.identity

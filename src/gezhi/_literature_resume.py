@@ -3218,7 +3218,6 @@ def resume_work(
     work_id: str,
     *,
     root: ValidatedDataRootV1,
-    knowledge_root: Path | None = None,
     source_environment: Mapping[str, str] | None = None,
 ) -> ResumeWorkResultV1:
     if type(work_id) is not str or _WORK_ID.fullmatch(work_id) is None:
@@ -3300,7 +3299,7 @@ def resume_work(
         start_stage: ResumeStage = (
             "ocr" if ocr_advanced else "canonicalize" if canonical.advanced else "read"
         )
-        if knowledge_root is None or source_environment is None:
+        if source_environment is None:
             _stop_stage(
                 authority,
                 root,
@@ -3322,7 +3321,6 @@ def resume_work(
                 authority,
                 canonical.current,
                 root=root,
-                knowledge_root=knowledge_root,
                 source_environment=source_environment,
             )
         except ReaderStageStoppedV1 as error:

@@ -64,13 +64,13 @@ run_codex_child(
 - attempt ordinal、私有 capture namespace 与 fresh final spool pathname；
 - role-owned capture profile；
 - role-owned 单 attempt timeout duration/policy、同一 monotonic clock domain，以及仅在前一次成功启动已建立时才存在的 shared absolute deadline；
-- attempt root、working/TEMP/SQLite/capture parent、Literature/Knowledge authoritative root 与 `CODEX_HOME` 的 frozen directory identity；attempt root 另冻结恰含 `captures`、`sqlite`、`temporary`、`working` 四个 immediate directory 的 exact entry set，四个 child 另冻结 exact empty entry set；
+- attempt root、working/TEMP/SQLite/capture parent、当前 role 实际消费的唯一 authoritative root 与 `CODEX_HOME` 的 frozen directory identity；attempt root 另冻结恰含 `captures`、`sqlite`、`temporary`、`working` 四个 immediate directory 的 exact entry set，四个 child 另冻结 exact empty entry set；未消费 Context 的 root 不进入 plan；
 - Schema 的 canonical path、FileIdentity、size 与 SHA-256；
 - commitment 前已经通过的 prompt/Schema/config/provenance/audit prerequisites。
 
 该 plan 不含秘密的持久副本，不允许把 prompt/Question 放进 argv，也不允许在模块内改选 executable、model、reasoning 或 role。plan 与其 attempt workspace 都是 non-cloneable sealed value：公开构造器拒绝实例化，只有 role module 的 private exact-field builder 能物化；`dataclasses.replace`、字段复制、伪造 seal 或只伪造 `proof_kind` 不能通过本模块的完整 seal/proof validation。
 
-模块在 commitment 前以 no-follow handle 重新打开并持有 executable、Schema 与上述目录 capability，逐项复验 frozen identity；executable/Schema 同时复验 size 与 SHA-256，attempt root 复验 exact four-name directory entry set，四个 attempt child 复验 exact empty entry set，Literature/Knowledge authoritative root 与 `CODEX_HOME` 只复验 directory identity。任一同路径替换、generation 变化、内容变化或 private namespace 漂移都必须在 `CreateProcessW` 前得到 `PreAttemptRejected`；最后一次复验后不得再释放这些 path guard 再按 pathname 重开。若一个已打开但不匹配的 capability 在拒绝路径上无法确定关闭，结果必须升级为 `UNSAFE_HOLD`，不能以 `PreAttemptRejected` 与伪造 ledger=0 降级。
+模块在 commitment 前以 no-follow handle 重新打开并持有 executable、Schema 与上述目录 capability，逐项复验 frozen identity；executable/Schema 同时复验 size 与 SHA-256，attempt root 复验 exact four-name directory entry set，四个 attempt child 复验 exact empty entry set，唯一 role-owned authoritative root 与 `CODEX_HOME` 只复验 directory identity。任一同路径替换、generation 变化、内容变化或 private namespace 漂移都必须在 `CreateProcessW` 前得到 `PreAttemptRejected`；最后一次复验后不得再释放这些 path guard 再按 pathname 重开。若一个已打开但不匹配的 capability 在拒绝路径上无法确定关闭，结果必须升级为 `UNSAFE_HOLD`，不能以 `PreAttemptRejected` 与伪造 ledger=0 降级。
 
 plan 绝不预存「从未来成功启动时刻计算」的 absolute attempt deadline。30-minute 规则仍由两个角色各自拥有，plan 只携带该角色已冻结的 duration/policy；模块仅在 `ResumeThread` 精确返回 `1` 后采集 `provider_started_at`，再在同一 monotonic domain 内派生本 attempt 的 absolute deadline。Knowledge 第一次成功启动还在同一转换中建立 95-minute shared absolute deadline；后续 retry 的新 plan 只能携带这个已经存在且不可变的 shared deadline。第一次启动前不存在可推测的 shared deadline。所有 duration、deadline 与可用 observation 都是非负 integer nanoseconds，禁止 bool、float 或 wall-clock duration 进入裁决。
 

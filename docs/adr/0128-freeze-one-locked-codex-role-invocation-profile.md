@@ -15,7 +15,7 @@
 - executable 只能来自 project-pinned resolver 形成的 sealed proof；proof 身份由语言中立 `runtimes/codex/runtime-identity-v1.json` 冻结，并携带 executable path、FileIdentity、size 与 SHA-256；test double 使用不同 `proof_kind` 的私有 factory；
 - 固定 Codex CLI `0.146.0`、模型 `gpt-5.6-sol`、reasoning `high`；
 - prompt 只经 stdin，Schema 与 final spool 只经 absolute path；
-- cwd、TEMP、SQLite 与 capture parent 来自 non-cloneable sealed attempt workspace；公开构造、`dataclasses.replace`、字段复制或伪造 seal 均不产生授权值；attempt root 冻结恰含四个 child 的 entry set，四个 child 冻结为空，commitment 前连同 Literature/Knowledge authoritative roots 的 identity 一并持有复验；Schema 另绑定 identity、size 与 SHA-256；
+- cwd、TEMP、SQLite 与 capture parent 来自 non-cloneable sealed attempt workspace；公开构造、`dataclasses.replace`、字段复制或伪造 seal 均不产生授权值；attempt root 冻结恰含四个 child 的 entry set，四个 child 冻结为空，commitment 前连同当前 role 实际消费的 authoritative root identity 一并持有复验；Schema 另绑定 identity、size 与 SHA-256；
 - 使用 `--ephemeral`、`--ignore-user-config`、`--ignore-rules`、`--strict-config`、只读 sandbox 与 `approval_policy="never"`；
 - 显式关闭 web search、shell、browser、computer use、MCP/plugin/skill discovery、multi-agent 及其他无关模型工具；
 - child environment 是大小写闭合、排序确定的最小 allowlist；不继承 PATH、HOME、USERPROFILE、APPDATA、LOCALAPPDATA、ComSpec、RUST_LOG 或未知变量；
@@ -25,3 +25,5 @@
 ## 结果
 
 新增 Bot 若采用同一 process module，必须显式选择一个版本化 role invocation profile；不能通过环境变量 executable override、PATH fallback 或复制用户环境接入。Codex CLI 升级时必须先新增或更新合同、锁文件、feature list 与 deterministic tests，不能只更新全局 Codex。
+
+[ADR 0134](./0134-prove-only-the-data-root-consumed-by-a-codex-role.md) 后续替换了同时证明 Literature/Knowledge 两个 root 的旧边界：workspace 绑定唯一 role，只 physical probe 该 role 实际消费的 Context Data Root。

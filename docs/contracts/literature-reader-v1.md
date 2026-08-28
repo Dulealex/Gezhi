@@ -6,11 +6,11 @@
 
 `literature_reader_v1` 从一个 Canonical Reading Asset 生成一个 Reading Result 与一组 Candidate Draft。它们在一次逻辑 semantic read 中由相同的 `input.jsonl`、提示词与 Schema 产生，经 Python 完成 closed Schema、Evidence、locator 与预算验证后作为同一个不可变 Reader bundle 发布；任何合同或证据错误都不得部分发布。T14 不把 Draft 转换成正式 Candidate Knowledge；规范化、内容身份与 Review Queue 物化属于 T15 的确定性 successor publication。只有 T13 terminal evidence 已机械证明的超时可以触发有限 attempt；它仍是同一次逻辑 read 的传输重试，不是第二次语义阅读。
 
-相关决策：[ADR 0015](../adr/0015-normalize-reading-input-into-a-canonical-asset-bundle.md)、[ADR 0016](../adr/0016-combine-semantic-reading-and-candidate-drafting.md)、[ADR 0033](../adr/0033-use-two-isolated-codex-runtime-roles.md)、[ADR 0034](../adr/0034-version-and-snapshot-codex-prompts-and-schemas.md)、[ADR 0130](../adr/0130-publish-reader-drafts-before-candidate-materialization.md)、[ADR 0132](../adr/0132-bound-literature-reader-attempt-captures.md)、[ADR 0133](../adr/0133-keep-t14-reader-bundles-inside-the-read-stage.md)。正式 Candidate 的共同合同见 [Candidate Knowledge v1](./candidate-knowledge-v1.md)。
+相关决策：[ADR 0015](../adr/0015-normalize-reading-input-into-a-canonical-asset-bundle.md)、[ADR 0016](../adr/0016-combine-semantic-reading-and-candidate-drafting.md)、[ADR 0033](../adr/0033-use-two-isolated-codex-runtime-roles.md)、[ADR 0034](../adr/0034-version-and-snapshot-codex-prompts-and-schemas.md)、[ADR 0130](../adr/0130-publish-reader-drafts-before-candidate-materialization.md)、[ADR 0132](../adr/0132-bound-literature-reader-attempt-captures.md)、[ADR 0133](../adr/0133-keep-t14-reader-bundles-inside-the-read-stage.md)、[ADR 0134](../adr/0134-prove-only-the-data-root-consumed-by-a-codex-role.md)。正式 Candidate 的共同合同见 [Candidate Knowledge v1](./candidate-knowledge-v1.md)。
 
 ## 输入边界
 
-首个可执行切片只接收当前 Work、Source、Canonical run 的身份与哈希及其 Canonical Reading Asset，不接收 Research Interest。它不得读取原始 PDF、MinerU vendor 产物、Knowledge Registry、仓库源码、用户 `AGENTS.md`、skills、个人配置或网络内容。
+首个可执行切片只接收当前 Work、Source、Canonical run 的身份与哈希及其 Canonical Reading Asset，不接收 Research Interest。它不得读取原始 PDF、MinerU vendor 产物、Knowledge Registry、仓库源码、用户 `AGENTS.md`、skills、个人配置或网络内容；Reader workspace/child 也不得 physical open、probe 或冻结 Knowledge Data Root identity。
 
 Research Interest 的领域位置与未来输入位置保留，但只有在其权威存储、管理入口和用户交互被单独设计后才能启用；启用时必须升级 Codex 角色版本。
 

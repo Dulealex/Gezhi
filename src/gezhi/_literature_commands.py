@@ -842,7 +842,6 @@ def run_resume(
                     result = resume_work(
                         work_id,
                         root=root,
-                        knowledge_root=Path(configuration.knowledge_data_root),
                         source_environment=os.environ.copy(),
                     )
                 except ResumeStoppedV1 as error:

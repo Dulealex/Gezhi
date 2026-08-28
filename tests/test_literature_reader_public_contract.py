@@ -258,7 +258,6 @@ def _timeout_then_success_sitecustomize(site_root: Path) -> None:
 import os
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import gezhi._literature_reader as reader
 from gezhi._codex_child_process import _run_codex_child_test_double_v1
@@ -270,10 +269,6 @@ def resolve_runtime(_project_root):
     previous = int(counter.read_text(encoding="ascii")) if counter.exists() else 0
     counter.write_text(str(previous + 1), encoding="ascii")
     return object()
-
-
-def freeze_workspace(**values):
-    return SimpleNamespace(attempt_root=values["attempt_root"])
 
 
 def freeze_launch(
@@ -288,7 +283,7 @@ def freeze_launch(
         "a", encoding="ascii"
     ) as target:
         target.write(f"{existing_shared_deadline_monotonic_ns}\\n")
-    attempt_root = workspace.attempt_root
+    attempt_root = Path(workspace.attempt_root)
     capture_parent = attempt_root / "captures"
     capture = capture_parent / f"{attempt_ordinal:02d}"
     staging = capture_parent / f".{attempt_ordinal:02d}.codex-stage"
@@ -339,7 +334,6 @@ def record_wait(seconds):
 
 
 reader.resolve_codex_runtime_v1 = resolve_runtime
-reader.freeze_codex_attempt_workspace_v1 = freeze_workspace
 reader.freeze_codex_role_launch_v1 = freeze_launch
 reader.run_codex_child_v1 = _run_codex_child_test_double_v1
 reader._wait_before_retry_v1 = record_wait
@@ -537,6 +531,7 @@ def test_public_resume_retries_once_and_publishes_an_evidence_bound_draft(
     launcher_index: int,
 ) -> None:
     literature_root, knowledge_root, pdf_path, runtime_base = reader_workspace
+    unavailable_knowledge_root = runtime_base / "missing-knowledge"
     source_text = (
         "This native PDF contains explicit searchable evidence for the Reader."
     )
@@ -624,7 +619,7 @@ def test_public_resume_retries_once_and_publishes_an_evidence_bound_draft(
                 "--literature-data-root",
                 str(literature_root),
                 "--knowledge-data-root",
-                str(knowledge_root),
+                str(unavailable_knowledge_root),
                 "literature",
                 "resume",
                 str(added["work_id"]),
@@ -813,7 +808,7 @@ def test_public_resume_retries_once_and_publishes_an_evidence_bound_draft(
                 "--literature-data-root",
                 str(literature_root),
                 "--knowledge-data-root",
-                str(knowledge_root),
+                str(unavailable_knowledge_root),
                 "literature",
                 "resume",
                 str(added["work_id"]),
@@ -860,7 +855,7 @@ def test_public_resume_retries_once_and_publishes_an_evidence_bound_draft(
                 "--literature-data-root",
                 str(literature_root),
                 "--knowledge-data-root",
-                str(knowledge_root),
+                str(unavailable_knowledge_root),
                 "literature",
                 "resume",
                 str(added["work_id"]),

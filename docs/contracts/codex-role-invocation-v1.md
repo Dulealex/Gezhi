@@ -113,11 +113,11 @@ Literature 的条件式 final capture 不改变 production argv：它仍提供 f
 
 ## 5. cwd 与 path profile
 
-role builder 先形成一个 sealed attempt workspace。其 root 恰好只有 `captures`、`sqlite`、`temporary`、`working` 四个 immediate directory，四者在 plan formation 与 commitment 前复验时都为空；root 与四个 child 的 canonical path 和 FileIdentity 一并冻结。Literature/Knowledge authoritative root 同样取得 FileIdentity、只冻结 identity 而不冻结业务 entry set，并与 attempt root 物理隔离。attempt ordinal 只由 builder 派生 `captures/NN` 与 `captures/.NN.codex-stage`，调用方不能分别拼接这些路径。
+role builder 先形成一个绑定唯一 role 的 sealed attempt workspace。其 root 恰好只有 `captures`、`sqlite`、`temporary`、`working` 四个 immediate directory，四者在 plan formation 与 commitment 前复验时都为空；root 与四个 child 的 canonical path 和 FileIdentity 一并冻结。只有该 role 实际消费的 authoritative root 取得 FileIdentity：`literature_reader_v1`只证明 Literature root，`knowledge_answerer_v1`只证明 Knowledge root；未消费 Context 的 root 不做 physical open/probe。role-owned root只冻结 identity而不冻结业务 entry set，并与 attempt root物理隔离。attempt ordinal 只由 builder 派生 `captures/NN` 与 `captures/.NN.codex-stage`，调用方不能分别拼接这些路径；精确边界由 [ADR 0134](../adr/0134-prove-only-the-data-root-consumed-by-a-codex-role.md) 冻结。
 
-working directory、Schema、`CODEX_HOME`、`CODEX_SQLITE_HOME`、TEMP/TMP 与 capture parent 都必须在 commitment 前通过 no-follow、无 reparse 的 absolute local path validation。plan 到 commitment 之间，child module 重新打开并持有关键 path capability：attempt root 必须仍是同一 FileIdentity 且 immediate entry set 恰为上述四个目录；`captures`、`sqlite`、`temporary`、`working` 四个 child 必须仍是各自冻结的 FileIdentity 与 exact empty entry set；Literature/Knowledge authoritative root 与 `CODEX_HOME` 只复验 directory identity；project-pinned executable 必须仍匹配 runtime proof 的 identity、size 与 SHA-256；Schema 必须仍匹配 plan 冻结的 identity、size 与 SHA-256。同路径删除重建、pathname replacement 或原地内容修改均在 `CreateProcessW` 前拒绝。working directory：
+working directory、Schema、`CODEX_HOME`、`CODEX_SQLITE_HOME`、TEMP/TMP 与 capture parent 都必须在 commitment 前通过 no-follow、无 reparse 的 absolute local path validation。plan 到 commitment 之间，child module 重新打开并持有关键 path capability：attempt root 必须仍是同一 FileIdentity 且 immediate entry set 恰为上述四个目录；`captures`、`sqlite`、`temporary`、`working` 四个 child 必须仍是各自冻结的 FileIdentity 与 exact empty entry set；唯一 role-owned authoritative root 与 `CODEX_HOME` 只复验 directory identity；project-pinned executable 必须仍匹配 runtime proof 的 identity、size 与 SHA-256；Schema 必须仍匹配 plan 冻结的 identity、size 与 SHA-256。同路径删除重建、pathname replacement 或原地内容修改均在 `CreateProcessW` 前拒绝。working directory：
 
-- 已存在、attempt-private，且不是项目目录、Literature/Knowledge authoritative store 或它们的祖先；
+- 已存在、attempt-private，且不是项目目录、当前 role-owned authoritative store 或其祖先；
 - 不依赖 Git，故 argv 固定使用 `--skip-git-repo-check`；
 - 不含项目 `.codex`、`AGENTS.md`、rules、plugins、skills 或业务资产；
 - read-only sandbox 仍保留为第二道 model-tool 防线，不能替代禁用工具。
