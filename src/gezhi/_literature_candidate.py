@@ -11,7 +11,11 @@ from typing import Literal, TypeAlias, cast
 
 from pydantic import ValidationError
 
-from gezhi._literature_canonical import CurrentCanonicalAssetV1
+from gezhi._literature_canonical import (
+    CurrentCanonicalAssetV1,
+    _CanonicalInvalidV1,
+    _load_run,
+)
 from gezhi._literature_intake import ActiveSourceAuthorityV1
 from gezhi._literature_reader import (
     CandidateDraftV1,
@@ -65,6 +69,10 @@ _MATERIALIZATION_RUN_ID = re.compile(
 )
 _READER_RUN_ID = re.compile(
     r"^semrun_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+_CANONICAL_RUN_ID = re.compile(
+    r"^canrun_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
     r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
 _KIND_ORDER = {
@@ -964,6 +972,49 @@ def _reader_from_materialization_manifest(
     )
 
 
+def _canonical_for_reader(
+    authority: ActiveSourceAuthorityV1,
+    reader: ReaderAdvanceV1,
+) -> CurrentCanonicalAssetV1:
+    semantic_run = authority.source_directory / "semantic" / "runs" / reader.run_id
+    try:
+        manifest, manifest_bytes = _read_canonical_object_v1(
+            semantic_run / "manifest.json"
+        )
+        canonical_run_id = manifest.get("canonical_run_id")
+        canonical_manifest_sha256 = manifest.get("canonical_manifest_sha256")
+        canonical_content_sha256 = manifest.get("canonical_content_sha256")
+        if (
+            hashlib.sha256(manifest_bytes).hexdigest() != reader.manifest_sha256
+            or type(canonical_run_id) is not str
+            or _CANONICAL_RUN_ID.fullmatch(canonical_run_id) is None
+            or type(canonical_manifest_sha256) is not str
+            or _SHA256.fullmatch(canonical_manifest_sha256) is None
+            or type(canonical_content_sha256) is not str
+            or _SHA256.fullmatch(canonical_content_sha256) is None
+        ):
+            raise ValueError("Historical Reader Canonical binding is invalid")
+        canonical_run = _load_run(
+            authority.source_directory / "canonical" / "runs" / canonical_run_id,
+            canonical_run_id,
+            authority,
+        )
+        if (
+            canonical_run.manifest_sha256 != canonical_manifest_sha256
+            or canonical_run.canonical_content_sha256 != canonical_content_sha256
+        ):
+            raise ValueError("Historical Canonical authority differs")
+    except _CanonicalInvalidV1 as error:
+        raise ValueError("Historical Canonical authority is invalid") from error
+    return CurrentCanonicalAssetV1(
+        run_id=canonical_run.run_id,
+        run_directory=canonical_run.path,
+        input_fingerprint_sha256=canonical_run.input_fingerprint_sha256,
+        manifest_sha256=canonical_run.manifest_sha256,
+        canonical_content_sha256=canonical_run.canonical_content_sha256,
+    )
+
+
 def _validate_pointed_success(
     runs_dir: Path,
     run_id: str,
@@ -982,19 +1033,24 @@ def _validate_pointed_success(
         pointed_reader.run_id == reader.run_id
         and pointed_reader.manifest_sha256 == reader.manifest_sha256
     )
+    pointed_canonical = (
+        canonical
+        if matches_current_reader
+        else _canonical_for_reader(authority, pointed_reader)
+    )
     pointed_bundle = (
         bundle
         if matches_current_reader
         else _reader_bundle_for_run(
             authority,
-            canonical,
+            pointed_canonical,
             pointed_reader,
             require_current=False,
         )
     )
     materialized = _materialized_documents(
         authority,
-        canonical,
+        pointed_canonical,
         pointed_reader,
         pointed_bundle,
         run_id,
@@ -1003,7 +1059,7 @@ def _validate_pointed_success(
         runs_dir / run_id,
         run_id,
         authority,
-        canonical,
+        pointed_canonical,
         pointed_reader,
         materialized,
         expected_manifest_sha256=manifest_sha256,
@@ -1073,7 +1129,7 @@ def _recover_next_pointer(
     reader: ReaderAdvanceV1,
     bundle: _ReaderBundleV1,
     root: ValidatedDataRootV1,
-) -> CandidateMaterializationAdvanceV1 | None:
+) -> tuple[CandidateMaterializationAdvanceV1, bool] | None:
     if not _name_exists(materializations, ".current.next.json"):
         return None
     try:
@@ -1081,7 +1137,7 @@ def _recover_next_pointer(
             materializations / ".current.next.json"
         )
         next_run_id, next_manifest_sha256 = _pointer_identity(next_pointer)
-        materialized, observed, _matches_current_reader = _validate_pointed_success(
+        materialized, observed, matches_current_reader = _validate_pointed_success(
             runs_dir,
             next_run_id,
             next_manifest_sha256,
@@ -1089,6 +1145,11 @@ def _recover_next_pointer(
             canonical,
             reader,
             bundle,
+        )
+        _ensure_no_historical_identity_conflicts(
+            runs_dir,
+            authority,
+            materialized,
         )
         _commit_next_pointer(materializations, authority, root, next_bytes)
     except CandidateMaterializationAuthorityStoppedV1:
@@ -1106,11 +1167,14 @@ def _recover_next_pointer(
         raise CandidateMaterializationRecoveryUncertainV1(
             "Materialization next pointer cannot be recovered"
         ) from error
-    return CandidateMaterializationAdvanceV1(
-        advanced=True,
-        run_id=next_run_id,
-        manifest_sha256=observed,
-        pending_candidate_ids=materialized.pending_candidate_ids,
+    return (
+        CandidateMaterializationAdvanceV1(
+            advanced=True,
+            run_id=next_run_id,
+            manifest_sha256=observed,
+            pending_candidate_ids=materialized.pending_candidate_ids,
+        ),
+        matches_current_reader,
     )
 
 
@@ -1141,6 +1205,11 @@ def _load_or_recover_current(
                 )
             )
             if matches_current_reader:
+                _ensure_no_historical_identity_conflicts(
+                    runs_dir,
+                    authority,
+                    materialized,
+                )
                 return CandidateMaterializationAdvanceV1(
                     advanced=False,
                     run_id=run_id,
@@ -1204,6 +1273,11 @@ def _load_or_recover_current(
     if not matches:
         return None
     run_id, manifest_sha256, materialized = matches[0]
+    _ensure_no_historical_identity_conflicts(
+        runs_dir,
+        authority,
+        materialized,
+    )
     _replace_current(
         materializations,
         authority,
@@ -1315,7 +1389,9 @@ def advance_candidate_materialization_v1(
         root,
     )
     if next_recovered is not None:
-        return next_recovered
+        recovered_advance, satisfies_current_reader = next_recovered
+        if satisfies_current_reader:
+            return recovered_advance
 
     _recover_staging(
         staging_dir,

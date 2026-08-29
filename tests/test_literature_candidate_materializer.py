@@ -103,6 +103,16 @@ def _canonical() -> CurrentCanonicalAssetV1:
     )
 
 
+def _historical_canonical() -> CurrentCanonicalAssetV1:
+    return CurrentCanonicalAssetV1(
+        run_id="canrun_323e4567-e89b-42d3-a456-426614174000",
+        run_directory=Path("historical-canonical"),
+        input_fingerprint_sha256="3" * 64,
+        manifest_sha256="4" * 64,
+        canonical_content_sha256="5" * 64,
+    )
+
+
 def _reader(
     *,
     run_id: str = _READER_RUN_ID,
@@ -149,10 +159,13 @@ def _write_committed_materialization(
     reader: ReaderAdvanceV1,
     bundle: candidate._ReaderBundleV1,
     run_id: str,
+    *,
+    canonical: CurrentCanonicalAssetV1 | None = None,
 ) -> tuple[candidate._MaterializedBytesV1, str]:
+    selected_canonical = _canonical() if canonical is None else canonical
     materialized = candidate._materialized_documents(
         authority,
-        _canonical(),
+        selected_canonical,
         reader,
         bundle,
         run_id,
@@ -170,7 +183,7 @@ def _write_committed_materialization(
     (result_dir / "review_queue.json").write_bytes(materialized.queue_bytes)
     manifest_bytes = candidate._manifest_bytes(
         authority,
-        _canonical(),
+        selected_canonical,
         reader,
         materialized,
         run_id,
@@ -378,6 +391,7 @@ def test_valid_historical_current_repairs_the_current_reader_success(
     )
     historical_bundle = _bundle(reading, drafts)
     current_bundle = _bundle(reading, drafts)
+    historical_canonical = _historical_canonical()
     historical_run_id = _MATERIALIZATION_RUN_ID
     current_run_id = "matrun_223e4567-e89b-42d3-a456-426614174000"
     _, historical_manifest_sha256 = _write_committed_materialization(
@@ -386,6 +400,7 @@ def test_valid_historical_current_repairs_the_current_reader_success(
         historical_reader,
         historical_bundle,
         historical_run_id,
+        canonical=historical_canonical,
     )
     current_materialized, current_manifest_sha256 = (
         _write_committed_materialization(
@@ -407,6 +422,20 @@ def test_valid_historical_current_repairs_the_current_reader_success(
     )
     _allow_plain_test_filesystem(monkeypatch)
 
+    def resolve_historical_canonical(
+        supplied_authority: ActiveSourceAuthorityV1,
+        supplied_reader: ReaderAdvanceV1,
+    ) -> CurrentCanonicalAssetV1:
+        assert supplied_authority == authority
+        assert supplied_reader.run_id == historical_reader.run_id
+        return historical_canonical
+
+    monkeypatch.setattr(
+        candidate,
+        "_canonical_for_reader",
+        resolve_historical_canonical,
+    )
+
     def load_historical_bundle(
         supplied_authority: ActiveSourceAuthorityV1,
         supplied_canonical: CurrentCanonicalAssetV1,
@@ -415,7 +444,7 @@ def test_valid_historical_current_repairs_the_current_reader_success(
         require_current: bool,
     ) -> candidate._ReaderBundleV1:
         assert supplied_authority == authority
-        assert supplied_canonical == _canonical()
+        assert supplied_canonical == historical_canonical
         assert not require_current
         assert supplied_reader.run_id == historical_reader.run_id
         return historical_bundle
@@ -444,6 +473,137 @@ def test_valid_historical_current_repairs_the_current_reader_success(
     assert json.loads((materializations / "current.json").read_bytes())[
         "run_id"
     ] == current_run_id
+
+
+def test_historical_next_is_committed_but_does_not_satisfy_current_reader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "source"
+    authority = _authority(source_dir)
+    materializations = source_dir / "semantic" / "materializations"
+    runs_dir = materializations / "runs"
+    runs_dir.mkdir(parents=True)
+    historical_reader = _reader()
+    current_reader = _reader(
+        run_id="semrun_223e4567-e89b-42d3-a456-426614174000",
+        manifest_sha256="e" * 64,
+    )
+    historical_canonical = _historical_canonical()
+    historical_bundle = _bundle(_reading_result(with_descriptors=False), [])
+    current_bundle = _bundle(_reading_result(with_descriptors=False), [])
+    materialized, manifest_sha256 = _write_committed_materialization(
+        runs_dir,
+        authority,
+        historical_reader,
+        historical_bundle,
+        _MATERIALIZATION_RUN_ID,
+        canonical=historical_canonical,
+    )
+    next_bytes = candidate._canonical_file_bytes(
+        {
+            "manifest_sha256": manifest_sha256,
+            "run_id": _MATERIALIZATION_RUN_ID,
+            "schema_version": "gezhi.candidate_materialization_current.v1",
+        }
+    )
+    (materializations / ".current.next.json").write_bytes(next_bytes)
+    _allow_plain_test_filesystem(monkeypatch)
+    monkeypatch.setattr(
+        candidate,
+        "_canonical_for_reader",
+        lambda _authority_value, _reader_value: historical_canonical,
+    )
+    monkeypatch.setattr(
+        candidate,
+        "_reader_bundle_for_run",
+        lambda *_args, **_kwargs: historical_bundle,
+    )
+
+    recovered = candidate._recover_next_pointer(
+        materializations,
+        runs_dir,
+        authority,
+        _canonical(),
+        current_reader,
+        current_bundle,
+        cast(ValidatedDataRootV1, object()),
+    )
+
+    assert recovered is not None
+    advance, satisfies_current_reader = recovered
+    assert not satisfies_current_reader
+    assert advance.pending_candidate_ids == materialized.pending_candidate_ids
+    assert (materializations / "current.json").read_bytes() == next_bytes
+
+
+def test_reused_current_rejects_a_cross_successor_identity_collision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "source"
+    authority = _authority(source_dir)
+    materializations = source_dir / "semantic" / "materializations"
+    runs_dir = materializations / "runs"
+    runs_dir.mkdir(parents=True)
+    reader = _reader()
+    reading = _reading_result(with_descriptors=False)
+    first_bundle = _bundle(
+        reading,
+        [
+            CandidateDraftV1(
+                candidate_type="claim",
+                descriptor_refs=[],
+                statement=_statement("第一条不同的结论。"),
+            )
+        ],
+    )
+    second_bundle = _bundle(
+        reading,
+        [
+            CandidateDraftV1(
+                candidate_type="claim",
+                descriptor_refs=[],
+                statement=_statement("第二条不同的结论。"),
+            )
+        ],
+    )
+    _allow_plain_test_filesystem(monkeypatch)
+    monkeypatch.setattr(candidate, "_content_sha256", _same_short_id)
+    _, first_manifest_sha256 = _write_committed_materialization(
+        runs_dir,
+        authority,
+        reader,
+        first_bundle,
+        _MATERIALIZATION_RUN_ID,
+    )
+    _write_committed_materialization(
+        runs_dir,
+        authority,
+        reader,
+        second_bundle,
+        "matrun_223e4567-e89b-42d3-a456-426614174000",
+    )
+    (materializations / "current.json").write_bytes(
+        candidate._canonical_file_bytes(
+            {
+                "manifest_sha256": first_manifest_sha256,
+                "run_id": _MATERIALIZATION_RUN_ID,
+                "schema_version": "gezhi.candidate_materialization_current.v1",
+            }
+        )
+    )
+
+    with pytest.raises(candidate.CandidateMaterializationRecoveryUncertainV1):
+        candidate._load_or_recover_current(
+            materializations,
+            runs_dir,
+            authority,
+            _canonical(),
+            reader,
+            first_bundle,
+            cast(ValidatedDataRootV1, object()),
+        )
 
 
 @pytest.mark.parametrize("identity", [_same_full_hash, _same_short_id])
