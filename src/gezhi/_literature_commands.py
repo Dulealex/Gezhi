@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -25,6 +27,7 @@ _WORK_ID = re.compile(
 )
 _SOURCE_ID = re.compile(r"^src_[0-9a-f]{24}$")
 _CANDIDATE_ID = re.compile(r"^cand_[0-9a-f]{24}$")
+_HANDOFF_ID = re.compile(r"^hnd_[0-9a-f]{24}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _INPUT_FIELDS = frozenset(
     {"pdf_path", "work_id", "doi", "arxiv_id", "citation", "pdf_content"}
@@ -32,6 +35,7 @@ _INPUT_FIELDS = frozenset(
 
 AddOutcome: TypeAlias = Literal["succeeded", "blocked", "failed"]
 ResumeOutcome: TypeAlias = Literal["succeeded", "blocked", "failed"]
+ReviewOutcome: TypeAlias = Literal["succeeded", "blocked", "failed"]
 
 _RESUME_STAGES = (
     "ingest",
@@ -90,6 +94,36 @@ _RESUME_STAGE_FAILED = {
         "import_failed",
     ),
 }
+
+_REVIEW_BLOCKED_CODES = frozenset(
+    {
+        "literature.review.configuration_invalid.v1",
+        "literature.review.data_root_unsafe.v1",
+        "literature.review.data_root_unavailable.v1",
+        "literature.review.candidate_invalid.v1",
+        "literature.review.candidate_not_found.v1",
+        "literature.review.work_busy.v1",
+        "literature.review.handoff_blocked.v1",
+        "literature.review.import_blocked.v1",
+    }
+)
+_REVIEW_FAILED_CODES = frozenset(
+    {
+        "literature.review.data_root_integrity_lost.v1",
+        "literature.review.candidate_integrity_lost.v1",
+        "literature.review.review_state_invalid.v1",
+        "literature.review.review_commit_failed.v1",
+        "literature.review.handoff_failed.v1",
+        "literature.review.import_failed.v1",
+    }
+)
+_REVIEW_DATA_ROOT_CODES = frozenset(
+    {
+        "literature.review.data_root_unsafe.v1",
+        "literature.review.data_root_unavailable.v1",
+        "literature.review.data_root_integrity_lost.v1",
+    }
+)
 
 _BLOCKED_CODES = frozenset(
     {
@@ -188,6 +222,13 @@ class AddReceiptV1:
 @dataclass(frozen=True, slots=True)
 class ResumeReceiptV1:
     outcome: ResumeOutcome
+    result: dict[str, object] | None
+    diagnostic: dict[str, object] | None
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewReceiptV1:
+    outcome: ReviewOutcome
     result: dict[str, object] | None
     diagnostic: dict[str, object] | None
 
@@ -866,5 +907,489 @@ def run_resume(
     return {"succeeded": 0, "blocked": 2, "failed": 1}[receipt.outcome]
 
 
-def run_review(**_values: object) -> int:
-    raise NotImplementedError("literature review is delivered by a later ticket")
+def _review_handoff_id(
+    *,
+    action: str,
+    candidate_id: str,
+    payload_sha256: str,
+    review_revision: int,
+) -> str:
+    identity = {
+        "action": action,
+        "candidate_id": candidate_id,
+        "payload_sha256": payload_sha256,
+        "review_revision": review_revision,
+        "schema_version": "gezhi.reviewed_handoff_identity.v1",
+    }
+    payload = json.dumps(
+        identity,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "hnd_" + hashlib.sha256(payload).hexdigest()[:24]
+
+
+def _validate_review_result(value: object) -> dict[str, object]:
+    if type(value) is not dict or set(value) != {
+        "candidate_id",
+        "decision_disposition",
+        "handoff_action",
+        "handoff_id",
+        "handoff_status",
+        "import_status",
+        "intake_status",
+        "payload_sha256",
+        "review_revision",
+        "review_status",
+        "schema_version",
+        "work_id",
+    }:
+        raise TypeError("Literature review result is invalid")
+    result = cast(dict[str, object], value)
+    candidate_id = result["candidate_id"]
+    payload_sha256 = result["payload_sha256"]
+    review_revision = result["review_revision"]
+    action = result["handoff_action"]
+    handoff_id = result["handoff_id"]
+    handoff_status = result["handoff_status"]
+    import_status = result["import_status"]
+    intake_status = result["intake_status"]
+    review_status = result["review_status"]
+    if (
+        type(candidate_id) is not str
+        or _CANDIDATE_ID.fullmatch(candidate_id) is None
+        or type(payload_sha256) is not str
+        or _SHA256.fullmatch(payload_sha256) is None
+        or candidate_id != "cand_" + payload_sha256[:24]
+        or type(review_revision) is not int
+        or not 1 <= review_revision <= 9_223_372_036_854_775_807
+        or result["decision_disposition"] not in {"created", "unchanged"}
+        or action not in {"accept", "withdraw", "none"}
+        or handoff_status not in {"committed", "not_required", "pending"}
+        or import_status not in {"applied", "not_required", "pending"}
+        or intake_status not in {"active", "withdrawn", None}
+        or review_status not in {"accepted", "rejected", "deferred"}
+        or result["schema_version"] != "gezhi.literature_review_result.v1"
+        or type(result["work_id"]) is not str
+        or _WORK_ID.fullmatch(cast(str, result["work_id"])) is None
+    ):
+        raise ValueError("Literature review result is invalid")
+
+    if review_status == "accepted":
+        if action != "accept":
+            raise ValueError("Literature review action is invalid")
+    elif action not in {"withdraw", "none"}:
+        raise ValueError("Literature review action is invalid")
+
+    if action == "none":
+        if (
+            handoff_id is not None
+            or handoff_status not in {"not_required", "pending"}
+            or import_status != "not_required"
+            or intake_status is not None
+        ):
+            raise ValueError("Literature review no-action result is invalid")
+        return result
+
+    if (
+        type(handoff_id) is not str
+        or _HANDOFF_ID.fullmatch(handoff_id) is None
+        or handoff_id
+        != _review_handoff_id(
+            action=cast(str, action),
+            candidate_id=candidate_id,
+            payload_sha256=payload_sha256,
+            review_revision=review_revision,
+        )
+    ):
+        raise ValueError("Literature review Handoff identity is invalid")
+    expected_intake = "active" if action == "accept" else "withdrawn"
+    if (handoff_status, import_status, intake_status) not in {
+        ("pending", "pending", None),
+        ("committed", "pending", None),
+        ("committed", "applied", expected_intake),
+    }:
+        raise ValueError("Literature review continuation result is invalid")
+    return result
+
+
+def _validate_review_diagnostic(
+    outcome: Literal["blocked", "failed"],
+    value: object,
+) -> dict[str, object]:
+    if (
+        type(value) is not dict
+        or set(value) != {"code", "context"}
+        or type(value["code"]) is not str
+        or type(value["context"]) is not dict
+    ):
+        raise TypeError("Literature review diagnostic is invalid")
+    diagnostic = cast(dict[str, object], value)
+    code = cast(str, diagnostic["code"])
+    context = cast(dict[str, object], diagnostic["context"])
+    allowed = (
+        _REVIEW_BLOCKED_CODES if outcome == "blocked" else _REVIEW_FAILED_CODES
+    )
+    if code not in allowed:
+        raise ValueError("Literature review diagnostic is invalid")
+    if code in _REVIEW_DATA_ROOT_CODES:
+        if context not in (
+            {"data_root": "literature"},
+            {"data_root": "knowledge"},
+        ):
+            raise ValueError("Literature review Data Root context is invalid")
+    elif context:
+        raise ValueError("Literature review diagnostic context is invalid")
+    return diagnostic
+
+
+def _review_result_presence(
+    diagnostic: dict[str, object],
+) -> Literal["forbidden", "optional", "required"]:
+    code = cast(str, diagnostic["code"])
+    context = cast(dict[str, object], diagnostic["context"])
+    if code in {
+        "literature.review.handoff_blocked.v1",
+        "literature.review.import_blocked.v1",
+        "literature.review.handoff_failed.v1",
+        "literature.review.import_failed.v1",
+    }:
+        return "required"
+    if code in _REVIEW_DATA_ROOT_CODES:
+        if context == {"data_root": "knowledge"}:
+            return "required"
+        if code == "literature.review.data_root_integrity_lost.v1":
+            return "optional"
+    return "forbidden"
+
+
+def _review_result_phase(
+    result: dict[str, object],
+) -> Literal["complete", "handoff", "import"]:
+    if result["import_status"] == "applied" or (
+        result["handoff_action"] == "none"
+        and result["handoff_status"] == "not_required"
+    ):
+        return "complete"
+    if result["handoff_status"] == "pending":
+        return "handoff"
+    return "import"
+
+
+def _validate_review_result_diagnostic_binding(
+    result: dict[str, object],
+    diagnostic: dict[str, object],
+) -> None:
+    code = cast(str, diagnostic["code"])
+    context = cast(dict[str, object], diagnostic["context"])
+    phase = _review_result_phase(result)
+    if phase == "complete":
+        raise ValueError("stopped Literature review result is complete")
+    if code in {
+        "literature.review.handoff_blocked.v1",
+        "literature.review.handoff_failed.v1",
+    }:
+        if phase != "handoff":
+            raise ValueError("Literature review Handoff result is invalid")
+        return
+    if (
+        code
+        in {
+            "literature.review.import_blocked.v1",
+            "literature.review.import_failed.v1",
+        }
+        or (
+            code in _REVIEW_DATA_ROOT_CODES
+            and context == {"data_root": "knowledge"}
+        )
+    ) and phase != "import":
+        raise ValueError("Literature review import result is invalid")
+
+
+def _validate_review_receipt(
+    receipt: ReviewReceiptV1,
+) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+    if type(receipt) is not ReviewReceiptV1 or receipt.outcome not in {
+        "succeeded",
+        "blocked",
+        "failed",
+    }:
+        raise TypeError("Literature review receipt is invalid")
+    if receipt.outcome == "succeeded":
+        if receipt.diagnostic is not None:
+            raise ValueError("successful Literature review has a diagnostic")
+        result = _validate_review_result(receipt.result)
+        if _review_result_phase(result) != "complete":
+            raise ValueError("successful Literature review is incomplete")
+        return result, None
+    if receipt.diagnostic is None:
+        raise ValueError("stopped Literature review diagnostic is unavailable")
+    diagnostic = _validate_review_diagnostic(receipt.outcome, receipt.diagnostic)
+    presence = _review_result_presence(diagnostic)
+    if receipt.result is None:
+        if presence == "required":
+            raise ValueError("Literature review result is required")
+        return None, diagnostic
+    if presence == "forbidden":
+        raise ValueError("Literature review result is forbidden")
+    result = _validate_review_result(receipt.result)
+    _validate_review_result_diagnostic_binding(result, diagnostic)
+    return result, diagnostic
+
+
+def build_review_json_buffer_v1(receipt: ReviewReceiptV1) -> bytes:
+    result, diagnostic = _validate_review_receipt(receipt)
+    buffer = operations_json_buffer(
+        command="literature.review",
+        outcome=receipt.outcome,
+        result=result,
+        diagnostics=[] if diagnostic is None else [diagnostic],
+    )
+    if len(buffer) > _LITERATURE_OUTPUT_CAP:
+        raise ValueError("Literature review output exceeds 32 KiB")
+    return buffer
+
+
+_REVIEW_HUMAN_CATALOG = {
+    "literature.review.configuration_invalid.v1": (
+        "配置无效",
+        "修正格致配置后重新运行 review",
+    ),
+    "literature.review.data_root_unsafe.v1": (
+        "<data_root> 数据目录不安全",
+        "移除不受支持的 namespace 或路径别名后用相同 action 重试",
+    ),
+    "literature.review.data_root_unavailable.v1": (
+        "<data_root> 数据目录不可用",
+        "修复该 Context 数据目录后用相同 action 重试",
+    ),
+    "literature.review.candidate_invalid.v1": (
+        "Candidate ID 格式无效",
+        "使用完整规范 Candidate ID 重试",
+    ),
+    "literature.review.candidate_not_found.v1": (
+        "指定 Candidate 不存在",
+        "核对 Candidate ID 后重试",
+    ),
+    "literature.review.work_busy.v1": (
+        "Candidate 所属 Work 正由另一个写流程处理",
+        "等待该流程结束后重试",
+    ),
+    "literature.review.handoff_blocked.v1": (
+        "Review Decision 已保存，但 Handoff 尚未完成",
+        "用相同 action 重试或运行 literature resume",
+    ),
+    "literature.review.import_blocked.v1": (
+        "Review Decision 与 Handoff 已保存，但 Knowledge import 尚未完成",
+        "修复 Knowledge 前置条件后用相同 action 重试或运行 literature resume",
+    ),
+    "literature.review.data_root_integrity_lost.v1": (
+        "<data_root> 数据目录身份在执行中失去可信性",
+        "停止写入并运行 gezhi doctor",
+    ),
+    "literature.review.candidate_integrity_lost.v1": (
+        "Candidate 资产完整性失效",
+        (
+            "保留 Candidate 与 Evidence 资产，运行 gezhi status 并检查 ID、hash、"
+            "canonical bytes、provenance、Evidence、payload、collision 与 asset 完整性"
+        ),
+    ),
+    "literature.review.review_state_invalid.v1": (
+        "Candidate Review 历史无效",
+        "保留审核资产并检查 revision 与 payload identity",
+    ),
+    "literature.review.review_commit_failed.v1": (
+        "Review Decision 提交失败",
+        "保持相同 Candidate 与 action 重试",
+    ),
+    "literature.review.handoff_failed.v1": (
+        "Review Decision 已保存，但 Handoff 失败",
+        (
+            "保留 Decision 与 Handoff 资产，运行 gezhi status 检查 Handoff 完整性、"
+            "协议、revision 与提交状态；修复确定原因后以同一 identity 续行"
+        ),
+    ),
+    "literature.review.import_failed.v1": (
+        "Review Decision 与 Handoff 已保存，但 Knowledge import 失败",
+        (
+            "保留 Decision、Handoff 与 Registry 前置事实，运行 gezhi status 检查 "
+            "KnowledgeIntake/Registry 完整性、协议、revision、commit 与 conflict；"
+            "修复确定原因后以同一 identity 续行"
+        ),
+    ),
+}
+
+
+def _append_review_result_lines(
+    lines: list[str],
+    result: dict[str, object],
+) -> None:
+    for key, label in (
+        ("candidate_id", "Candidate ID"),
+        ("decision_disposition", "Decision 处理结果"),
+        ("handoff_action", "Handoff 动作"),
+        ("handoff_id", "Handoff ID"),
+        ("handoff_status", "Handoff 状态"),
+        ("import_status", "Import 状态"),
+        ("intake_status", "Intake 状态"),
+        ("payload_sha256", "Payload SHA-256"),
+        ("review_revision", "Review revision"),
+        ("review_status", "Review 状态"),
+        ("schema_version", "Schema"),
+        ("work_id", "Work ID"),
+    ):
+        lines.append(f"{label}：{_human_value(result[key])}")
+
+
+def build_review_human_buffer_v1(receipt: ReviewReceiptV1) -> bytes:
+    result, diagnostic = _validate_review_receipt(receipt)
+    lines = [
+        {
+            "succeeded": "Literature review：完成",
+            "blocked": "Literature review：已阻塞",
+            "failed": "Literature review：失败",
+        }[receipt.outcome]
+    ]
+    if result is not None:
+        _append_review_result_lines(lines, result)
+    if diagnostic is None:
+        if result is None:
+            raise RuntimeError("Literature review result is unavailable")
+        lines.append(f"下一步：运行 gezhi literature resume {result['work_id']}")
+    else:
+        code = cast(str, diagnostic["code"])
+        context = cast(dict[str, object], diagnostic["context"])
+        reason, next_action = _REVIEW_HUMAN_CATALOG[code]
+        if "data_root" in context:
+            reason = reason.replace(
+                "<data_root>",
+                cast(str, context["data_root"]),
+            )
+        lines.extend((f"原因：{reason}", f"下一步：{next_action}"))
+    buffer = ("\n".join(lines) + "\n").encode("utf-8")
+    if len(buffer) > _LITERATURE_OUTPUT_CAP:
+        raise ValueError("Literature review output exceeds 32 KiB")
+    return buffer
+
+
+def _present_review(receipt: ReviewReceiptV1, *, json_output: bool) -> None:
+    try:
+        buffer = (
+            build_review_json_buffer_v1(receipt)
+            if json_output
+            else build_review_human_buffer_v1(receipt)
+        )
+    except Exception:  # noqa: BLE001 - contract hard-stops seal failures.
+        os._exit(1)
+    write_operations_stdout(buffer)
+
+
+def run_review(
+    *,
+    candidate_id: str,
+    action: str,
+    note: None,
+    json_output: bool,
+    cli_patch: tuple[tuple[str, str], ...],
+) -> int:
+    if action not in {"accept", "reject", "defer"} or note is not None:
+        raise TypeError("validated Literature review command is invalid")
+    try:
+        configuration = resolve_configuration_v1(
+            trusted_project_root=Path(r"E:\Gezhi"),
+            cli_patch=cli_patch,
+            environ=os.environ.copy(),
+        )
+    except ConfigurationError:
+        receipt = ReviewReceiptV1(
+            outcome="blocked",
+            result=None,
+            diagnostic={
+                "code": "literature.review.configuration_invalid.v1",
+                "context": {},
+            },
+        )
+    else:
+        try:
+            root = open_validated_data_root_v1(configuration.literature_data_root)
+        except DataRootOpenErrorV1 as error:
+            reason = (
+                "data_root_unsafe"
+                if error.status == "unsafe"
+                else "data_root_unavailable"
+            )
+            receipt = ReviewReceiptV1(
+                outcome="blocked",
+                result=None,
+                diagnostic={
+                    "code": f"literature.review.{reason}.v1",
+                    "context": {"data_root": "literature"},
+                },
+            )
+        else:
+            from gezhi._literature_review import (
+                ReviewBlockedV1,
+                ReviewCandidateCommandV1,
+                ReviewFailedV1,
+                ReviewSucceededV1,
+                review_candidate_v1,
+            )
+
+            with root:
+                verdict = review_candidate_v1(
+                    ReviewCandidateCommandV1(
+                        candidate_id=candidate_id,
+                        action=cast(
+                            Literal["accept", "reject", "defer"],
+                            action,
+                        ),
+                    ),
+                    root=root,
+                    knowledge_intake=None,
+                )
+            if type(verdict) is ReviewSucceededV1:
+                receipt = ReviewReceiptV1(
+                    outcome="succeeded",
+                    result=verdict.progress.as_mapping_v1(),
+                    diagnostic=None,
+                )
+            elif type(verdict) is ReviewBlockedV1:
+                receipt = ReviewReceiptV1(
+                    outcome="blocked",
+                    result=(
+                        None
+                        if verdict.progress is None
+                        else verdict.progress.as_mapping_v1()
+                    ),
+                    diagnostic={
+                        "code": f"literature.review.{verdict.cause.reason}.v1",
+                        "context": (
+                            {}
+                            if verdict.cause.data_root is None
+                            else {"data_root": verdict.cause.data_root}
+                        ),
+                    },
+                )
+            elif type(verdict) is ReviewFailedV1:
+                receipt = ReviewReceiptV1(
+                    outcome="failed",
+                    result=(
+                        None
+                        if verdict.progress is None
+                        else verdict.progress.as_mapping_v1()
+                    ),
+                    diagnostic={
+                        "code": f"literature.review.{verdict.cause.reason}.v1",
+                        "context": (
+                            {}
+                            if verdict.cause.data_root is None
+                            else {"data_root": verdict.cause.data_root}
+                        ),
+                    },
+                )
+            else:
+                raise TypeError("Literature review returned an invalid verdict")
+    _present_review(receipt, json_output=json_output)
+    return {"succeeded": 0, "blocked": 2, "failed": 1}[receipt.outcome]

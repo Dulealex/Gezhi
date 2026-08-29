@@ -139,6 +139,18 @@ class CandidateMaterializationAdvanceV1:
     pending_candidate_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class CandidateReviewMaterializationV1:
+    """One fully re-derived immutable Candidate successor for review."""
+
+    run_id: str
+    manifest_sha256: str
+    canonical: CurrentCanonicalAssetV1
+    reader: ReaderAdvanceV1
+    candidate_bytes: bytes
+    descriptor_bytes: bytes
+
+
 class CandidateMaterializationStageStoppedV1(RuntimeError):
     def __init__(
         self,
@@ -1065,6 +1077,59 @@ def _validate_pointed_success(
         expected_manifest_sha256=manifest_sha256,
     )
     return materialized, observed, matches_current_reader
+
+
+def validate_candidate_materialization_for_review_v1(
+    authority: ActiveSourceAuthorityV1,
+    run_directory: Path,
+    run_id: str,
+) -> CandidateReviewMaterializationV1:
+    """Re-derive and validate one historical successor without trusting current."""
+
+    if _MATERIALIZATION_RUN_ID.fullmatch(run_id) is None:
+        raise ValueError("Materialization run ID is invalid")
+    manifest, manifest_bytes = _read_canonical_object_v1(
+        run_directory / "manifest.json"
+    )
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    if manifest.get("run_id") != run_id:
+        raise ValueError("Materialization manifest run identity differs")
+    reader = _reader_from_materialization_manifest(
+        run_directory,
+        run_id,
+        manifest_sha256,
+    )
+    canonical = _canonical_for_reader(authority, reader)
+    bundle = _reader_bundle_for_run(
+        authority,
+        canonical,
+        reader,
+        require_current=False,
+    )
+    materialized = _materialized_documents(
+        authority,
+        canonical,
+        reader,
+        bundle,
+        run_id,
+    )
+    observed = _validate_success(
+        run_directory,
+        run_id,
+        authority,
+        canonical,
+        reader,
+        materialized,
+        expected_manifest_sha256=manifest_sha256,
+    )
+    return CandidateReviewMaterializationV1(
+        run_id=run_id,
+        manifest_sha256=observed,
+        canonical=canonical,
+        reader=reader,
+        candidate_bytes=materialized.candidate_bytes,
+        descriptor_bytes=materialized.descriptor_bytes,
+    )
 
 
 def _commit_next_pointer(
