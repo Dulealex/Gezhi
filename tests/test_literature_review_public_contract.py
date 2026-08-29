@@ -380,6 +380,43 @@ def _run_review(
     )
 
 
+def _run_resume(
+    data_root: Path,
+    work_id: str,
+    *,
+    launcher_index: int,
+) -> object:
+    return run_launcher(
+        launcher_commands(
+            (
+                "--literature-data-root",
+                str(data_root),
+                "literature",
+                "resume",
+                work_id,
+                "--json",
+            )
+        )[launcher_index]
+    )
+
+
+def _resume_with_intake(
+    data_root: Path,
+    work_id: str,
+    intake: object,
+) -> object:
+    from gezhi._literature_resume import resume_work
+    from gezhi._windows_data_root import open_validated_data_root_v1
+
+    with open_validated_data_root_v1(str(data_root)) as root:
+        return resume_work(
+            work_id,
+            root=root,
+            source_environment={},
+            knowledge_intake=intake,  # type: ignore[arg-type]
+        )
+
+
 @pytest.mark.parametrize("launcher_index", [0, 1])
 def test_raw_candidate_selector_is_rejected_before_asset_lookup(
     review_empty_root: Path,
@@ -1924,6 +1961,7 @@ def test_decision_rename_failure_leaves_evidence_only_in_private_staging(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from gezhi import _literature_review as review
+    from gezhi._literature_resume import ResumeWorkResultV1
     from gezhi._windows_data_root import open_validated_data_root_v1
 
     literature_root, template = review_candidate_root
@@ -1968,6 +2006,17 @@ def test_decision_rename_failure_leaves_evidence_only_in_private_staging(
         "no_actions",
     }
     private_files = candidate_reviews.parent / ".staging" / ".files"
+    assert any(
+        path.name.startswith(f"{template.candidate_id}.1.")
+        for path in private_files.iterdir()
+    )
+
+    resumed = _resume_with_intake(literature_root, template.work_id, None)
+
+    assert type(resumed) is ResumeWorkResultV1
+    assert resumed.start_stage == "complete"
+    assert resumed.advanced_stages == ()
+    assert resumed.pipeline_complete is True
     assert any(
         path.name.startswith(f"{template.candidate_id}.1.")
         for path in private_files.iterdir()
@@ -2262,3 +2311,1115 @@ def test_unavailable_candidate_work_cannot_be_reported_as_not_found(
             root=root,
             knowledge_intake=None,
         )
+
+
+@pytest.mark.parametrize("launcher_index", [0, 1])
+def test_resume_observes_a_completed_rejected_no_action_decision(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+    launcher_index: int,
+) -> None:
+    literature_root, template = review_candidate_root
+    rejected = _run_review(
+        literature_root,
+        template.candidate_id,
+        "--reject",
+        launcher_index=1 - launcher_index,
+    )
+    assert rejected.returncode == 0
+    source_directory = (
+        literature_root / "works" / template.work_id / "sources" / template.source_id
+    )
+    semantic_runs_before = {
+        path.name for path in (source_directory / "semantic" / "runs").iterdir()
+    }
+    materialization_runs_before = {
+        path.name
+        for path in (
+            source_directory / "semantic" / "materializations" / "runs"
+        ).iterdir()
+    }
+
+    resumed = _run_resume(
+        literature_root,
+        template.work_id,
+        launcher_index=launcher_index,
+    )
+
+    assert resumed.returncode == 0, (resumed.stdout + resumed.stderr).decode(
+        errors="replace"
+    )
+    assert json.loads(resumed.stdout) == {
+        "command": "literature.resume",
+        "diagnostics": [],
+        "outcome": "succeeded",
+        "result": {
+            "active_source_id": template.source_id,
+            "advanced_stages": [],
+            "pending_candidate_ids": [],
+            "pipeline_complete": True,
+            "schema_version": "gezhi.literature_resume_result.v1",
+            "start_stage": "complete",
+            "stop_stage": "complete",
+            "work_id": template.work_id,
+        },
+        "schema_version": "gezhi.cli_result.v1",
+    }
+    candidate_reviews = (
+        literature_root / "works" / template.work_id / "reviews" / template.candidate_id
+    )
+    assert {path.name for path in candidate_reviews.glob("[0-9]*.json")} == {"1.json"}
+    assert not (literature_root / "works" / template.work_id / "handoffs").exists()
+    assert {
+        path.name for path in (source_directory / "semantic" / "runs").iterdir()
+    } == semantic_runs_before
+    assert {
+        path.name
+        for path in (
+            source_directory / "semantic" / "materializations" / "runs"
+        ).iterdir()
+    } == materialization_runs_before
+
+
+@pytest.mark.parametrize("launcher_index", [0, 1])
+def test_resume_reports_committed_accept_as_import_backlog_without_t18(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+    launcher_index: int,
+) -> None:
+    literature_root, template = review_candidate_root
+    accepted = _run_review(
+        literature_root,
+        template.candidate_id,
+        "--accept",
+        launcher_index=1 - launcher_index,
+    )
+    assert accepted.returncode == 2
+    accepted_document = json.loads(accepted.stdout)
+    handoff_id = accepted_document["result"]["handoff_id"]
+
+    resumed = _run_resume(
+        literature_root,
+        template.work_id,
+        launcher_index=launcher_index,
+    )
+
+    assert resumed.returncode == 2, (resumed.stdout + resumed.stderr).decode(
+        errors="replace"
+    )
+    assert json.loads(resumed.stdout) == {
+        "command": "literature.resume",
+        "diagnostics": [
+            {
+                "code": "literature.resume.stage_blocked.v1",
+                "context": {
+                    "reason": "import_blocked",
+                    "stage": "knowledge_import",
+                },
+            }
+        ],
+        "outcome": "blocked",
+        "result": {
+            "active_source_id": template.source_id,
+            "advanced_stages": [],
+            "pending_candidate_ids": [],
+            "pipeline_complete": False,
+            "schema_version": "gezhi.literature_resume_result.v1",
+            "start_stage": "knowledge_import",
+            "stop_stage": "knowledge_import",
+            "work_id": template.work_id,
+        },
+        "schema_version": "gezhi.cli_result.v1",
+    }
+    reviews = (
+        literature_root / "works" / template.work_id / "reviews" / template.candidate_id
+    )
+    assert not (reviews / "import_attempts").exists()
+    assert not (reviews / "imports").exists()
+    assert (
+        literature_root
+        / "works"
+        / template.work_id
+        / "handoffs"
+        / str(handoff_id)
+        / "manifest.json"
+    ).is_file()
+
+
+def test_resume_repairs_a_missing_no_action_receipt_without_a_new_decision(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gezhi import _literature_review as review
+    from gezhi._windows_data_root import open_validated_data_root_v1
+
+    literature_root, template = review_candidate_root
+
+    def fail_no_action(*_args: object, **_kwargs: object) -> None:
+        raise review._HandoffFailedV1("injected no-action failure")
+
+    monkeypatch.setattr(review, "_commit_no_action_receipt", fail_no_action)
+    with open_validated_data_root_v1(str(literature_root)) as root:
+        stopped = review.review_candidate_v1(
+            review.ReviewCandidateCommandV1(template.candidate_id, "reject"),
+            root=root,
+            knowledge_intake=None,
+        )
+    assert type(stopped) is review.ReviewFailedV1
+    assert stopped.progress is not None
+    assert stopped.progress.handoff_status == "pending"
+
+    resumed = _run_resume(literature_root, template.work_id, launcher_index=1)
+
+    assert resumed.returncode == 0, (resumed.stdout + resumed.stderr).decode(
+        errors="replace"
+    )
+    document = json.loads(resumed.stdout)
+    assert document["result"] == {
+        "active_source_id": template.source_id,
+        "advanced_stages": ["handoff", "knowledge_import"],
+        "pending_candidate_ids": [],
+        "pipeline_complete": True,
+        "schema_version": "gezhi.literature_resume_result.v1",
+        "start_stage": "handoff",
+        "stop_stage": "complete",
+        "work_id": template.work_id,
+    }
+    candidate_reviews = (
+        literature_root / "works" / template.work_id / "reviews" / template.candidate_id
+    )
+    assert (candidate_reviews / "no_actions" / "1.json").is_file()
+    assert {path.name for path in candidate_reviews.glob("[0-9]*.json")} == {"1.json"}
+
+
+def test_resume_repairs_a_missing_accept_handoff_then_stops_at_import(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gezhi import _literature_review as review
+    from gezhi._windows_data_root import open_validated_data_root_v1
+
+    literature_root, template = review_candidate_root
+
+    def fail_handoff(*_args: object, **_kwargs: object) -> object:
+        raise review._HandoffFailedV1("injected Handoff failure")
+
+    monkeypatch.setattr(review, "_commit_or_reuse_handoff", fail_handoff)
+    with open_validated_data_root_v1(str(literature_root)) as root:
+        stopped = review.review_candidate_v1(
+            review.ReviewCandidateCommandV1(template.candidate_id, "accept"),
+            root=root,
+            knowledge_intake=None,
+        )
+    assert type(stopped) is review.ReviewFailedV1
+    assert stopped.progress is not None
+    assert stopped.progress.handoff_status == "pending"
+
+    resumed = _run_resume(literature_root, template.work_id, launcher_index=0)
+
+    assert resumed.returncode == 2, (resumed.stdout + resumed.stderr).decode(
+        errors="replace"
+    )
+    document = json.loads(resumed.stdout)
+    assert document["diagnostics"][0]["context"] == {
+        "reason": "import_blocked",
+        "stage": "knowledge_import",
+    }
+    assert document["result"] == {
+        "active_source_id": template.source_id,
+        "advanced_stages": ["handoff"],
+        "pending_candidate_ids": [],
+        "pipeline_complete": False,
+        "schema_version": "gezhi.literature_resume_result.v1",
+        "start_stage": "handoff",
+        "stop_stage": "knowledge_import",
+        "work_id": template.work_id,
+    }
+    handoffs = literature_root / "works" / template.work_id / "handoffs"
+    assert len([path for path in handoffs.iterdir() if path.name != ".staging"]) == 1
+
+
+def test_resume_reports_work_busy_without_observing_partial_state(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+) -> None:
+    from gezhi._windows_data_root import open_validated_data_root_v1
+    from gezhi._windows_ownership import try_acquire_work_writer_v1
+
+    literature_root, template = review_candidate_root
+    with open_validated_data_root_v1(str(literature_root)) as root:
+        assert root.inspection.identity is not None
+        owner = try_acquire_work_writer_v1(
+            root.inspection.identity,
+            template.work_id,
+        )
+        assert owner is not None
+        with owner:
+            resumed = _run_resume(
+                literature_root,
+                template.work_id,
+                launcher_index=1,
+            )
+
+    assert resumed.returncode == 2
+    assert json.loads(resumed.stdout) == {
+        "command": "literature.resume",
+        "diagnostics": [
+            {
+                "code": "literature.resume.work_busy.v1",
+                "context": {},
+            }
+        ],
+        "outcome": "blocked",
+        "result": None,
+        "schema_version": "gezhi.cli_result.v1",
+    }
+
+
+def test_resume_applies_accept_backlog_once_then_skips_the_verified_receipt(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+) -> None:
+    from gezhi._literature_resume import ResumeWorkResultV1
+    from gezhi._literature_review import IntakeAppliedV1, ReviewedHandoffBytesV1
+
+    literature_root, template = review_candidate_root
+    accepted = _run_review(
+        literature_root,
+        template.candidate_id,
+        "--accept",
+        launcher_index=1,
+    )
+    assert accepted.returncode == 2
+
+    class RecordingIntake:
+        def __init__(self) -> None:
+            self.actions: list[str] = []
+
+        def apply(self, handoff: ReviewedHandoffBytesV1) -> object:
+            action = str(json.loads(handoff.candidates_bytes)["action"])
+            self.actions.append(action)
+            return IntakeAppliedV1("active", "applied")
+
+    intake = RecordingIntake()
+    resumed = _resume_with_intake(literature_root, template.work_id, intake)
+
+    assert type(resumed) is ResumeWorkResultV1
+    assert resumed.start_stage == "knowledge_import"
+    assert resumed.advanced_stages == ("knowledge_import",)
+    assert resumed.pipeline_complete is True
+    assert intake.actions == ["accept"]
+
+    class NoSecondApply:
+        def apply(self, _handoff: ReviewedHandoffBytesV1) -> object:
+            raise AssertionError("verified import receipt was replayed")
+
+    repeated = _resume_with_intake(
+        literature_root,
+        template.work_id,
+        NoSecondApply(),
+    )
+    assert type(repeated) is ResumeWorkResultV1
+    assert repeated.start_stage == "complete"
+    assert repeated.advanced_stages == ()
+    candidate_reviews = (
+        literature_root / "works" / template.work_id / "reviews" / template.candidate_id
+    )
+    assert (candidate_reviews / "import_attempts" / "1.json").is_file()
+    assert (candidate_reviews / "imports" / "1.json").is_file()
+
+
+def test_resume_replays_an_unresolved_import_attempt_with_identical_bytes(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+) -> None:
+    from gezhi._literature_resume import ResumeWorkResultV1
+    from gezhi._literature_review import (
+        IntakeAppliedV1,
+        ReviewCandidateCommandV1,
+        ReviewedHandoffBytesV1,
+        ReviewIndeterminateV1,
+        review_candidate_v1,
+    )
+    from gezhi._windows_data_root import open_validated_data_root_v1
+
+    literature_root, template = review_candidate_root
+
+    class CrashAfterApply:
+        def apply(self, _handoff: ReviewedHandoffBytesV1) -> object:
+            raise RuntimeError("simulated loss after external apply")
+
+    with (
+        open_validated_data_root_v1(str(literature_root)) as root,
+        pytest.raises(ReviewIndeterminateV1),
+    ):
+        review_candidate_v1(
+            ReviewCandidateCommandV1(template.candidate_id, "accept"),
+            root=root,
+            knowledge_intake=CrashAfterApply(),
+        )
+
+    class RecoveringIntake:
+        def __init__(self) -> None:
+            self.handoffs: list[bytes] = []
+
+        def apply(self, handoff: ReviewedHandoffBytesV1) -> object:
+            self.handoffs.append(handoff.manifest_bytes + handoff.candidates_bytes)
+            return IntakeAppliedV1("active", "unchanged")
+
+    intake = RecoveringIntake()
+    resumed = _resume_with_intake(literature_root, template.work_id, intake)
+
+    assert type(resumed) is ResumeWorkResultV1
+    assert resumed.start_stage == "knowledge_import"
+    assert resumed.advanced_stages == ("knowledge_import",)
+    assert len(intake.handoffs) == 1
+    candidate_reviews = (
+        literature_root / "works" / template.work_id / "reviews" / template.candidate_id
+    )
+    attempt = json.loads(
+        (candidate_reviews / "import_attempts" / "1.json").read_bytes()
+    )
+    receipt = json.loads((candidate_reviews / "imports" / "1.json").read_bytes())
+    assert receipt == {
+        **attempt,
+        "intake_status": "active",
+        "schema_version": "gezhi.review_import_receipt.v1",
+    }
+
+
+@pytest.mark.parametrize(
+    ("verdict_kind", "reason", "expected_outcome"),
+    [
+        ("blocked", "registry_unavailable", "blocked"),
+        ("blocked", "registry_busy", "blocked"),
+        ("blocked", "import_blocked", "blocked"),
+        ("failed", "revision_conflict", "failed"),
+        ("failed", "registry_conflict", "failed"),
+        ("failed", "commit_failed", "failed"),
+        ("failed", "import_failed", "failed"),
+    ],
+)
+def test_resume_preserves_specific_knowledge_intake_reasons(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+    verdict_kind: str,
+    reason: str,
+    expected_outcome: str,
+) -> None:
+    from gezhi._literature_resume import ResumeStoppedV1
+    from gezhi._literature_review import (
+        IntakeBlockedV1,
+        IntakeFailedV1,
+        ReviewBlockedV1,
+        ReviewCandidateCommandV1,
+        ReviewedHandoffBytesV1,
+        review_candidate_v1,
+    )
+    from gezhi._windows_data_root import open_validated_data_root_v1
+
+    literature_root, template = review_candidate_root
+    with open_validated_data_root_v1(str(literature_root)) as root:
+        accepted = review_candidate_v1(
+            ReviewCandidateCommandV1(template.candidate_id, "accept"),
+            root=root,
+            knowledge_intake=None,
+        )
+    assert type(accepted) is ReviewBlockedV1
+
+    class StoppedIntake:
+        def apply(self, _handoff: ReviewedHandoffBytesV1) -> object:
+            if verdict_kind == "blocked":
+                return IntakeBlockedV1(reason)  # type: ignore[arg-type]
+            return IntakeFailedV1(reason)  # type: ignore[arg-type]
+
+    with pytest.raises(ResumeStoppedV1) as caught:
+        _resume_with_intake(
+            literature_root,
+            template.work_id,
+            StoppedIntake(),
+        )
+
+    stopped = caught.value
+    assert stopped.outcome == expected_outcome
+    assert stopped.reason == reason
+    assert stopped.stage == "knowledge_import"
+    assert stopped.data_root is None
+    assert stopped.result is not None
+    assert stopped.result.start_stage == "knowledge_import"
+    assert stopped.result.stop_stage == "knowledge_import"
+    assert stopped.result.advanced_stages == ()
+
+
+def test_resume_repairs_every_historical_no_action_before_current_import(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gezhi import _literature_review as review
+    from gezhi._windows_data_root import open_validated_data_root_v1
+
+    literature_root, template = review_candidate_root
+
+    def fail_no_action(*_args: object, **_kwargs: object) -> None:
+        raise review._HandoffFailedV1("injected historical no-action failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(review, "_commit_no_action_receipt", fail_no_action)
+        with open_validated_data_root_v1(str(literature_root)) as root:
+            rejected = review.review_candidate_v1(
+                review.ReviewCandidateCommandV1(template.candidate_id, "reject"),
+                root=root,
+                knowledge_intake=None,
+            )
+    assert type(rejected) is review.ReviewFailedV1
+    assert rejected.progress is not None
+    assert rejected.progress.review_revision == 1
+
+    with open_validated_data_root_v1(str(literature_root)) as root:
+        accepted = review.review_candidate_v1(
+            review.ReviewCandidateCommandV1(template.candidate_id, "accept"),
+            root=root,
+            knowledge_intake=None,
+        )
+    assert type(accepted) is review.ReviewBlockedV1
+    assert accepted.progress is not None
+    assert accepted.progress.review_revision == 2
+
+    resumed = _run_resume(literature_root, template.work_id, launcher_index=1)
+
+    assert resumed.returncode == 2
+    document = json.loads(resumed.stdout)
+    assert document["diagnostics"][0]["context"] == {
+        "reason": "import_blocked",
+        "stage": "knowledge_import",
+    }
+    assert document["result"]["start_stage"] == "handoff"
+    assert document["result"]["advanced_stages"] == ["handoff"]
+    candidate_reviews = (
+        literature_root / "works" / template.work_id / "reviews" / template.candidate_id
+    )
+    assert (candidate_reviews / "no_actions" / "1.json").is_file()
+    assert {path.name for path in candidate_reviews.glob("[0-9]*.json")} == {
+        "1.json",
+        "2.json",
+    }
+
+
+def test_resume_commits_but_does_not_import_a_superseded_accept_handoff(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gezhi import _literature_review as review
+    from gezhi._windows_data_root import open_validated_data_root_v1
+
+    literature_root, template = review_candidate_root
+
+    def fail_handoff(*_args: object, **_kwargs: object) -> object:
+        raise review._HandoffFailedV1("injected historical Handoff failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(review, "_commit_or_reuse_handoff", fail_handoff)
+        with open_validated_data_root_v1(str(literature_root)) as root:
+            accepted = review.review_candidate_v1(
+                review.ReviewCandidateCommandV1(template.candidate_id, "accept"),
+                root=root,
+                knowledge_intake=None,
+            )
+    assert type(accepted) is review.ReviewFailedV1
+
+    with open_validated_data_root_v1(str(literature_root)) as root:
+        rejected = review.review_candidate_v1(
+            review.ReviewCandidateCommandV1(template.candidate_id, "reject"),
+            root=root,
+            knowledge_intake=None,
+        )
+    assert type(rejected) is review.ReviewSucceededV1
+    assert rejected.progress.review_revision == 2
+
+    resumed = _run_resume(literature_root, template.work_id, launcher_index=0)
+
+    assert resumed.returncode == 0, (resumed.stdout + resumed.stderr).decode(
+        errors="replace"
+    )
+    result = json.loads(resumed.stdout)["result"]
+    assert result["start_stage"] == "handoff"
+    assert result["advanced_stages"] == ["handoff"]
+    assert result["pipeline_complete"] is True
+    candidate_reviews = (
+        literature_root / "works" / template.work_id / "reviews" / template.candidate_id
+    )
+    assert not (candidate_reviews / "import_attempts").exists()
+    assert not (candidate_reviews / "imports").exists()
+    handoffs = literature_root / "works" / template.work_id / "handoffs"
+    assert len([path for path in handoffs.iterdir() if path.name != ".staging"]) == 1
+
+
+def test_resume_repairs_missing_review_current_from_review_stage(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+) -> None:
+    literature_root, template = review_candidate_root
+    rejected = _run_review(
+        literature_root,
+        template.candidate_id,
+        "--reject",
+        launcher_index=1,
+    )
+    assert rejected.returncode == 0
+    candidate_reviews = (
+        literature_root / "works" / template.work_id / "reviews" / template.candidate_id
+    )
+    (candidate_reviews / "current.json").unlink()
+
+    resumed = _run_resume(literature_root, template.work_id, launcher_index=0)
+
+    assert resumed.returncode == 0, (resumed.stdout + resumed.stderr).decode(
+        errors="replace"
+    )
+    result = json.loads(resumed.stdout)["result"]
+    assert result["start_stage"] == "review"
+    assert result["advanced_stages"] == ["review"]
+    assert result["pipeline_complete"] is True
+    assert (candidate_reviews / "current.json").is_file()
+
+
+def test_resume_quarantines_partial_handoff_staging_in_place(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gezhi import _literature_review as review
+    from gezhi._windows_data_root import open_validated_data_root_v1
+
+    literature_root, template = review_candidate_root
+
+    def fail_handoff(*_args: object, **_kwargs: object) -> object:
+        raise review._HandoffFailedV1("injected pre-staging failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(review, "_commit_or_reuse_handoff", fail_handoff)
+        with open_validated_data_root_v1(str(literature_root)) as root:
+            accepted = review.review_candidate_v1(
+                review.ReviewCandidateCommandV1(template.candidate_id, "accept"),
+                root=root,
+                knowledge_intake=None,
+            )
+    assert type(accepted) is review.ReviewFailedV1
+    handoff_id = _handoff_id(template, action="accept", revision=1)
+    handoffs = literature_root / "works" / template.work_id / "handoffs"
+    partial = handoffs / ".staging" / handoff_id
+    partial.mkdir(parents=True)
+    marker = b'{"partial":true}\n'
+    (partial / "manifest.json").write_bytes(marker)
+
+    resumed = _run_resume(literature_root, template.work_id, launcher_index=1)
+
+    assert resumed.returncode == 1
+    document = json.loads(resumed.stdout)
+    assert document["diagnostics"] == [
+        {
+            "code": "literature.resume.stage_failed.v1",
+            "context": {
+                "reason": "asset_integrity_lost",
+                "stage": "handoff",
+            },
+        }
+    ]
+    assert document["result"]["start_stage"] == "handoff"
+    assert document["result"]["stop_stage"] == "handoff"
+    assert (partial / "manifest.json").read_bytes() == marker
+    assert not (handoffs / handoff_id).exists()
+
+
+def test_resume_rejects_partial_staging_when_formal_handoff_is_exact(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+) -> None:
+    literature_root, template = review_candidate_root
+    accepted = _run_review(
+        literature_root,
+        template.candidate_id,
+        "--accept",
+        launcher_index=0,
+    )
+    assert accepted.returncode == 2
+
+    handoff_id = _handoff_id(template, action="accept", revision=1)
+    handoffs = literature_root / "works" / template.work_id / "handoffs"
+    formal = handoffs / handoff_id
+    formal_bytes = {
+        name: (formal / name).read_bytes()
+        for name in ("candidates.jsonl", "manifest.json")
+    }
+    partial = handoffs / ".staging" / handoff_id
+    partial.mkdir(parents=True)
+    marker = b'{"partial":true}\n'
+    (partial / "manifest.json").write_bytes(marker)
+
+    resumed = _run_resume(literature_root, template.work_id, launcher_index=1)
+
+    assert resumed.returncode == 1
+    document = json.loads(resumed.stdout)
+    assert document["diagnostics"] == [
+        {
+            "code": "literature.resume.stage_failed.v1",
+            "context": {
+                "reason": "asset_integrity_lost",
+                "stage": "handoff",
+            },
+        }
+    ]
+    assert (partial / "manifest.json").read_bytes() == marker
+    assert {
+        name: (formal / name).read_bytes()
+        for name in ("candidates.jsonl", "manifest.json")
+    } == formal_bytes
+
+
+def test_work_snapshot_scans_all_candidates_before_sealing_pending(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from gezhi import _literature_review as review
+    from gezhi._windows_data_root import open_validated_data_root_v1
+    from gezhi._windows_ownership import try_acquire_work_writer_v1
+
+    literature_root, template = review_candidate_root
+    invalid_id = "cand_000000000000000000000000"
+    with open_validated_data_root_v1(str(literature_root)) as root:
+        original = review._find_candidate_authority_v1(template.candidate_id, root=root)
+        authority = original.source
+        invalid = replace(
+            original,
+            candidate={**original.candidate, "candidate_id": invalid_id},
+        )
+        decided = review._DecisionV1(
+            document={},
+            payload=b"",
+            revision=1,
+            status="rejected",
+        )
+
+        def candidate_ids(_authority: object) -> tuple[str, ...]:
+            return (invalid_id, template.candidate_id)
+
+        def find_candidate(candidate_id: str, **_kwargs: object) -> object:
+            return invalid if candidate_id == invalid_id else original
+
+        def snapshot(candidate: object, **_kwargs: object) -> object:
+            if candidate is invalid:
+                raise review._ReviewStateInvalidV1("injected first Candidate failure")
+            return (
+                literature_root / "works" / template.work_id / "reviews",
+                literature_root
+                / "works"
+                / template.work_id
+                / "reviews"
+                / template.candidate_id,
+                (decided,),
+                frozenset({1}),
+                (),
+                (),
+                False,
+            )
+
+        monkeypatch.setattr(review, "_work_review_candidate_ids", candidate_ids)
+        monkeypatch.setattr(review, "_find_candidate_authority_v1", find_candidate)
+        monkeypatch.setattr(review, "_review_authority_snapshot", snapshot)
+        assert root.inspection.identity is not None
+        owner = try_acquire_work_writer_v1(
+            root.inspection.identity,
+            template.work_id,
+        )
+        assert owner is not None
+        with owner:
+            result = review.continue_work_review_v1(
+                authority,
+                (invalid_id, template.candidate_id),
+                owner=owner,
+                root=root,
+                knowledge_intake=None,
+            )
+
+    assert result.stop is not None
+    assert result.stop.stage == "review"
+    assert result.stop.reason == "review_state_invalid"
+    assert result.pending_candidate_ids == ()
+
+
+def test_work_continuation_maps_initial_root_checkpoint_drift(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gezhi import _literature_review as review
+    from gezhi._windows_data_root import open_validated_data_root_v1
+    from gezhi._windows_ownership import try_acquire_work_writer_v1
+
+    literature_root, template = review_candidate_root
+    with open_validated_data_root_v1(str(literature_root)) as root:
+        candidate = review._find_candidate_authority_v1(
+            template.candidate_id,
+            root=root,
+        )
+        assert root.inspection.identity is not None
+        owner = try_acquire_work_writer_v1(
+            root.inspection.identity,
+            template.work_id,
+        )
+        assert owner is not None
+
+        def drift(_root: object) -> None:
+            raise review.AddStoppedV1("failed", "data_root_integrity_lost")
+
+        monkeypatch.setattr(review, "_root_checkpoint", drift)
+        with owner:
+            result = review.continue_work_review_v1(
+                candidate.source,
+                (template.candidate_id,),
+                owner=owner,
+                root=root,
+                knowledge_intake=None,
+            )
+
+    assert result.stop is not None
+    assert result.stop.outcome == "failed"
+    assert result.stop.stage == "review"
+    assert result.stop.reason == "data_root_integrity_lost"
+    assert result.stop.data_root == "literature"
+    assert result.pending_candidate_ids == ()
+
+
+def test_resume_fails_closed_when_review_authority_drifts_before_final_seal(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gezhi import _literature_review as review
+    from gezhi._literature_resume import ResumeStoppedV1
+
+    literature_root, template = review_candidate_root
+    rejected = _run_review(
+        literature_root,
+        template.candidate_id,
+        "--reject",
+        launcher_index=1,
+    )
+    assert rejected.returncode == 0
+    no_action = (
+        literature_root
+        / "works"
+        / template.work_id
+        / "reviews"
+        / template.candidate_id
+        / "no_actions"
+        / "1.json"
+    )
+    assert no_action.is_file()
+    continue_review = review.continue_work_review_v1
+
+    def drift_after_continuation(*args: object, **kwargs: object) -> object:
+        result = continue_review(*args, **kwargs)  # type: ignore[arg-type]
+        no_action.unlink()
+        return result
+
+    monkeypatch.setattr(
+        review,
+        "continue_work_review_v1",
+        drift_after_continuation,
+    )
+
+    with pytest.raises(ResumeStoppedV1) as caught:
+        _resume_with_intake(literature_root, template.work_id, None)
+
+    assert caught.value.outcome == "failed"
+    assert caught.value.reason == "recovery_failed"
+    assert caught.value.result is None
+
+
+def test_resume_quarantines_review_file_staging_in_place(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+) -> None:
+    literature_root, template = review_candidate_root
+    rejected = _run_review(
+        literature_root,
+        template.candidate_id,
+        "--reject",
+        launcher_index=0,
+    )
+    assert rejected.returncode == 0
+    staged = (
+        literature_root
+        / "works"
+        / template.work_id
+        / "reviews"
+        / ".staging"
+        / ".files"
+        / "foreign.tmp"
+    )
+    marker = b"quarantined-review-staging"
+    staged.write_bytes(marker)
+
+    resumed = _run_resume(literature_root, template.work_id, launcher_index=1)
+
+    assert resumed.returncode == 1
+    document = json.loads(resumed.stdout)
+    assert document["diagnostics"] == [
+        {
+            "code": "literature.resume.recovery_failed.v1",
+            "context": {},
+        }
+    ]
+    assert document["result"] is None
+    assert staged.read_bytes() == marker
+
+
+def test_resume_retries_a_valid_no_action_private_staging_file(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gezhi import _literature_review as review
+    from gezhi._literature_resume import ResumeWorkResultV1
+    from gezhi._windows_data_root import open_validated_data_root_v1
+
+    literature_root, template = review_candidate_root
+    real_rename = review.os.rename
+    failed = False
+
+    def fail_first_no_action(source: object, target: object) -> None:
+        nonlocal failed
+        if not failed and Path(target).parent.name == "no_actions":
+            failed = True
+            raise OSError("injected no-action rename failure")
+        real_rename(source, target)
+
+    monkeypatch.setattr(review.os, "rename", fail_first_no_action)
+    with open_validated_data_root_v1(str(literature_root)) as root:
+        stopped = review.review_candidate_v1(
+            review.ReviewCandidateCommandV1(template.candidate_id, "reject"),
+            root=root,
+            knowledge_intake=None,
+        )
+    assert type(stopped) is review.ReviewFailedV1
+    assert stopped.cause.reason == "handoff_failed"
+    private_files = (
+        literature_root / "works" / template.work_id / "reviews" / ".staging" / ".files"
+    )
+    evidence = {
+        path.name: path.read_bytes()
+        for path in private_files.iterdir()
+        if path.name.startswith("no_actions.1.json.")
+    }
+    assert len(evidence) == 1
+
+    resumed = _resume_with_intake(literature_root, template.work_id, None)
+
+    assert type(resumed) is ResumeWorkResultV1
+    assert resumed.start_stage == "handoff"
+    assert resumed.advanced_stages == ("handoff", "knowledge_import")
+    assert resumed.pipeline_complete is True
+    candidate_reviews = (
+        literature_root / "works" / template.work_id / "reviews" / template.candidate_id
+    )
+    assert (candidate_reviews / "no_actions" / "1.json").is_file()
+    assert {name: (private_files / name).read_bytes() for name in evidence} == evidence
+
+
+def test_resume_retries_a_valid_import_receipt_private_staging_file(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gezhi import _literature_review as review
+    from gezhi._literature_resume import ResumeWorkResultV1
+    from gezhi._windows_data_root import open_validated_data_root_v1
+
+    literature_root, template = review_candidate_root
+
+    class IdempotentIntake:
+        def __init__(self) -> None:
+            self.actions: list[str] = []
+
+        def apply(self, handoff: review.ReviewedHandoffBytesV1) -> object:
+            action = str(json.loads(handoff.candidates_bytes)["action"])
+            self.actions.append(action)
+            return review.IntakeAppliedV1(
+                "active",
+                "applied" if len(self.actions) == 1 else "unchanged",
+            )
+
+    real_rename = review.os.rename
+    failed = False
+
+    def fail_first_import_receipt(source: object, target: object) -> None:
+        nonlocal failed
+        if not failed and Path(target).parent.name == "imports":
+            failed = True
+            raise OSError("injected import receipt rename failure")
+        real_rename(source, target)
+
+    monkeypatch.setattr(review.os, "rename", fail_first_import_receipt)
+    intake = IdempotentIntake()
+    with (
+        open_validated_data_root_v1(str(literature_root)) as root,
+        pytest.raises(review.ReviewIndeterminateV1),
+    ):
+        review.review_candidate_v1(
+            review.ReviewCandidateCommandV1(template.candidate_id, "accept"),
+            root=root,
+            knowledge_intake=intake,
+        )
+    private_files = (
+        literature_root / "works" / template.work_id / "reviews" / ".staging" / ".files"
+    )
+    evidence = {
+        path.name: path.read_bytes()
+        for path in private_files.iterdir()
+        if path.name.startswith("imports.1.json.")
+    }
+    assert len(evidence) == 1
+
+    resumed = _resume_with_intake(literature_root, template.work_id, intake)
+
+    assert type(resumed) is ResumeWorkResultV1
+    assert resumed.start_stage == "knowledge_import"
+    assert resumed.advanced_stages == ("knowledge_import",)
+    assert resumed.pipeline_complete is True
+    assert intake.actions == ["accept", "accept"]
+    candidate_reviews = (
+        literature_root / "works" / template.work_id / "reviews" / template.candidate_id
+    )
+    assert (candidate_reviews / "imports" / "1.json").is_file()
+    assert {name: (private_files / name).read_bytes() for name in evidence} == evidence
+
+
+def test_resume_rejects_orphan_formal_handoff_namespace(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+) -> None:
+    literature_root, template = review_candidate_root
+    rejected = _run_review(
+        literature_root,
+        template.candidate_id,
+        "--reject",
+        launcher_index=1,
+    )
+    assert rejected.returncode == 0
+    orphan = (
+        literature_root
+        / "works"
+        / template.work_id
+        / "handoffs"
+        / "hnd_000000000000000000000000"
+    )
+    orphan.mkdir(parents=True)
+    marker = b'{"orphan":true}\n'
+    (orphan / "manifest.json").write_bytes(marker)
+
+    resumed = _run_resume(literature_root, template.work_id, launcher_index=0)
+
+    assert resumed.returncode == 1
+    document = json.loads(resumed.stdout)
+    assert document["diagnostics"] == [
+        {
+            "code": "literature.resume.stage_failed.v1",
+            "context": {
+                "reason": "asset_integrity_lost",
+                "stage": "handoff",
+            },
+        }
+    ]
+    assert document["result"]["start_stage"] == "handoff"
+    assert document["result"]["stop_stage"] == "handoff"
+    assert (orphan / "manifest.json").read_bytes() == marker
+
+
+def test_resume_replays_historical_withdraw_before_the_current_accept(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gezhi import _literature_review as review
+    from gezhi._literature_resume import ResumeStoppedV1, ResumeWorkResultV1
+    from gezhi._windows_data_root import open_validated_data_root_v1
+
+    literature_root, template = review_candidate_root
+
+    class AppliedIntake:
+        def __init__(self) -> None:
+            self.actions: list[str] = []
+
+        def apply(self, handoff: review.ReviewedHandoffBytesV1) -> object:
+            action = str(json.loads(handoff.candidates_bytes)["action"])
+            self.actions.append(action)
+            return review.IntakeAppliedV1(
+                "active" if action == "accept" else "withdrawn",
+                "applied",
+            )
+
+    initial_intake = AppliedIntake()
+    with open_validated_data_root_v1(str(literature_root)) as root:
+        accepted = review.review_candidate_v1(
+            review.ReviewCandidateCommandV1(template.candidate_id, "accept"),
+            root=root,
+            knowledge_intake=initial_intake,
+        )
+    assert type(accepted) is review.ReviewSucceededV1
+    assert initial_intake.actions == ["accept"]
+
+    def fail_withdraw(*_args: object, **_kwargs: object) -> object:
+        raise review._HandoffFailedV1("injected historical withdraw failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(review, "_commit_or_reuse_handoff", fail_withdraw)
+        with open_validated_data_root_v1(str(literature_root)) as root:
+            rejected = review.review_candidate_v1(
+                review.ReviewCandidateCommandV1(template.candidate_id, "reject"),
+                root=root,
+                knowledge_intake=None,
+            )
+    assert type(rejected) is review.ReviewFailedV1
+    assert rejected.progress is not None
+    assert rejected.progress.review_revision == 2
+
+    with open_validated_data_root_v1(str(literature_root)) as root:
+        current_accept = review.review_candidate_v1(
+            review.ReviewCandidateCommandV1(template.candidate_id, "accept"),
+            root=root,
+            knowledge_intake=None,
+        )
+    assert type(current_accept) is review.ReviewBlockedV1
+    assert current_accept.progress is not None
+    assert current_accept.progress.review_revision == 3
+
+    class BlockOnceIntake:
+        def __init__(self) -> None:
+            self.actions: list[str] = []
+
+        def apply(self, handoff: review.ReviewedHandoffBytesV1) -> object:
+            action = str(json.loads(handoff.candidates_bytes)["action"])
+            self.actions.append(action)
+            if len(self.actions) == 1:
+                return review.IntakeBlockedV1("import_blocked")
+            return review.IntakeAppliedV1(
+                "active" if action == "accept" else "withdrawn",
+                "applied",
+            )
+
+    recovery_intake = BlockOnceIntake()
+    with pytest.raises(ResumeStoppedV1) as first_stop:
+        _resume_with_intake(
+            literature_root,
+            template.work_id,
+            recovery_intake,
+        )
+
+    assert first_stop.value.outcome == "blocked"
+    assert first_stop.value.reason == "import_blocked"
+    assert first_stop.value.stage == "knowledge_import"
+    assert first_stop.value.result is not None
+    assert first_stop.value.result.start_stage == "handoff"
+    assert first_stop.value.result.advanced_stages == ("handoff",)
+    candidate_reviews = (
+        literature_root / "works" / template.work_id / "reviews" / template.candidate_id
+    )
+    assert (candidate_reviews / "import_attempts" / "2.json").is_file()
+    assert not (candidate_reviews / "imports" / "2.json").exists()
+
+    resumed = _resume_with_intake(literature_root, template.work_id, recovery_intake)
+
+    assert type(resumed) is ResumeWorkResultV1
+    assert resumed.start_stage == "knowledge_import"
+    assert resumed.advanced_stages == ("knowledge_import",)
+    assert resumed.pipeline_complete is True
+    assert recovery_intake.actions == ["withdraw", "withdraw", "accept"]
+    assert (candidate_reviews / "imports" / "2.json").is_file()
+    assert (candidate_reviews / "imports" / "3.json").is_file()

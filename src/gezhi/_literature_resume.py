@@ -15,7 +15,7 @@ from collections.abc import Collection, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import BinaryIO, Literal, NoReturn, TypeAlias, cast
+from typing import TYPE_CHECKING, BinaryIO, Literal, NoReturn, TypeAlias, cast
 
 from pypdf import PageObject, PdfReader
 from pypdf.generic import NullObject
@@ -40,6 +40,9 @@ from gezhi._windows_data_root import (
     validate_relative_parts_v1,
 )
 from gezhi._windows_ownership import try_acquire_work_writer_v1
+
+if TYPE_CHECKING:
+    from gezhi._literature_review import KnowledgeIntakeV1
 
 _WORK_ID = re.compile(
     r"^wrk_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
@@ -3220,6 +3223,7 @@ def resume_work(
     *,
     root: ValidatedDataRootV1,
     source_environment: Mapping[str, str] | None = None,
+    knowledge_intake: KnowledgeIntakeV1 | None = None,
 ) -> ResumeWorkResultV1:
     if type(work_id) is not str or _WORK_ID.fullmatch(work_id) is None:
         raise ResumeStoppedV1("blocked", "work_invalid")
@@ -3410,30 +3414,86 @@ def resume_work(
             *advanced_stages,
             *(("read",) if materialized.advanced else ()),
         )
-        if materialized.pending_candidate_ids:
-            review_start: ResumeStage = (
-                start_stage
-                if advanced_stages or materialized.advanced
-                else "review"
+        from gezhi._literature_review import (
+            ReviewIndeterminateV1,
+            continue_work_review_v1,
+            verify_work_review_continuation_v1,
+        )
+
+        try:
+            review = continue_work_review_v1(
+                authority,
+                materialized.pending_candidate_ids,
+                owner=owner,
+                root=root,
+                knowledge_intake=knowledge_intake,
             )
+            if review.stop is not None and review.stop.data_root == "literature":
+                raise ResumeStoppedV1(
+                    review.stop.outcome,
+                    review.stop.reason,
+                    data_root="literature",
+                )
+            review = verify_work_review_continuation_v1(
+                authority,
+                materialized.pending_candidate_ids,
+                review,
+                owner=owner,
+                root=root,
+            )
+        except ReviewIndeterminateV1 as error:
+            raise ResumeStoppedV1("failed", "recovery_failed") from error
+        review_advanced = cast(tuple[ResumeStage, ...], review.advanced_stages)
+        all_advanced: tuple[ResumeStage, ...] = (
+            *completed_stages,
+            *review_advanced,
+        )
+        invocation_start: ResumeStage | Literal["complete"] = (
+            start_stage if completed_stages else review.start_stage
+        )
+        if review.stop is not None:
+            if review.stop.data_root == "literature":
+                raise ResumeStoppedV1(
+                    review.stop.outcome,
+                    review.stop.reason,
+                    data_root="literature",
+                )
+            _fresh_authority_or_stop(authority, root)
+            stopped_result = ResumeWorkResultV1(
+                active_source_id=authority.source_id,
+                advanced_stages=all_advanced,
+                pending_candidate_ids=review.pending_candidate_ids,
+                pipeline_complete=False,
+                start_stage=invocation_start,
+                stop_stage=review.stop.stage,
+                work_id=authority.work_id,
+            )
+            raise ResumeStoppedV1(
+                review.stop.outcome,
+                review.stop.reason,
+                stage=(
+                    None if review.stop.data_root is not None else review.stop.stage
+                ),
+                data_root=review.stop.data_root,
+                result=stopped_result,
+            )
+        if review.pending_candidate_ids:
             _stop_stage(
                 authority,
                 root,
-                start_stage=review_start,
-                advanced_stages=completed_stages,
+                start_stage=cast(ResumeStage, invocation_start),
+                advanced_stages=all_advanced,
                 outcome="blocked",
                 stage="review",
                 reason="awaiting_review",
-                pending_candidate_ids=materialized.pending_candidate_ids,
+                pending_candidate_ids=review.pending_candidate_ids,
             )
 
         _fresh_authority_or_stop(authority, root)
-        complete_start: ResumeStage | Literal["complete"] = (
-            start_stage if advanced_stages or materialized.advanced else "complete"
-        )
+        complete_start: ResumeStage | Literal["complete"] = invocation_start
         return ResumeWorkResultV1(
             active_source_id=authority.source_id,
-            advanced_stages=completed_stages,
+            advanced_stages=all_advanced,
             pending_candidate_ids=(),
             pipeline_complete=True,
             start_stage=complete_start,

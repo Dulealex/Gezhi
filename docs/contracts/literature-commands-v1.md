@@ -300,7 +300,7 @@ T04 V1不定义 supplemental Literature diagnostic。成功 `diagnostics=[]`；b
 | `literature.resume.stage_failed.v1` | failed | `{"reason":"<closed>","stage":"<stage>"}` | non-null |
 | `literature.resume.recovery_failed.v1` | failed | `{}` | null |
 
-三个 Resume Data Root primary 的 context 都是且只能是 `{"data_root":"literature"}` 或 `{"data_root":"knowledge"}` 两个 exact object 的 closed one-of；不得出现合并字符串、其他 value、其他 key 或 additional property。三个 `literature` variant 均阻止 result seal 并返回 null；三个 `knowledge` variant 只在到达 `knowledge_import` 后出现，均返回第 5.3 节冻结的 non-null sealed result，`stop_stage=knowledge_import`，且不属于下方 43 个 stage/reason pair。Knowledge root fault 不暗示 Literature root 同时失去可信性。
+三个 Resume Data Root primary 的 context 都是且只能是 `{"data_root":"literature"}` 或 `{"data_root":"knowledge"}` 两个 exact object 的 closed one-of；不得出现合并字符串、其他 value、其他 key 或 additional property。三个 `literature` variant 均阻止 result seal 并返回 null；三个 `knowledge` variant 只在到达 `knowledge_import` 后出现，均返回第 5.3 节冻结的 non-null sealed result，`stop_stage=knowledge_import`，且不属于下方 38 个 stage/reason pair。Knowledge root fault 不暗示 Literature root 同时失去可信性。
 
 `stage_blocked` closed matrix：
 

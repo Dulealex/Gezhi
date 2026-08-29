@@ -62,6 +62,33 @@ class WriterOwnershipV1:
     def __exit__(self, *_exc: object) -> None:
         self.close()
 
+    def assert_work_ownership_v1(
+        self,
+        root_identity: FileIdentity,
+        work_id: str,
+    ) -> None:
+        """Prove this live token owns one exact Work on the current thread."""
+
+        identity = _validated_root_identity(root_identity)
+        if type(work_id) is not str or _WORK_ID.fullmatch(work_id) is None:
+            raise ValueError("Work ID is invalid")
+        expected_name = _mutex_name(identity, scope="work", work_id=work_id)
+        thread_id = threading.get_ident()
+        with _registry_guard:
+            if (
+                self._closed
+                or self.scope != "work"
+                or self.work_id != work_id
+                or self._name != expected_name
+                or self._handle == 0
+                or self._thread_id != thread_id
+                or _process_leases.get(expected_name) != thread_id
+                or _thread_work_leases.get(thread_id) != expected_name
+            ):
+                raise WriterOwnershipLifecycleErrorV1(
+                    "Work writer ownership proof is invalid"
+                )
+
     def close(self) -> None:
         if self._closed:
             return

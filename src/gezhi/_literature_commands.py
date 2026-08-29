@@ -512,7 +512,9 @@ def _validate_resume_result(value: object) -> dict[str, object]:
             start == "review"
             and stop == "review"
             and bool(advanced)
-            and all(stage in {"handoff", "knowledge_import"} for stage in advanced)
+            and all(
+                stage in {"review", "handoff", "knowledge_import"} for stage in advanced
+            )
         )
         if not returned_from_review_backlog and (
             start_index > stop_index
@@ -627,12 +629,11 @@ def _validate_resume_result_diagnostic_binding(
         if reason == "awaiting_review":
             if stage != "review" or not pending:
                 raise ValueError("Literature resume review backlog is invalid")
-        elif stage in {"handoff", "knowledge_import"}:
-            if result["start_stage"] != "review" or not pending:
-                raise ValueError("Literature resume retained backlog is invalid")
-        elif pending:
+        elif pending and stage not in {"review", "handoff", "knowledge_import"}:
             raise ValueError("Literature resume pending backlog is invalid")
-        if stage in advanced:
+        if stage in advanced and not (
+            stage == "review" and reason == "awaiting_review"
+        ):
             raise ValueError("Literature resume stopped stage was advanced")
         return
     if (
@@ -1029,9 +1030,7 @@ def _validate_review_diagnostic(
     diagnostic = cast(dict[str, object], value)
     code = cast(str, diagnostic["code"])
     context = cast(dict[str, object], diagnostic["context"])
-    allowed = (
-        _REVIEW_BLOCKED_CODES if outcome == "blocked" else _REVIEW_FAILED_CODES
-    )
+    allowed = _REVIEW_BLOCKED_CODES if outcome == "blocked" else _REVIEW_FAILED_CODES
     if code not in allowed:
         raise ValueError("Literature review diagnostic is invalid")
     if code in _REVIEW_DATA_ROOT_CODES:
@@ -1100,10 +1099,7 @@ def _validate_review_result_diagnostic_binding(
             "literature.review.import_blocked.v1",
             "literature.review.import_failed.v1",
         }
-        or (
-            code in _REVIEW_DATA_ROOT_CODES
-            and context == {"data_root": "knowledge"}
-        )
+        or (code in _REVIEW_DATA_ROOT_CODES and context == {"data_root": "knowledge"})
     ) and phase != "import":
         raise ValueError("Literature review import result is invalid")
 
