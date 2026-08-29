@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
+from contextlib import nullcontext
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -20,6 +22,7 @@ from gezhi._literature_reader import (
     StudyDescriptorV1,
     SynopsisStatementV1,
 )
+from gezhi._windows_data_root import ValidatedDataRootV1
 
 _BLOCK_ID = "blk_111111111111111111111111"
 _CANONICAL_SHA256 = "c" * 64
@@ -74,16 +77,18 @@ def _reading_result(*, with_descriptors: bool) -> ReadingResultV1:
     )
 
 
-def _authority() -> ActiveSourceAuthorityV1:
+def _authority(
+    source_directory: Path = Path("source"),
+) -> ActiveSourceAuthorityV1:
     return ActiveSourceAuthorityV1(
         work_id=_WORK_ID,
         source_id=_SOURCE_ID,
         source_sha256=_SOURCE_SHA256,
         source_byte_length=123,
         source_manifest_sha256="a" * 64,
-        work_directory=Path("work"),
-        source_directory=Path("source"),
-        original_pdf_path=Path("source.pdf"),
+        work_directory=source_directory.parent / "work",
+        source_directory=source_directory,
+        original_pdf_path=source_directory / "source.pdf",
         ingest_identity_ready=True,
     )
 
@@ -98,11 +103,15 @@ def _canonical() -> CurrentCanonicalAssetV1:
     )
 
 
-def _reader() -> ReaderAdvanceV1:
+def _reader(
+    *,
+    run_id: str = _READER_RUN_ID,
+    manifest_sha256: str = _READER_MANIFEST_SHA256,
+) -> ReaderAdvanceV1:
     return ReaderAdvanceV1(
         advanced=True,
-        run_id=_READER_RUN_ID,
-        manifest_sha256=_READER_MANIFEST_SHA256,
+        run_id=run_id,
+        manifest_sha256=manifest_sha256,
         pending_candidate_ids=(),
     )
 
@@ -131,6 +140,81 @@ def _materialize(
         _reader(),
         _bundle(reading, drafts),
         run_id,
+    )
+
+
+def _write_committed_materialization(
+    runs_dir: Path,
+    authority: ActiveSourceAuthorityV1,
+    reader: ReaderAdvanceV1,
+    bundle: candidate._ReaderBundleV1,
+    run_id: str,
+) -> tuple[candidate._MaterializedBytesV1, str]:
+    materialized = candidate._materialized_documents(
+        authority,
+        _canonical(),
+        reader,
+        bundle,
+        run_id,
+    )
+    run_dir = runs_dir / run_id
+    result_dir = run_dir / "result"
+    result_dir.mkdir(parents=True)
+    (run_dir / "input.json").write_bytes(materialized.input_bytes)
+    (result_dir / "descriptor_payloads.jsonl").write_bytes(
+        materialized.descriptor_bytes
+    )
+    (result_dir / "candidate_knowledge.jsonl").write_bytes(
+        materialized.candidate_bytes
+    )
+    (result_dir / "review_queue.json").write_bytes(materialized.queue_bytes)
+    manifest_bytes = candidate._manifest_bytes(
+        authority,
+        _canonical(),
+        reader,
+        materialized,
+        run_id,
+    )
+    (run_dir / "manifest.json").write_bytes(manifest_bytes)
+    return materialized, hashlib.sha256(manifest_bytes).hexdigest()
+
+
+def _allow_plain_test_filesystem(monkeypatch: pytest.MonkeyPatch) -> None:
+    def read_safe(path: Path, *, limit: int) -> bytes:
+        payload = path.read_bytes()
+        if len(payload) > limit:
+            raise ValueError("test asset is too large")
+        return payload
+
+    def read_canonical(path: Path) -> tuple[dict[str, object], bytes]:
+        payload = read_safe(path, limit=candidate._MAX_ASSET_BYTES)
+        value = json.loads(payload)
+        if type(value) is not dict or payload != candidate._canonical_file_bytes(value):
+            raise ValueError("test JSON is not canonical")
+        return value, payload
+
+    monkeypatch.setattr(candidate, "_materialization_checkpoint", lambda *_: None)
+    monkeypatch.setattr(
+        candidate,
+        "open_validated_data_root_v1",
+        lambda _path: nullcontext(),
+    )
+    monkeypatch.setattr(candidate, "_read_safe_bytes", read_safe)
+    monkeypatch.setattr(candidate, "_read_canonical_object_v1", read_canonical)
+    monkeypatch.setattr(
+        candidate,
+        "_write_new_verified",
+        lambda path, payload: path.write_bytes(payload),
+    )
+    monkeypatch.setattr(
+        candidate,
+        "_entry_names",
+        lambda path: tuple(sorted(child.name for child in path.iterdir())),
+    )
+    monkeypatch.setattr(
+        candidate,
+        "_name_exists",
+        lambda parent, name: (parent / name).exists(),
     )
 
 
@@ -240,5 +324,173 @@ def test_candidate_identity_conflicts_fail_the_whole_materialization(
         candidate.CandidateMaterializationStageStoppedV1
     ) as stopped:
         _materialize(reading, drafts)
+    assert stopped.value.outcome == "failed"
+    assert stopped.value.reason == "candidate_validation_failed"
+
+
+def test_current_replace_requires_matching_readback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    materializations = tmp_path / "materializations"
+    materializations.mkdir()
+    authority = _authority(tmp_path / "source")
+    _allow_plain_test_filesystem(monkeypatch)
+    original_read = candidate._read_safe_bytes
+
+    def mismatched_current(path: Path, *, limit: int) -> bytes:
+        if path == materializations / "current.json":
+            return b"{}\n"
+        return original_read(path, limit=limit)
+
+    monkeypatch.setattr(candidate, "_read_safe_bytes", mismatched_current)
+    with pytest.raises(candidate.CandidateMaterializationRecoveryUncertainV1):
+        candidate._replace_current(
+            materializations,
+            authority,
+            cast(ValidatedDataRootV1, object()),
+            _MATERIALIZATION_RUN_ID,
+            "a" * 64,
+        )
+
+
+def test_valid_historical_current_repairs_the_current_reader_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "source"
+    authority = _authority(source_dir)
+    materializations = source_dir / "semantic" / "materializations"
+    runs_dir = materializations / "runs"
+    runs_dir.mkdir(parents=True)
+    reading = _reading_result(with_descriptors=False)
+    drafts = [
+        CandidateDraftV1(
+            candidate_type="claim",
+            descriptor_refs=[],
+            statement=_statement("这是一个跨 Reader successor 的稳定结论。"),
+        )
+    ]
+    historical_reader = _reader()
+    current_reader = _reader(
+        run_id="semrun_223e4567-e89b-42d3-a456-426614174000",
+        manifest_sha256="e" * 64,
+    )
+    historical_bundle = _bundle(reading, drafts)
+    current_bundle = _bundle(reading, drafts)
+    historical_run_id = _MATERIALIZATION_RUN_ID
+    current_run_id = "matrun_223e4567-e89b-42d3-a456-426614174000"
+    _, historical_manifest_sha256 = _write_committed_materialization(
+        runs_dir,
+        authority,
+        historical_reader,
+        historical_bundle,
+        historical_run_id,
+    )
+    current_materialized, current_manifest_sha256 = (
+        _write_committed_materialization(
+            runs_dir,
+            authority,
+            current_reader,
+            current_bundle,
+            current_run_id,
+        )
+    )
+    (materializations / "current.json").write_bytes(
+        candidate._canonical_file_bytes(
+            {
+                "manifest_sha256": historical_manifest_sha256,
+                "run_id": historical_run_id,
+                "schema_version": "gezhi.candidate_materialization_current.v1",
+            }
+        )
+    )
+    _allow_plain_test_filesystem(monkeypatch)
+
+    def load_historical_bundle(
+        supplied_authority: ActiveSourceAuthorityV1,
+        supplied_canonical: CurrentCanonicalAssetV1,
+        supplied_reader: ReaderAdvanceV1,
+        *,
+        require_current: bool,
+    ) -> candidate._ReaderBundleV1:
+        assert supplied_authority == authority
+        assert supplied_canonical == _canonical()
+        assert not require_current
+        assert supplied_reader.run_id == historical_reader.run_id
+        return historical_bundle
+
+    monkeypatch.setattr(
+        candidate,
+        "_reader_bundle_for_run",
+        load_historical_bundle,
+    )
+    recovered = candidate._load_or_recover_current(
+        materializations,
+        runs_dir,
+        authority,
+        _canonical(),
+        current_reader,
+        current_bundle,
+        cast(ValidatedDataRootV1, object()),
+    )
+
+    assert recovered == candidate.CandidateMaterializationAdvanceV1(
+        advanced=True,
+        run_id=current_run_id,
+        manifest_sha256=current_manifest_sha256,
+        pending_candidate_ids=current_materialized.pending_candidate_ids,
+    )
+    assert json.loads((materializations / "current.json").read_bytes())[
+        "run_id"
+    ] == current_run_id
+
+
+@pytest.mark.parametrize("identity", [_same_full_hash, _same_short_id])
+def test_cross_successor_candidate_collision_fails_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    identity: Callable[[bytes], str],
+) -> None:
+    source_dir = tmp_path / "source"
+    authority = _authority(source_dir)
+    runs_dir = source_dir / "semantic" / "materializations" / "runs"
+    runs_dir.mkdir(parents=True)
+    reading = _reading_result(with_descriptors=False)
+    historical_draft = CandidateDraftV1(
+        candidate_type="claim",
+        descriptor_refs=[],
+        statement=_statement("第一条不同的结论。"),
+    )
+    current_draft = CandidateDraftV1(
+        candidate_type="claim",
+        descriptor_refs=[],
+        statement=_statement("第二条不同的结论。"),
+    )
+    _allow_plain_test_filesystem(monkeypatch)
+    monkeypatch.setattr(candidate, "_content_sha256", identity)
+    _write_committed_materialization(
+        runs_dir,
+        authority,
+        _reader(),
+        _bundle(reading, [historical_draft]),
+        _MATERIALIZATION_RUN_ID,
+    )
+    current = candidate._materialized_documents(
+        authority,
+        _canonical(),
+        _reader(),
+        _bundle(reading, [current_draft]),
+        "matrun_223e4567-e89b-42d3-a456-426614174000",
+    )
+
+    with pytest.raises(
+        candidate.CandidateMaterializationStageStoppedV1
+    ) as stopped:
+        candidate._ensure_no_historical_identity_conflicts(
+            runs_dir,
+            authority,
+            current,
+        )
     assert stopped.value.outcome == "failed"
     assert stopped.value.reason == "candidate_validation_failed"

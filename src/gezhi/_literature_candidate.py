@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import uuid
@@ -29,6 +30,8 @@ from gezhi._literature_reader import (
     _name_exists,
     _read_canonical_object_v1,
     _read_safe_bytes,
+    _reject_duplicate_pairs,
+    _reject_float,
     _utc_now,
     _validated_success_manifest_sha256,
     _write_new_verified,
@@ -58,6 +61,10 @@ _MAX_ASSET_BYTES = 67_108_864
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MATERIALIZATION_RUN_ID = re.compile(
     r"^matrun_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+_READER_RUN_ID = re.compile(
+    r"^semrun_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
     r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
 _KIND_ORDER = {
@@ -91,6 +98,25 @@ _PROFILE_DOCUMENT = {
 _PROFILE_SHA256 = hashlib.sha256(
     _canonical_payload_bytes(_PROFILE_DOCUMENT)
 ).hexdigest()
+_MATERIALIZATION_MANIFEST_KEYS = {
+    "assets",
+    "candidate_count",
+    "candidate_draft_count",
+    "canonical_content_sha256",
+    "descriptor_count",
+    "finished_at",
+    "git_revision",
+    "input_sha256",
+    "materializer_profile_sha256",
+    "reader_manifest_sha256",
+    "reader_run_id",
+    "run_id",
+    "schema_version",
+    "source_id",
+    "source_sha256",
+    "status",
+    "work_id",
+}
 
 
 def _content_sha256(payload: bytes) -> str:
@@ -146,6 +172,12 @@ class _MaterializedBytesV1:
     pending_candidate_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _IdentityBindingsV1:
+    candidates: dict[str, tuple[str, bytes]]
+    descriptors: dict[str, tuple[str, bytes]]
+
+
 def _raise_authority(error: ReaderAuthorityStoppedV1) -> None:
     reason = error.reason
     if reason not in {
@@ -175,17 +207,35 @@ def _reader_bundle(
     canonical: CurrentCanonicalAssetV1,
     reader: ReaderAdvanceV1,
 ) -> _ReaderBundleV1:
+    return _reader_bundle_for_run(
+        authority,
+        canonical,
+        reader,
+        require_current=True,
+    )
+
+
+def _reader_bundle_for_run(
+    authority: ActiveSourceAuthorityV1,
+    canonical: CurrentCanonicalAssetV1,
+    reader: ReaderAdvanceV1,
+    *,
+    require_current: bool,
+) -> _ReaderBundleV1:
     semantic_dir = authority.source_directory / "semantic"
     try:
-        current, _current_bytes = _read_canonical_object_v1(
-            semantic_dir / "current.json"
-        )
-        if current != {
-            "manifest_sha256": reader.manifest_sha256,
-            "run_id": reader.run_id,
-            "schema_version": "gezhi.literature_semantic_current.v1",
-        }:
-            raise ValueError("Reader current does not match the supplied authority")
+        if require_current:
+            current, _current_bytes = _read_canonical_object_v1(
+                semantic_dir / "current.json"
+            )
+            if current != {
+                "manifest_sha256": reader.manifest_sha256,
+                "run_id": reader.run_id,
+                "schema_version": "gezhi.literature_semantic_current.v1",
+            }:
+                raise ValueError(
+                    "Reader current does not match the supplied authority"
+                )
         observed_manifest_sha256 = _validated_success_manifest_sha256(
             semantic_dir / "runs" / reader.run_id,
             reader.run_id,
@@ -501,29 +551,34 @@ def _materialized_documents(
     )
 
 
-def _asset_entries(materialized: _MaterializedBytesV1) -> list[dict[str, object]]:
+def _asset_entries_for_bytes(
+    input_bytes: bytes,
+    descriptor_bytes: bytes,
+    candidate_bytes: bytes,
+    queue_bytes: bytes,
+) -> list[dict[str, object]]:
     assets = (
         (
             "input.json",
-            materialized.input_bytes,
+            input_bytes,
             "application/json",
             "gezhi.candidate_materialization_input.v1",
         ),
         (
             "result/candidate_knowledge.jsonl",
-            materialized.candidate_bytes,
+            candidate_bytes,
             "application/x-ndjson",
             "gezhi.candidate_knowledge.v1",
         ),
         (
             "result/descriptor_payloads.jsonl",
-            materialized.descriptor_bytes,
+            descriptor_bytes,
             "application/x-ndjson",
             "gezhi.descriptor_payload_record.v1",
         ),
         (
             "result/review_queue.json",
-            materialized.queue_bytes,
+            queue_bytes,
             "application/json",
             "gezhi.review_queue.v2",
         ),
@@ -538,6 +593,15 @@ def _asset_entries(materialized: _MaterializedBytesV1) -> list[dict[str, object]
         }
         for path, payload, media_type, schema_version in assets
     ]
+
+
+def _asset_entries(materialized: _MaterializedBytesV1) -> list[dict[str, object]]:
+    return _asset_entries_for_bytes(
+        materialized.input_bytes,
+        materialized.descriptor_bytes,
+        materialized.candidate_bytes,
+        materialized.queue_bytes,
+    )
 
 
 def _manifest_bytes(
@@ -589,27 +653,8 @@ def _validate_success(
     manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
     if expected_manifest_sha256 is not None and manifest_sha256 != expected_manifest_sha256:
         raise ValueError("Materialization manifest hash differs")
-    expected_keys = {
-        "assets",
-        "candidate_count",
-        "candidate_draft_count",
-        "canonical_content_sha256",
-        "descriptor_count",
-        "finished_at",
-        "git_revision",
-        "input_sha256",
-        "materializer_profile_sha256",
-        "reader_manifest_sha256",
-        "reader_run_id",
-        "run_id",
-        "schema_version",
-        "source_id",
-        "source_sha256",
-        "status",
-        "work_id",
-    }
     if (
-        set(manifest) != expected_keys
+        set(manifest) != _MATERIALIZATION_MANIFEST_KEYS
         or manifest.get("run_id") != run_id
         or manifest.get("schema_version")
         != "gezhi.candidate_materialization_run_manifest.v1"
@@ -654,6 +699,349 @@ def _validate_success(
     return manifest_sha256
 
 
+def _identity_bindings_from_jsonl(
+    payload: bytes,
+    *,
+    record_kind: Literal["candidate", "descriptor"],
+) -> dict[str, tuple[str, bytes]]:
+    if not payload:
+        return {}
+    if not payload.endswith(b"\n"):
+        raise ValueError("Identity JSONL has no terminal LF")
+    bindings: dict[str, tuple[str, bytes]] = {}
+    order: list[tuple[int | str, str]] = []
+    for raw_record in payload.splitlines():
+        if not raw_record:
+            raise ValueError("Identity JSONL contains an empty record")
+        record = json.loads(
+            raw_record,
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_float=_reject_float,
+            parse_constant=_reject_float,
+        )
+        if type(record) is not dict or raw_record != _canonical_payload_bytes(record):
+            raise ValueError("Identity record is not canonical")
+        if record_kind == "candidate":
+            id_key = "candidate_id"
+            id_prefix = "cand_"
+            record_schema = "gezhi.candidate_knowledge.v1"
+            payload_schema = "gezhi.candidate_payload.v1"
+        else:
+            id_key = "descriptor_id"
+            id_prefix = "desc_"
+            record_schema = "gezhi.descriptor_payload_record.v1"
+            payload_schema = "gezhi.descriptor_payload.v1"
+        if set(record) != {
+            id_key,
+            "payload",
+            "payload_sha256",
+            "schema_version",
+        }:
+            raise ValueError("Identity record shape is invalid")
+        identity = record[id_key]
+        payload_sha256 = record["payload_sha256"]
+        identity_payload = record["payload"]
+        if (
+            type(identity) is not str
+            or type(payload_sha256) is not str
+            or _SHA256.fullmatch(payload_sha256) is None
+            or type(identity_payload) is not dict
+            or identity_payload.get("schema_version") != payload_schema
+            or record["schema_version"] != record_schema
+        ):
+            raise ValueError("Identity record fields are invalid")
+        identity_payload_bytes = _canonical_payload_bytes(identity_payload)
+        observed_sha256 = _content_sha256(identity_payload_bytes)
+        if (
+            payload_sha256 != observed_sha256
+            or identity != id_prefix + observed_sha256[:24]
+            or identity in bindings
+        ):
+            raise ValueError("Identity record binding is invalid")
+        if record_kind == "descriptor":
+            descriptor_kind = identity_payload.get("kind")
+            if type(descriptor_kind) is not str or descriptor_kind not in _KIND_ORDER:
+                raise ValueError("Descriptor identity kind is invalid")
+            order.append((_KIND_ORDER[descriptor_kind], payload_sha256))
+        else:
+            order.append((identity, payload_sha256))
+        bindings[identity] = (payload_sha256, identity_payload_bytes)
+    if order != sorted(order):
+        raise ValueError("Identity records are not in canonical order")
+    if record_kind == "candidate" and len(bindings) > 12:
+        raise ValueError("Candidate identity collection is too large")
+    return bindings
+
+
+def _historical_identity_bindings(
+    run_dir: Path,
+    run_id: str,
+    authority: ActiveSourceAuthorityV1,
+) -> _IdentityBindingsV1:
+    if frozenset(_entry_names(run_dir)) != {"input.json", "manifest.json", "result"}:
+        raise ValueError("Historical materialization namespace is invalid")
+    result_dir = run_dir / "result"
+    if frozenset(_entry_names(result_dir)) != {
+        "candidate_knowledge.jsonl",
+        "descriptor_payloads.jsonl",
+        "review_queue.json",
+    }:
+        raise ValueError("Historical materialization result namespace is invalid")
+    manifest, _manifest_bytes_value = _read_canonical_object_v1(
+        run_dir / "manifest.json"
+    )
+    _input, input_bytes = _read_canonical_object_v1(run_dir / "input.json")
+    _queue, queue_bytes = _read_canonical_object_v1(
+        result_dir / "review_queue.json"
+    )
+    descriptor_bytes = _read_safe_bytes(
+        result_dir / "descriptor_payloads.jsonl",
+        limit=_MAX_ASSET_BYTES,
+    )
+    candidate_bytes = _read_safe_bytes(
+        result_dir / "candidate_knowledge.jsonl",
+        limit=_MAX_ASSET_BYTES,
+    )
+    descriptors = _identity_bindings_from_jsonl(
+        descriptor_bytes,
+        record_kind="descriptor",
+    )
+    candidates = _identity_bindings_from_jsonl(
+        candidate_bytes,
+        record_kind="candidate",
+    )
+    candidate_draft_count = manifest.get("candidate_draft_count")
+    reader_run_id = manifest.get("reader_run_id")
+    reader_manifest_sha256 = manifest.get("reader_manifest_sha256")
+    canonical_content_sha256 = manifest.get("canonical_content_sha256")
+    git_revision = manifest.get("git_revision")
+    if (
+        set(manifest) != _MATERIALIZATION_MANIFEST_KEYS
+        or manifest.get("run_id") != run_id
+        or manifest.get("schema_version")
+        != "gezhi.candidate_materialization_run_manifest.v1"
+        or manifest.get("status") != "succeeded"
+        or manifest.get("source_id") != authority.source_id
+        or manifest.get("source_sha256") != authority.source_sha256
+        or manifest.get("work_id") != authority.work_id
+        or manifest.get("materializer_profile_sha256") != _PROFILE_SHA256
+        or manifest.get("candidate_count") != len(candidates)
+        or manifest.get("descriptor_count") != len(descriptors)
+        or type(candidate_draft_count) is not int
+        or not 0 <= candidate_draft_count <= 12
+        or type(reader_run_id) is not str
+        or _READER_RUN_ID.fullmatch(reader_run_id) is None
+        or type(reader_manifest_sha256) is not str
+        or _SHA256.fullmatch(reader_manifest_sha256) is None
+        or type(canonical_content_sha256) is not str
+        or _SHA256.fullmatch(canonical_content_sha256) is None
+        or type(manifest.get("finished_at")) is not str
+        or not manifest["finished_at"]
+        or type(git_revision) is not str
+        or re.fullmatch(r"[0-9a-f]{40}", git_revision) is None
+        or manifest.get("input_sha256")
+        != hashlib.sha256(input_bytes).hexdigest()
+        or manifest.get("assets")
+        != _asset_entries_for_bytes(
+            input_bytes,
+            descriptor_bytes,
+            candidate_bytes,
+            queue_bytes,
+        )
+    ):
+        raise ValueError("Historical materialization manifest is invalid")
+    return _IdentityBindingsV1(
+        candidates=candidates,
+        descriptors=descriptors,
+    )
+
+
+def _merge_historical_bindings(
+    target: dict[str, tuple[str, bytes]],
+    observed: dict[str, tuple[str, bytes]],
+) -> None:
+    for identity, binding in observed.items():
+        previous = target.get(identity)
+        if previous is not None and previous != binding:
+            raise ValueError("Historical identity collision")
+        target[identity] = binding
+
+
+def _ensure_no_historical_identity_conflicts(
+    runs_dir: Path,
+    authority: ActiveSourceAuthorityV1,
+    materialized: _MaterializedBytesV1,
+) -> None:
+    historical_candidates: dict[str, tuple[str, bytes]] = {}
+    historical_descriptors: dict[str, tuple[str, bytes]] = {}
+    try:
+        for run_id in _entry_names(runs_dir):
+            if _MATERIALIZATION_RUN_ID.fullmatch(run_id) is None:
+                raise ValueError("Materialization run namespace is invalid")
+            bindings = _historical_identity_bindings(
+                runs_dir / run_id,
+                run_id,
+                authority,
+            )
+            _merge_historical_bindings(
+                historical_candidates,
+                bindings.candidates,
+            )
+            _merge_historical_bindings(
+                historical_descriptors,
+                bindings.descriptors,
+            )
+        current_candidates = _identity_bindings_from_jsonl(
+            materialized.candidate_bytes,
+            record_kind="candidate",
+        )
+        current_descriptors = _identity_bindings_from_jsonl(
+            materialized.descriptor_bytes,
+            record_kind="descriptor",
+        )
+    except (
+        KeyError,
+        OSError,
+        ReaderStageStoppedV1,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise CandidateMaterializationRecoveryUncertainV1(
+            "Historical materialization identities cannot be proven"
+        ) from error
+    for historical, current in (
+        (historical_candidates, current_candidates),
+        (historical_descriptors, current_descriptors),
+    ):
+        if any(
+            identity in historical and historical[identity] != binding
+            for identity, binding in current.items()
+        ):
+            raise CandidateMaterializationStageStoppedV1(
+                "failed", "candidate_validation_failed"
+            )
+
+
+def _pointer_identity(pointer: dict[str, object]) -> tuple[str, str]:
+    if set(pointer) != {"manifest_sha256", "run_id", "schema_version"}:
+        raise ValueError("Materialization current pointer shape is invalid")
+    run_id = pointer["run_id"]
+    manifest_sha256 = pointer["manifest_sha256"]
+    if (
+        type(run_id) is not str
+        or _MATERIALIZATION_RUN_ID.fullmatch(run_id) is None
+        or type(manifest_sha256) is not str
+        or _SHA256.fullmatch(manifest_sha256) is None
+        or pointer["schema_version"]
+        != "gezhi.candidate_materialization_current.v1"
+    ):
+        raise ValueError("Materialization current pointer identity is invalid")
+    return run_id, manifest_sha256
+
+
+def _reader_from_materialization_manifest(
+    run_dir: Path,
+    run_id: str,
+    expected_manifest_sha256: str,
+) -> ReaderAdvanceV1:
+    manifest, manifest_bytes = _read_canonical_object_v1(run_dir / "manifest.json")
+    reader_run_id = manifest.get("reader_run_id")
+    reader_manifest_sha256 = manifest.get("reader_manifest_sha256")
+    if (
+        hashlib.sha256(manifest_bytes).hexdigest() != expected_manifest_sha256
+        or manifest.get("run_id") != run_id
+        or type(reader_run_id) is not str
+        or _READER_RUN_ID.fullmatch(reader_run_id) is None
+        or type(reader_manifest_sha256) is not str
+        or _SHA256.fullmatch(reader_manifest_sha256) is None
+    ):
+        raise ValueError("Pointed materialization manifest identity is invalid")
+    return ReaderAdvanceV1(
+        advanced=False,
+        run_id=reader_run_id,
+        manifest_sha256=reader_manifest_sha256,
+        pending_candidate_ids=(),
+    )
+
+
+def _validate_pointed_success(
+    runs_dir: Path,
+    run_id: str,
+    manifest_sha256: str,
+    authority: ActiveSourceAuthorityV1,
+    canonical: CurrentCanonicalAssetV1,
+    reader: ReaderAdvanceV1,
+    bundle: _ReaderBundleV1,
+) -> tuple[_MaterializedBytesV1, str, bool]:
+    pointed_reader = _reader_from_materialization_manifest(
+        runs_dir / run_id,
+        run_id,
+        manifest_sha256,
+    )
+    matches_current_reader = (
+        pointed_reader.run_id == reader.run_id
+        and pointed_reader.manifest_sha256 == reader.manifest_sha256
+    )
+    pointed_bundle = (
+        bundle
+        if matches_current_reader
+        else _reader_bundle_for_run(
+            authority,
+            canonical,
+            pointed_reader,
+            require_current=False,
+        )
+    )
+    materialized = _materialized_documents(
+        authority,
+        canonical,
+        pointed_reader,
+        pointed_bundle,
+        run_id,
+    )
+    observed = _validate_success(
+        runs_dir / run_id,
+        run_id,
+        authority,
+        canonical,
+        pointed_reader,
+        materialized,
+        expected_manifest_sha256=manifest_sha256,
+    )
+    return materialized, observed, matches_current_reader
+
+
+def _commit_next_pointer(
+    materializations: Path,
+    authority: ActiveSourceAuthorityV1,
+    root: ValidatedDataRootV1,
+    pointer: bytes,
+) -> None:
+    next_path = materializations / ".current.next.json"
+    _materialization_checkpoint(authority, root)
+    try:
+        with open_validated_data_root_v1(str(materializations)):
+            os.replace(next_path, materializations / "current.json")
+        if (
+            _read_safe_bytes(
+                materializations / "current.json",
+                limit=len(pointer),
+            )
+            != pointer
+        ):
+            raise ValueError("Materialization current readback differs")
+    except (
+        DataRootLifecycleErrorV1,
+        DataRootOpenErrorV1,
+        OSError,
+        ReaderStageStoppedV1,
+        ValueError,
+    ) as error:
+        raise CandidateMaterializationRecoveryUncertainV1(
+            "Materialization current replacement is uncertain"
+        ) from error
+
+
 def _replace_current(
     materializations: Path,
     authority: ActiveSourceAuthorityV1,
@@ -668,26 +1056,62 @@ def _replace_current(
             "schema_version": "gezhi.candidate_materialization_current.v1",
         }
     )
-    next_path = materializations / ".current.next.json"
     try:
-        _write_new_verified(next_path, pointer)
+        _write_new_verified(materializations / ".current.next.json", pointer)
     except ReaderStageStoppedV1 as error:
         raise CandidateMaterializationStageStoppedV1(
             "failed", "commit_failed"
         ) from error
-    _materialization_checkpoint(authority, root)
+    _commit_next_pointer(materializations, authority, root, pointer)
+
+
+def _recover_next_pointer(
+    materializations: Path,
+    runs_dir: Path,
+    authority: ActiveSourceAuthorityV1,
+    canonical: CurrentCanonicalAssetV1,
+    reader: ReaderAdvanceV1,
+    bundle: _ReaderBundleV1,
+    root: ValidatedDataRootV1,
+) -> CandidateMaterializationAdvanceV1 | None:
+    if not _name_exists(materializations, ".current.next.json"):
+        return None
     try:
-        with open_validated_data_root_v1(str(materializations)):
-            os.replace(next_path, materializations / "current.json")
+        next_pointer, next_bytes = _read_canonical_object_v1(
+            materializations / ".current.next.json"
+        )
+        next_run_id, next_manifest_sha256 = _pointer_identity(next_pointer)
+        materialized, observed, _matches_current_reader = _validate_pointed_success(
+            runs_dir,
+            next_run_id,
+            next_manifest_sha256,
+            authority,
+            canonical,
+            reader,
+            bundle,
+        )
+        _commit_next_pointer(materializations, authority, root, next_bytes)
+    except CandidateMaterializationAuthorityStoppedV1:
+        raise
     except (
+        CandidateMaterializationStageStoppedV1,
         DataRootLifecycleErrorV1,
         DataRootOpenErrorV1,
+        KeyError,
         OSError,
+        ReaderStageStoppedV1,
+        TypeError,
         ValueError,
     ) as error:
         raise CandidateMaterializationRecoveryUncertainV1(
-            "Materialization current replacement is uncertain"
+            "Materialization next pointer cannot be recovered"
         ) from error
+    return CandidateMaterializationAdvanceV1(
+        advanced=True,
+        run_id=next_run_id,
+        manifest_sha256=observed,
+        pending_candidate_ids=materialized.pending_candidate_ids,
+    )
 
 
 def _load_or_recover_current(
@@ -699,116 +1123,43 @@ def _load_or_recover_current(
     bundle: _ReaderBundleV1,
     root: ValidatedDataRootV1,
 ) -> CandidateMaterializationAdvanceV1 | None:
-    if _name_exists(materializations, ".current.next.json"):
+    if _name_exists(materializations, "current.json"):
         try:
-            next_pointer, next_bytes = _read_canonical_object_v1(
-                materializations / ".current.next.json"
+            current, _current_bytes = _read_canonical_object_v1(
+                materializations / "current.json"
             )
-            if set(next_pointer) != {
-                "manifest_sha256",
-                "run_id",
-                "schema_version",
-            }:
-                raise ValueError("Materialization next pointer shape is invalid")
-            next_run_id = next_pointer["run_id"]
-            next_manifest_sha256 = next_pointer["manifest_sha256"]
-            if (
-                type(next_run_id) is not str
-                or _MATERIALIZATION_RUN_ID.fullmatch(next_run_id) is None
-                or type(next_manifest_sha256) is not str
-                or _SHA256.fullmatch(next_manifest_sha256) is None
-                or next_pointer["schema_version"]
-                != "gezhi.candidate_materialization_current.v1"
-            ):
-                raise ValueError("Materialization next pointer identity is invalid")
-            next_materialized = _materialized_documents(
-                authority, canonical, reader, bundle, next_run_id
-            )
-            observed = _validate_success(
-                runs_dir / next_run_id,
-                next_run_id,
-                authority,
-                canonical,
-                reader,
-                next_materialized,
-                expected_manifest_sha256=next_manifest_sha256,
-            )
-            if _name_exists(materializations, "current.json"):
-                current_bytes = _read_safe_bytes(
-                    materializations / "current.json",
-                    limit=_MAX_ASSET_BYTES,
+            run_id, manifest_sha256 = _pointer_identity(current)
+            materialized, observed, matches_current_reader = (
+                _validate_pointed_success(
+                    runs_dir,
+                    run_id,
+                    manifest_sha256,
+                    authority,
+                    canonical,
+                    reader,
+                    bundle,
                 )
-                if current_bytes != next_bytes:
-                    raise ValueError(
-                        "Materialization current and next pointer conflict"
-                    )
-            _materialization_checkpoint(authority, root)
-            with open_validated_data_root_v1(str(materializations)):
-                os.replace(
-                    materializations / ".current.next.json",
-                    materializations / "current.json",
+            )
+            if matches_current_reader:
+                return CandidateMaterializationAdvanceV1(
+                    advanced=False,
+                    run_id=run_id,
+                    manifest_sha256=observed,
+                    pending_candidate_ids=materialized.pending_candidate_ids,
                 )
-        except CandidateMaterializationStageStoppedV1:
-            raise
         except CandidateMaterializationAuthorityStoppedV1:
             raise
+        except CandidateMaterializationStageStoppedV1 as error:
+            raise CandidateMaterializationStageStoppedV1(
+                "failed", "asset_integrity_lost"
+            ) from error
         except (
-            DataRootLifecycleErrorV1,
-            DataRootOpenErrorV1,
             KeyError,
             OSError,
             ReaderStageStoppedV1,
             TypeError,
             ValueError,
         ) as error:
-            raise CandidateMaterializationRecoveryUncertainV1(
-                "Materialization next pointer cannot be recovered"
-            ) from error
-        return CandidateMaterializationAdvanceV1(
-            advanced=True,
-            run_id=next_run_id,
-            manifest_sha256=observed,
-            pending_candidate_ids=next_materialized.pending_candidate_ids,
-        )
-    if _name_exists(materializations, "current.json"):
-        try:
-            current, _current_bytes = _read_canonical_object_v1(
-                materializations / "current.json"
-            )
-            if set(current) != {"manifest_sha256", "run_id", "schema_version"}:
-                raise ValueError("Materialization current shape is invalid")
-            run_id = current["run_id"]
-            manifest_sha256 = current["manifest_sha256"]
-            if (
-                type(run_id) is not str
-                or _MATERIALIZATION_RUN_ID.fullmatch(run_id) is None
-                or type(manifest_sha256) is not str
-                or _SHA256.fullmatch(manifest_sha256) is None
-                or current["schema_version"]
-                != "gezhi.candidate_materialization_current.v1"
-            ):
-                raise ValueError("Materialization current identity is invalid")
-            materialized = _materialized_documents(
-                authority, canonical, reader, bundle, run_id
-            )
-            observed = _validate_success(
-                runs_dir / run_id,
-                run_id,
-                authority,
-                canonical,
-                reader,
-                materialized,
-                expected_manifest_sha256=manifest_sha256,
-            )
-            return CandidateMaterializationAdvanceV1(
-                advanced=False,
-                run_id=run_id,
-                manifest_sha256=observed,
-                pending_candidate_ids=materialized.pending_candidate_ids,
-            )
-        except CandidateMaterializationStageStoppedV1:
-            raise
-        except (KeyError, ReaderStageStoppedV1, TypeError, ValueError) as error:
             raise CandidateMaterializationStageStoppedV1(
                 "failed", "asset_integrity_lost"
             ) from error
@@ -954,6 +1305,18 @@ def advance_candidate_materialization_v1(
             "Materialization namespace cannot be proven"
         ) from error
 
+    next_recovered = _recover_next_pointer(
+        materializations,
+        runs_dir,
+        authority,
+        canonical,
+        reader,
+        bundle,
+        root,
+    )
+    if next_recovered is not None:
+        return next_recovered
+
     _recover_staging(
         staging_dir,
         runs_dir,
@@ -979,6 +1342,11 @@ def advance_candidate_materialization_v1(
     run_id = "matrun_" + str(uuid.uuid4())
     materialized = _materialized_documents(
         authority, canonical, reader, bundle, run_id
+    )
+    _ensure_no_historical_identity_conflicts(
+        runs_dir,
+        authority,
+        materialized,
     )
     stage = staging_dir / run_id
     try:

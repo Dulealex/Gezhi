@@ -1014,6 +1014,14 @@ def test_public_resume_retries_once_and_publishes_an_evidence_bound_draft(
     (materializations / "current.json").replace(
         materializations / ".current.next.json"
     )
+    recovery_order_stage = (
+        materializations
+        / ".staging"
+        / "matrun_44444444-4444-4444-8444-444444444444"
+    )
+    recovery_order_stage.mkdir()
+    (recovery_order_stage / "input.json").write_bytes(b"{}\n")
+    (materializations / "current.json").write_bytes(b"{}\n")
     next_pointer_recovered = run_launcher(
         launcher_commands(
             (
@@ -1038,6 +1046,8 @@ def test_public_resume_retries_once_and_publishes_an_evidence_bound_draft(
         materialization_current_bytes
     )
     assert not (materializations / ".current.next.json").exists()
+    assert recovery_order_stage.is_dir()
+    shutil.rmtree(recovery_order_stage)
 
     (materializations / "current.json").unlink()
     staged_materialization = (
