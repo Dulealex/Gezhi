@@ -606,6 +606,76 @@ def test_reused_current_rejects_a_cross_successor_identity_collision(
         )
 
 
+def test_staging_recovery_rejects_a_cross_successor_identity_collision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "source"
+    authority = _authority(source_dir)
+    materializations = source_dir / "semantic" / "materializations"
+    staging_dir = materializations / ".staging"
+    runs_dir = materializations / "runs"
+    staging_dir.mkdir(parents=True)
+    runs_dir.mkdir()
+    reader = _reader()
+    reading = _reading_result(with_descriptors=False)
+    historical_bundle = _bundle(
+        reading,
+        [
+            CandidateDraftV1(
+                candidate_type="claim",
+                descriptor_refs=[],
+                statement=_statement("第一条不同的结论。"),
+            )
+        ],
+    )
+    staged_bundle = _bundle(
+        reading,
+        [
+            CandidateDraftV1(
+                candidate_type="claim",
+                descriptor_refs=[],
+                statement=_statement("第二条不同的结论。"),
+            )
+        ],
+    )
+    staged_run_id = "matrun_223e4567-e89b-42d3-a456-426614174000"
+    _allow_plain_test_filesystem(monkeypatch)
+    monkeypatch.setattr(candidate, "_content_sha256", _same_short_id)
+    _write_committed_materialization(
+        runs_dir,
+        authority,
+        reader,
+        historical_bundle,
+        _MATERIALIZATION_RUN_ID,
+    )
+    _write_committed_materialization(
+        staging_dir,
+        authority,
+        reader,
+        staged_bundle,
+        staged_run_id,
+    )
+
+    with pytest.raises(
+        candidate.CandidateMaterializationStageStoppedV1
+    ) as stopped:
+        candidate._recover_staging(
+            staging_dir,
+            runs_dir,
+            authority,
+            _canonical(),
+            reader,
+            staged_bundle,
+            cast(ValidatedDataRootV1, object()),
+        )
+
+    assert stopped.value.outcome == "failed"
+    assert stopped.value.reason == "candidate_validation_failed"
+    assert (staging_dir / staged_run_id).is_dir()
+    assert not (runs_dir / staged_run_id).exists()
+
+
 @pytest.mark.parametrize("identity", [_same_full_hash, _same_short_id])
 def test_cross_successor_candidate_collision_fails_before_publication(
     tmp_path: Path,

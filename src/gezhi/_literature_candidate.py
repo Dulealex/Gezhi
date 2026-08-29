@@ -1325,16 +1325,23 @@ def _recover_staging(
             materialized,
             expected_manifest_sha256=None,
         )
+        _ensure_no_historical_identity_conflicts(
+            runs_dir,
+            authority,
+            materialized,
+        )
         _materialization_checkpoint(authority, root)
         with (
             open_validated_data_root_v1(str(staging_dir)),
             open_validated_data_root_v1(str(runs_dir)),
         ):
             os.rename(staging_dir / run_id, runs_dir / run_id)
-    except CandidateMaterializationAuthorityStoppedV1:
+    except (
+        CandidateMaterializationAuthorityStoppedV1,
+        CandidateMaterializationStageStoppedV1,
+    ):
         raise
     except (
-        CandidateMaterializationStageStoppedV1,
         DataRootLifecycleErrorV1,
         DataRootOpenErrorV1,
         OSError,
