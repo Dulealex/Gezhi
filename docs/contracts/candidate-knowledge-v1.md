@@ -8,7 +8,7 @@
 
 短证据摘录、页码、bbox、文件路径、审核收据和 Descriptor 正文快照是交接或展示信息，不进入 Candidate 内容身份；它们必须能由正式引用验证，不能反向改变 `candidate_id`。
 
-相关决策：[ADR 0015](../adr/0015-normalize-reading-input-into-a-canonical-asset-bundle.md)、[ADR 0018](../adr/0018-content-address-candidate-knowledge.md)、[ADR 0039](../adr/0039-resolve-temporary-descriptor-locators-to-content-addressed-references.md)。
+相关决策：[ADR 0015](../adr/0015-normalize-reading-input-into-a-canonical-asset-bundle.md)、[ADR 0018](../adr/0018-content-address-candidate-knowledge.md)、[ADR 0039](../adr/0039-resolve-temporary-descriptor-locators-to-content-addressed-references.md)、[ADR 0135](../adr/0135-publish-candidate-materialization-as-an-immutable-successor.md)。
 
 ## CanonicalJsonV1
 
@@ -155,3 +155,90 @@ Reference 不复制 Descriptor 正文或数组位置。相同完整 payload 确�
 7. 按 `(candidate_id, payload_sha256)` 写入 `candidate_knowledge.jsonl`。
 
 顶层 `candidate_drafts` 数组是“列表内部禁止完全重复”的唯一例外；Candidate 内部的 `source_terms`、证据、风险标记和 Descriptor Locator 仍禁止重复。相似但 payload 不同的 Candidate 不得自动合并；任何碰撞、预算超限或无效引用都使整个 semantic run 失败且不部分发布。
+
+## Descriptor Payload 记录
+
+正式 materialization 只保存被至少一个正式 Candidate 引用的唯一 Descriptor Payload。每条 `descriptor_payloads.jsonl` 记录为以下 closed object：
+
+```json
+{
+  "descriptor_id": "desc_<24 位小写十六进制>",
+  "payload": {
+    "kind": "method|object|dataset|experiment|metric",
+    "schema_version": "gezhi.descriptor_payload.v1",
+    "value": {}
+  },
+  "payload_sha256": "<64 位小写十六进制>",
+  "schema_version": "gezhi.descriptor_payload_record.v1"
+}
+```
+
+`payload_sha256` 与 `descriptor_id` 必须由同一条 `payload` 的 CanonicalJsonV1 bytes 重算成立；记录按 Descriptor kind 固定顺序、再按 `payload_sha256` 排序。相同完整 hash 与 bytes 归并；短 ID 对应不同完整 hash，或完整 hash 对应不同 bytes，使整个 materialization 失败。每个 Candidate 的 Descriptor Reference 必须解析到本文件中逐字段匹配的唯一记录，未被任何 Candidate 引用的 Reading Result Descriptor 不复制进来。
+
+## Candidate materialization successor
+
+T15 的正式结果位于 Reader namespace 的独立 successor：
+
+```text
+semantic/materializations/
+├── current.json
+├── .current.next.json
+├── .staging/<matrun_uuidv4>/
+└── runs/<matrun_uuidv4>/
+    ├── input.json
+    ├── manifest.json
+    └── result/
+        ├── descriptor_payloads.jsonl
+        ├── candidate_knowledge.jsonl
+        └── review_queue.json
+```
+
+`input.json` 是 closed `gezhi.candidate_materialization_input.v1`，恰含 `candidate_drafts_sha256、canonical_content_sha256、materializer_profile_sha256、reader_manifest_sha256、reader_run_id、reading_result_sha256、schema_version、source_id、source_sha256、work_id`。两个 result SHA-256 对 T14 Reader 文件包含末尾 LF 的实际 bytes 计算。`materializer_profile_sha256` 对以下 CanonicalJsonV1 payload 计算：
+
+```json
+{
+  "candidate_budgets": {
+    "claim": 4,
+    "limitation": 3,
+    "method": 2,
+    "open_question": 2,
+    "relevance": 0
+  },
+  "candidate_contract": "gezhi.candidate_knowledge.v1",
+  "descriptor_record": "gezhi.descriptor_payload_record.v1",
+  "materializer": "candidate_materializer_v1",
+  "queue_contract": "gezhi.review_queue.v2",
+  "schema_version": "gezhi.candidate_materializer_profile.v1"
+}
+```
+
+`manifest.json` 是 closed `gezhi.candidate_materialization_run_manifest.v1`，恰含 `assets、candidate_count、candidate_draft_count、canonical_content_sha256、descriptor_count、finished_at、git_revision、input_sha256、materializer_profile_sha256、reader_manifest_sha256、reader_run_id、run_id、schema_version、source_id、source_sha256、status、work_id`，且 `status` 只能是 `succeeded`。`assets` 按 UTF-8 path bytes 排序，列出 `input.json` 与三个 result 文件各自的 `path、byte_length、sha256、media_type、schema_version`；manifest 不列出自身。`current.json` 恰含 `manifest_sha256、run_id、schema_version=gezhi.candidate_materialization_current.v1`。
+
+successor 不复制 Reading Result 或 Candidate Draft，也不原地修改 T14 Reader run。创建 staging 前必须完成整集合校验；只有三个 result、input 和 manifest 全部写入、关闭并 readback 后才可把目录原子改名到 `runs/`，随后通过同目录下唯一 `.current.next.json` 原子替换 current。确定失败不得发布部分 Candidate；提交结果不确定、partial/foreign/reparse staging、多个恢复候选或冲突 target 必须保留现场并停止恢复。
+
+## Review Queue v2
+
+正式 `review_queue.json` 是以下 closed projection：
+
+```json
+{
+  "candidates": [
+    {
+      "candidate_id": "cand_<24 位小写十六进制>",
+      "payload_sha256": "<64 位小写十六进制>",
+      "review_status": "pending",
+      "schema_version": "gezhi.review_queue_candidate.v1"
+    }
+  ],
+  "canonical_content_sha256": "<64 位小写十六进制>",
+  "materialization_run_id": "matrun_<lowercase UUIDv4>",
+  "reader_manifest_sha256": "<64 位小写十六进制>",
+  "reader_run_id": "semrun_<lowercase UUIDv4>",
+  "schema_version": "gezhi.review_queue.v2",
+  "source_id": "src_<24 位小写十六进制>",
+  "source_sha256": "<64 位小写十六进制>",
+  "work_id": "wrk_<lowercase UUIDv4>"
+}
+```
+
+Queue item 与 `candidate_knowledge.jsonl` 一一对应并使用同一顺序；`candidate_id` 与完整 payload hash 必须逐项匹配，数量为 `0..12`。Queue 只表示该 successor 尚无 Review Decision 的初始 pending 投影，不是可变审核状态或 Review authority。零 Candidate 仍发布完整 success successor：两个 JSONL 精确零字节，`candidates=[]`；此时 Resume 的 review、handoff 与 knowledge_import 是空集合义务并直接完成，但不得创建 Decision、Handoff、Registry receipt 或 Promoted Knowledge。

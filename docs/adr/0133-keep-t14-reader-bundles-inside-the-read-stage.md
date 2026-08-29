@@ -2,6 +2,8 @@
 
 状态：已接受
 
+> 实施说明：[ADR 0135](./0135-publish-candidate-materialization-as-an-immutable-successor.md) 已为 T15 冻结正式 materializer；本文关于“当前构建尚未提供 T15”时复用临时 `reader_prerequisite_unavailable` 的分支只描述 T14 交付边界，不再是 T15 后的可达正常路径。
+
 ADR 0130冻结的T14 Reader bundle只完成`read`阶段中的模型阅读、Draft验证和不可变审计发布；T15的确定性Candidate materializer及successor publication仍是同一个七阶段`read` obligation的一部分。精确零字节`candidate_knowledge.jsonl`和空`review_queue.json`只表示“尚未物化”，不能让Resume把`read`、`review`或整个pipeline判为成功。
 
 在当前构建尚未提供T15 materializer时，公开`literature resume`必须复用既有`stage_blocked(read, reader_prerequisite_unavailable)`，不新增临时reason。若同次invocation刚发布T14 bundle，它仍不把`read`列入`advanced_stages`；`stop_stage=read`、`pipeline_complete=false`、`pending_candidate_ids=[]`，`start_stage`保持invocation初始Continuation Point。再次resume必须验证并复用已提交bundle而不再调用Codex，然后返回同一blocked边界。

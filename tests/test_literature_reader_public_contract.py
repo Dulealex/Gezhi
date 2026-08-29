@@ -75,6 +75,16 @@ def _canonical_bytes(value: object) -> bytes:
     )
 
 
+def _canonical_payload_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 def _canonicalize_only_sitecustomize(site_root: Path) -> None:
     source = """
 import gezhi._literature_reader as reader
@@ -648,6 +658,43 @@ def test_public_resume_retries_once_and_publishes_an_evidence_bound_draft(
     assert deadline_values[0] == "None"
     assert len(deadline_values) == 2
     assert deadline_values[1].isdigit()
+    candidate_payload = {
+        "candidate_type": "claim",
+        "canonical_content_sha256": canonical_current[
+            "canonical_content_sha256"
+        ],
+        "descriptor_refs": [],
+        "schema_version": "gezhi.candidate_payload.v1",
+        "source_id": added["source_id"],
+        "source_sha256": added["source_sha256"],
+        "statement": {
+            "evidence_pointers": [
+                {
+                    "block_id": block["block_id"],
+                    "canonical_content_sha256": canonical_current[
+                        "canonical_content_sha256"
+                    ],
+                    "schema_version": "gezhi.evidence_pointer.v1",
+                }
+            ],
+            "risk_flags": [],
+            "source_terms": ["explicit searchable evidence"],
+            "support_kind": "direct",
+            "text": "该资料提供了可由原文直接定位的明确证据。",
+        },
+        "work_id": added["work_id"],
+    }
+    payload_sha256 = hashlib.sha256(
+        _canonical_payload_bytes(candidate_payload)
+    ).hexdigest()
+    candidate_id = "cand_" + payload_sha256[:24]
+    candidate = {
+        "candidate_id": candidate_id,
+        "payload": candidate_payload,
+        "payload_sha256": payload_sha256,
+        "schema_version": "gezhi.candidate_knowledge.v1",
+    }
+
     document = json.loads(completed.stdout)
     assert document == {
         "command": "literature.resume",
@@ -655,20 +702,20 @@ def test_public_resume_retries_once_and_publishes_an_evidence_bound_draft(
             {
                 "code": "literature.resume.stage_blocked.v1",
                 "context": {
-                    "reason": "reader_prerequisite_unavailable",
-                    "stage": "read",
+                    "reason": "awaiting_review",
+                    "stage": "review",
                 },
             }
         ],
         "outcome": "blocked",
         "result": {
             "active_source_id": added["source_id"],
-            "advanced_stages": [],
-            "pending_candidate_ids": [],
+            "advanced_stages": ["read"],
+            "pending_candidate_ids": [candidate_id],
             "pipeline_complete": False,
             "schema_version": "gezhi.literature_resume_result.v1",
             "start_stage": "read",
-            "stop_stage": "read",
+            "stop_stage": "review",
             "work_id": added["work_id"],
         },
         "schema_version": "gezhi.cli_result.v1",
@@ -703,6 +750,54 @@ def test_public_resume_retries_once_and_publishes_an_evidence_bound_draft(
         ]
         == []
     )
+
+    materializations = semantic / "materializations"
+    materialization_current_bytes = (materializations / "current.json").read_bytes()
+    materialization_current = json.loads(materialization_current_bytes)
+    materialization_run = (
+        materializations / "runs" / materialization_current["run_id"]
+    )
+    materialization_manifest_bytes = (
+        materialization_run / "manifest.json"
+    ).read_bytes()
+    assert materialization_current == {
+        "manifest_sha256": hashlib.sha256(
+            materialization_manifest_bytes
+        ).hexdigest(),
+        "run_id": materialization_current["run_id"],
+        "schema_version": "gezhi.candidate_materialization_current.v1",
+    }
+    assert (
+        materialization_run / "result" / "descriptor_payloads.jsonl"
+    ).read_bytes() == b""
+    assert [
+        json.loads(line)
+        for line in (
+            materialization_run / "result" / "candidate_knowledge.jsonl"
+        ).read_bytes().splitlines()
+    ] == [candidate]
+    assert json.loads(
+        (materialization_run / "result" / "review_queue.json").read_bytes()
+    ) == {
+        "candidates": [
+            {
+                "candidate_id": candidate_id,
+                "payload_sha256": payload_sha256,
+                "review_status": "pending",
+                "schema_version": "gezhi.review_queue_candidate.v1",
+            }
+        ],
+        "canonical_content_sha256": canonical_current[
+            "canonical_content_sha256"
+        ],
+        "materialization_run_id": materialization_current["run_id"],
+        "reader_manifest_sha256": current["manifest_sha256"],
+        "reader_run_id": current["run_id"],
+        "schema_version": "gezhi.review_queue.v2",
+        "source_id": added["source_id"],
+        "source_sha256": added["source_sha256"],
+        "work_id": added["work_id"],
+    }
     first_attempt = run_dir / "attempts" / "01"
     second_attempt = run_dir / "attempts" / "02"
     first_attempt_document = json.loads(
@@ -823,8 +918,8 @@ def test_public_resume_retries_once_and_publishes_an_evidence_bound_draft(
             {
                 "code": "literature.resume.stage_blocked.v1",
                 "context": {
-                    "reason": "reader_prerequisite_unavailable",
-                    "stage": "read",
+                    "reason": "awaiting_review",
+                    "stage": "review",
                 },
             }
         ],
@@ -832,11 +927,11 @@ def test_public_resume_retries_once_and_publishes_an_evidence_bound_draft(
         "result": {
             "active_source_id": added["source_id"],
             "advanced_stages": [],
-            "pending_candidate_ids": [],
+            "pending_candidate_ids": [candidate_id],
             "pipeline_complete": False,
             "schema_version": "gezhi.literature_resume_result.v1",
-            "start_stage": "read",
-            "stop_stage": "read",
+            "start_stage": "review",
+            "stop_stage": "review",
             "work_id": added["work_id"],
         },
         "schema_version": "gezhi.cli_result.v1",
@@ -847,6 +942,13 @@ def test_public_resume_retries_once_and_publishes_an_evidence_bound_draft(
     assert [path.name for path in (semantic / "runs").iterdir()] == [
         run_dir.name
     ]
+    materialization_run_names = [
+        path.name for path in (materializations / "runs").iterdir()
+    ]
+    assert (materializations / "current.json").read_bytes() == (
+        materialization_current_bytes
+    )
+    assert materialization_run_names == [materialization_run.name]
 
     (semantic / "current.json").unlink()
     recovered = run_launcher(
@@ -871,6 +973,200 @@ def test_public_resume_retries_once_and_publishes_an_evidence_bound_draft(
     assert [path.name for path in (semantic / "runs").iterdir()] == [
         run_dir.name
     ]
+    assert (materializations / "current.json").read_bytes() == (
+        materialization_current_bytes
+    )
+    assert [path.name for path in (materializations / "runs").iterdir()] == (
+        materialization_run_names
+    )
+
+    (materializations / "current.json").unlink()
+    materialization_recovered = run_launcher(
+        launcher_commands(
+            (
+                "--literature-data-root",
+                str(literature_root),
+                "--knowledge-data-root",
+                str(unavailable_knowledge_root),
+                "literature",
+                "resume",
+                str(added["work_id"]),
+                "--json",
+            )
+        )[launcher_index],
+        pythonpath_roots=(reuse_site, SOURCE_ROOT),
+    )
+    expected_materialization_recovery = json.loads(resumed.stdout)
+    expected_materialization_recovery["result"]["advanced_stages"] = ["read"]
+    expected_materialization_recovery["result"]["start_stage"] = "read"
+    assert json.loads(materialization_recovered.stdout) == (
+        expected_materialization_recovery
+    )
+    assert materialization_recovered.returncode == 2
+    assert materialization_recovered.stderr == b""
+    assert (materializations / "current.json").read_bytes() == (
+        materialization_current_bytes
+    )
+    assert [path.name for path in (materializations / "runs").iterdir()] == (
+        materialization_run_names
+    )
+
+    (materializations / "current.json").replace(
+        materializations / ".current.next.json"
+    )
+    recovery_order_stage = (
+        materializations
+        / ".staging"
+        / "matrun_44444444-4444-4444-8444-444444444444"
+    )
+    recovery_order_stage.mkdir()
+    (recovery_order_stage / "input.json").write_bytes(b"{}\n")
+    (materializations / "current.json").write_bytes(b"{}\n")
+    next_pointer_recovered = run_launcher(
+        launcher_commands(
+            (
+                "--literature-data-root",
+                str(literature_root),
+                "--knowledge-data-root",
+                str(unavailable_knowledge_root),
+                "literature",
+                "resume",
+                str(added["work_id"]),
+                "--json",
+            )
+        )[launcher_index],
+        pythonpath_roots=(reuse_site, SOURCE_ROOT),
+    )
+    assert json.loads(next_pointer_recovered.stdout) == (
+        expected_materialization_recovery
+    )
+    assert next_pointer_recovered.returncode == 2
+    assert next_pointer_recovered.stderr == b""
+    assert (materializations / "current.json").read_bytes() == (
+        materialization_current_bytes
+    )
+    assert not (materializations / ".current.next.json").exists()
+    assert recovery_order_stage.is_dir()
+    shutil.rmtree(recovery_order_stage)
+
+    (materializations / "current.json").unlink()
+    staged_materialization = (
+        materializations / ".staging" / materialization_run.name
+    )
+    materialization_run.replace(staged_materialization)
+    staging_recovered = run_launcher(
+        launcher_commands(
+            (
+                "--literature-data-root",
+                str(literature_root),
+                "--knowledge-data-root",
+                str(unavailable_knowledge_root),
+                "literature",
+                "resume",
+                str(added["work_id"]),
+                "--json",
+            )
+        )[launcher_index],
+        pythonpath_roots=(reuse_site, SOURCE_ROOT),
+    )
+    assert json.loads(staging_recovered.stdout) == (
+        expected_materialization_recovery
+    )
+    assert staging_recovered.returncode == 2
+    assert staging_recovered.stderr == b""
+    assert (materializations / "current.json").read_bytes() == (
+        materialization_current_bytes
+    )
+    assert materialization_run.is_dir()
+    assert list((materializations / ".staging").iterdir()) == []
+
+    (materializations / "current.json").write_bytes(b"{}\n")
+    invalid_materialization_current = run_launcher(
+        launcher_commands(
+            (
+                "--literature-data-root",
+                str(literature_root),
+                "--knowledge-data-root",
+                str(unavailable_knowledge_root),
+                "literature",
+                "resume",
+                str(added["work_id"]),
+                "--json",
+            )
+        )[launcher_index],
+        pythonpath_roots=(reuse_site, SOURCE_ROOT),
+    )
+    assert json.loads(invalid_materialization_current.stdout) == {
+        "command": "literature.resume",
+        "diagnostics": [
+            {
+                "code": "literature.resume.stage_failed.v1",
+                "context": {
+                    "reason": "asset_integrity_lost",
+                    "stage": "read",
+                },
+            }
+        ],
+        "outcome": "failed",
+        "result": {
+            "active_source_id": added["source_id"],
+            "advanced_stages": [],
+            "pending_candidate_ids": [],
+            "pipeline_complete": False,
+            "schema_version": "gezhi.literature_resume_result.v1",
+            "start_stage": "read",
+            "stop_stage": "read",
+            "work_id": added["work_id"],
+        },
+        "schema_version": "gezhi.cli_result.v1",
+    }
+    assert invalid_materialization_current.returncode == 1
+    assert invalid_materialization_current.stderr == b""
+    (materializations / "current.json").write_bytes(
+        materialization_current_bytes
+    )
+
+    partial_materialization = (
+        materializations
+        / ".staging"
+        / "matrun_33333333-3333-4333-8333-333333333333"
+    )
+    partial_materialization.mkdir()
+    (partial_materialization / "input.json").write_bytes(b"{}\n")
+    invalid_staging = run_launcher(
+        launcher_commands(
+            (
+                "--literature-data-root",
+                str(literature_root),
+                "--knowledge-data-root",
+                str(unavailable_knowledge_root),
+                "literature",
+                "resume",
+                str(added["work_id"]),
+                "--json",
+            )
+        )[launcher_index],
+        pythonpath_roots=(reuse_site, SOURCE_ROOT),
+    )
+    assert json.loads(invalid_staging.stdout) == {
+        "command": "literature.resume",
+        "diagnostics": [
+            {
+                "code": "literature.resume.recovery_failed.v1",
+                "context": {},
+            }
+        ],
+        "outcome": "failed",
+        "result": None,
+        "schema_version": "gezhi.cli_result.v1",
+    }
+    assert invalid_staging.returncode == 1
+    assert invalid_staging.stderr == b""
+    assert partial_materialization.is_dir()
+    assert (materializations / "current.json").read_bytes() == (
+        materialization_current_bytes
+    )
+    shutil.rmtree(partial_materialization)
 
     corrupted_reading = run_dir / "result" / "reading_result.json"
     corrupted_payload = b"{}\n"
@@ -913,6 +1209,150 @@ def test_public_resume_retries_once_and_publishes_an_evidence_bound_draft(
         }
     ]
     assert not (semantic / "current.json").exists()
+
+
+def test_public_resume_rejects_candidate_budget_without_partial_publication(
+    reader_workspace: tuple[Path, Path, Path, Path],
+) -> None:
+    literature_root, knowledge_root, pdf_path, runtime_base = reader_workspace
+    write_text_pdf(pdf_path, "Evidence supports several distinct Reader drafts.")
+    added = _run_add(literature_root, pdf_path)
+
+    canonical_site = runtime_base / "canonical-site"
+    canonical_site.mkdir()
+    _canonicalize_only_sitecustomize(canonical_site)
+    canonicalized = run_launcher(
+        launcher_commands(
+            (
+                "--literature-data-root",
+                str(literature_root),
+                "literature",
+                "resume",
+                str(added["work_id"]),
+                "--json",
+            )
+        )[1],
+        pythonpath_roots=(canonical_site, SOURCE_ROOT),
+    )
+    assert canonicalized.returncode == 2
+
+    source_dir = (
+        literature_root
+        / "works"
+        / str(added["work_id"])
+        / "sources"
+        / str(added["source_id"])
+    )
+    canonical_current = json.loads(
+        (source_dir / "canonical" / "current.json").read_bytes()
+    )
+    canonical_run = (
+        source_dir / "canonical" / "runs" / canonical_current["run_id"]
+    )
+    block = json.loads((canonical_run / "blocks.jsonl").read_bytes().splitlines()[0])
+    synopsis = {
+        "evidence_block_ids": [block["block_id"]],
+        "risk_flags": [],
+        "source_terms": ["distinct Reader drafts"],
+        "support_kind": "direct",
+        "text": "该资料为多个不同候选草稿提供了直接证据。",
+    }
+    drafts = [
+        {
+            "candidate_type": "claim",
+            "descriptor_refs": [],
+            "statement": {
+                **synopsis,
+                "text": f"这是第 {index} 条具有不同正文的候选结论。",
+            },
+        }
+        for index in range(5)
+    ]
+    reader_output = {
+        "candidate_drafts": drafts,
+        "reading_result": {
+            "findings": [],
+            "limitations": [],
+            "methods": [],
+            "open_questions": [],
+            "relevance": [],
+            "research_problems": [],
+            "study_descriptors": {
+                "datasets": [],
+                "experiments": [],
+                "metrics": [],
+                "objects": [],
+            },
+            "synopsis": synopsis,
+        },
+        "schema_version": "gezhi.literature_reader_output.v1",
+    }
+    final_path = runtime_base / "reader-final.json"
+    final_path.write_bytes(_canonical_bytes(reader_output))
+    reader_site = runtime_base / "reader-site"
+    reader_site.mkdir()
+    _reader_sitecustomize(reader_site)
+    codex_home = runtime_base / "home"
+    temporary = runtime_base / "temp"
+    codex_home.mkdir()
+    temporary.mkdir()
+
+    completed = run_launcher(
+        launcher_commands(
+            (
+                "--literature-data-root",
+                str(literature_root),
+                "--knowledge-data-root",
+                str(knowledge_root),
+                "literature",
+                "resume",
+                str(added["work_id"]),
+                "--json",
+            )
+        )[1],
+        pythonpath_roots=(reader_site, SOURCE_ROOT),
+        environment_updates={
+            "CODEX_HOME": str(codex_home),
+            "READER_DOUBLE_EXE": str(_DOUBLE),
+            "READER_DOUBLE_FINAL": str(final_path),
+            "TEMP": str(temporary),
+            "TMP": str(temporary),
+        },
+        timeout=30,
+    )
+
+    assert json.loads(completed.stdout) == {
+        "command": "literature.resume",
+        "diagnostics": [
+            {
+                "code": "literature.resume.stage_failed.v1",
+                "context": {
+                    "reason": "candidate_validation_failed",
+                    "stage": "read",
+                },
+            }
+        ],
+        "outcome": "failed",
+        "result": {
+            "active_source_id": added["source_id"],
+            "advanced_stages": [],
+            "pending_candidate_ids": [],
+            "pipeline_complete": False,
+            "schema_version": "gezhi.literature_resume_result.v1",
+            "start_stage": "read",
+            "stop_stage": "read",
+            "work_id": added["work_id"],
+        },
+        "schema_version": "gezhi.cli_result.v1",
+    }
+    assert completed.returncode == 1
+    assert completed.stderr == b""
+    semantic = source_dir / "semantic"
+    assert (semantic / "current.json").exists()
+    materializations = semantic / "materializations"
+    assert not (materializations / "current.json").exists()
+    assert list((materializations / "runs").iterdir()) == []
+    assert list((materializations / ".staging").iterdir()) == []
 
 
 def test_public_resume_never_follows_a_semantic_directory_reparse_point(
@@ -1672,10 +2112,26 @@ def test_public_resume_commits_a_runtime_block_and_recovers_attempted_staging(
         },
         timeout=30,
     )
-    assert resumed.returncode == 2, (
+    assert resumed.returncode == 0, (
         resumed.stdout + resumed.stderr
     ).decode(errors="replace")
     assert resumed.stderr == b""
+    assert json.loads(resumed.stdout) == {
+        "command": "literature.resume",
+        "diagnostics": [],
+        "outcome": "succeeded",
+        "result": {
+            "active_source_id": added["source_id"],
+            "advanced_stages": ["read"],
+            "pending_candidate_ids": [],
+            "pipeline_complete": True,
+            "schema_version": "gezhi.literature_resume_result.v1",
+            "start_stage": "read",
+            "stop_stage": "complete",
+            "work_id": added["work_id"],
+        },
+        "schema_version": "gezhi.cli_result.v1",
+    }
     current = json.loads((semantic / "current.json").read_bytes())
     assert current["run_id"] != orphan_run_id
     assert list((semantic / ".staging").iterdir()) == []
@@ -1692,6 +2148,69 @@ def test_public_resume_commits_a_runtime_block_and_recovers_attempted_staging(
         "reasoning_output_tokens": None,
     }
     assert not (recovered_orphan / "result").exists()
+
+    materializations = semantic / "materializations"
+    materialization_current = json.loads(
+        (materializations / "current.json").read_bytes()
+    )
+    materialization_run = (
+        materializations / "runs" / materialization_current["run_id"]
+    )
+    assert (
+        materialization_run / "result" / "descriptor_payloads.jsonl"
+    ).read_bytes() == b""
+    assert (
+        materialization_run / "result" / "candidate_knowledge.jsonl"
+    ).read_bytes() == b""
+    assert json.loads(
+        (materialization_run / "result" / "review_queue.json").read_bytes()
+    )["candidates"] == []
+    work_dir = literature_root / "works" / str(added["work_id"])
+    assert not (work_dir / "reviews").exists()
+    assert not (work_dir / "handoffs").exists()
+
+    materialization_run_names = [
+        path.name for path in (materializations / "runs").iterdir()
+    ]
+    reuse_site = runtime_base / "reuse-site"
+    reuse_site.mkdir()
+    _reject_reader_attempt_sitecustomize(reuse_site)
+    reused = run_launcher(
+        launcher_commands(
+            (
+                "--literature-data-root",
+                str(literature_root),
+                "--knowledge-data-root",
+                str(knowledge_root),
+                "literature",
+                "resume",
+                str(added["work_id"]),
+                "--json",
+            )
+        )[1],
+        pythonpath_roots=(reuse_site, SOURCE_ROOT),
+    )
+    assert json.loads(reused.stdout) == {
+        "command": "literature.resume",
+        "diagnostics": [],
+        "outcome": "succeeded",
+        "result": {
+            "active_source_id": added["source_id"],
+            "advanced_stages": [],
+            "pending_candidate_ids": [],
+            "pipeline_complete": True,
+            "schema_version": "gezhi.literature_resume_result.v1",
+            "start_stage": "complete",
+            "stop_stage": "complete",
+            "work_id": added["work_id"],
+        },
+        "schema_version": "gezhi.cli_result.v1",
+    }
+    assert reused.returncode == 0
+    assert reused.stderr == b""
+    assert [path.name for path in (materializations / "runs").iterdir()] == (
+        materialization_run_names
+    )
 
     partial_run_id = "semrun_33333333-3333-4333-8333-333333333333"
     partial_stage = semantic / ".staging" / partial_run_id
