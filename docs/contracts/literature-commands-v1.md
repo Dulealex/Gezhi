@@ -21,7 +21,7 @@
 
 这些名称冻结行为 interface，不冻结 Python module、class、函数签名或 exception。CLI adapter 不得逐步调用“算 hash”“写 manifest”“改 current”“写 review”“生成 handoff”或“直接改 Registry”等浅接口，也不得自己解释资产状态。三者分别把路径安全/身份、七阶段恢复、审核/交接一致性隐藏在 Literature-owned deep module 内；唯一跨 Context 写入仍是 `KnowledgeIntake.apply(reviewed_handoff)`。
 
-运行端 Codex、OCR child、renderer、`status`、reader 与未来 Context 都不能获得 `review_candidate` 的写能力。模型输出最多形成 Candidate Knowledge 与 pending Review Queue；只有从完整 public `literature review CANDIDATE_ID (--accept|--reject|--defer)` grammar 创建的不可伪造、invocation-local human-review capability 才能提交 Review Decision。
+运行端 Codex、OCR child、renderer、`status`、reader 与未来 Context 都不能获得 `review_candidate` 的写能力。模型输出最多形成 Candidate Knowledge 与 pending Review Queue；只有完整 public `literature review CANDIDATE_ID (--accept|--reject|--defer)` grammar 能构造 closed `ReviewCandidateCommandV1(candidate_id, action)` 并进入 Review deep module。该 command value 不携带 capability、reviewer、路径、payload 或写权限；Human-only 由完整 grammar、module 固定写入 `local_human_cli`，以及 static composition 不向其他 caller 暴露 Literature 写能力共同保证。
 
 ## 2. 共同 gate、身份与资源所有权
 
@@ -253,7 +253,7 @@ Decision明确提交或 unchanged完整验证后，result恰好为：
 
 值域：`decision_disposition=created|unchanged`；`handoff_action=accept|withdraw|none`；`handoff_status=committed|not_required|pending`；`import_status=applied|not_required|pending`；`intake_status=active|withdrawn|null`；revision为 `1..9223372036854775807` non-boolean integer。
 
-Action=none必须配 handoff_id=null、handoff/import=not_required、intake=null。Accept/withdraw必须配 deterministic Handoff ID；Handoff未提交时 handoff/import=pending、intake=null；Handoff committed但 import未完成时 committed/pending/null；import applied时 accept→active、withdraw→withdrawn。
+Action=none必须配 handoff_id=null、import=not_required、intake=null；no-action receipt已提交时 handoff=not_required，Decision已提交但该receipt的确定性提交失败时 handoff=pending且只可形成 non-null handoff continuation failure。Accept/withdraw必须配 deterministic Handoff ID；Handoff未提交时 handoff/import=pending、intake=null；Handoff committed但 import未完成时 committed/pending/null；import applied时 accept→active、withdraw→withdrawn。
 
 Decision前 blocked/failed固定 result=null。Decision后先应用 ADR 0121 的 specific-before-generic 互斥映射；generic blocked/failed 只接受 Handoff 或 `KnowledgeIntake` interface 的其余已批准 typed verdict，两者都保留 non-null partial receipt且只陈述已完成提交点。Unknown、untyped 或 commit-uncertain 不形成 handled receipt；完整成功要求 required continuation applied或 no-action成立。
 
@@ -633,6 +633,6 @@ Review catalog 的 `<data_root>` 逐字取胜出 root primary context 中的 `da
 
 本合同不增加 command/option、batch/interactive review、Identity Review专用命令、自动搜索/下载、网络 acquisition、多 Source评分、force rerun、维护命令、GUI/daemon、动态插件、Promotion Gate、Promoted Knowledge、Research Interest或 Relevance Candidate。它不冻结 OCR/Canonical/Reader内部 schema、Registry表、可选 interactive Rich decoration或 child transport实现；第 8 节的 Human 语义行与 redirected bytes 已冻结。
 
-未来 Context先定义业务语言、状态所有权与 versioned handoff，再由 static composition加入；不得复用 human-review capability、直接写 Literature assets或把七阶段扩成通用 DAG。
+未来 Context先定义业务语言、状态所有权与 versioned handoff，再由 static composition加入；不得获得 `review_candidate` 写能力、直接写 Literature assets或把七阶段扩成通用 DAG。
 
 修改 result字段/值域、primary code/context、阶段推进权限、Review→Handoff→Intake矩阵、Active Source语义或 normal exit，必须升级 nested schema/code或使用 replacing decision。只改未冻结 Rich样式或内部 module拆分不改变本合同。

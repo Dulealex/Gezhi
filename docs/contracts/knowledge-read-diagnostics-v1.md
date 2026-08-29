@@ -154,7 +154,7 @@ Knowledge 候选搜索
 
 ### Redirected success fixture bytes
 
-下列四个 fence 各自是完整 UTF-8 文件 bytes：无 BOM、无 CR，closing fence 前的换行是唯一 final LF。它们只固定本节 exact-output witness 的可复制输入与哈希，不替代未来独立版本化的生产 Reviewed Handoff Schema。Accept Candidate payload/hash、两次 T04 Handoff identity、accept 的 self-contained snapshots、withdraw tombstone、manifest→`candidates.jsonl` 哈希与 revision 关系均须按现有合同复验。
+下列四个 fence 各自是完整 UTF-8 文件 bytes：无 BOM、无 CR，closing fence 前的换行是唯一 final LF。它们是 [Reviewed Handoff v1](./reviewed-handoff-v1.md) 的 exact-byte conformance witness；Accept Candidate payload/hash、两次 T04 Handoff identity、accept 的 self-contained snapshots、withdraw tombstone、manifest→`candidates.jsonl` 哈希与 revision 关系均须按该合同复验。
 
 Accept `candidates.jsonl`：
 
