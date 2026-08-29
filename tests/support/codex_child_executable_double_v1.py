@@ -36,6 +36,41 @@ def _success(final_path: Path, *, exit_code: int = 0) -> None:
     os._exit(exit_code)
 
 
+def _final_from_file(final_path: Path, payload_path: Path) -> None:
+    prompt = sys.stdin.buffer.read()
+    _write_all(1, _prompt_receipt(prompt), chunk=7)
+    completed = {
+        "type": "turn.completed",
+        "usage": {
+            "cached_input_tokens": 0,
+            "input_tokens": 10,
+            "output_tokens": 20,
+            "reasoning_output_tokens": 5,
+        },
+    }
+    _write_all(
+        1,
+        json.dumps(completed, separators=(",", ":")).encode("ascii") + b"\n",
+        chunk=7,
+    )
+    final_path.write_bytes(payload_path.read_bytes())
+
+
+def _message_failure(message_path: Path, *, exit_code: int) -> None:
+    prompt = sys.stdin.buffer.read()
+    _write_all(1, _prompt_receipt(prompt), chunk=7)
+    failed = {
+        "type": "turn.failed",
+        "error": {"message": message_path.read_text(encoding="utf-8")},
+    }
+    _write_all(
+        1,
+        json.dumps(failed, separators=(",", ":")).encode("utf-8") + b"\n",
+        chunk=7,
+    )
+    os._exit(exit_code)
+
+
 def _hang(*, read_prompt: bool) -> None:
     if read_prompt:
         sys.stdin.buffer.read()
@@ -44,10 +79,7 @@ def _hang(*, read_prompt: bool) -> None:
 
 def _descendant_hang() -> None:
     prompt = sys.stdin.buffer.read()
-    child = (
-        "import threading;"
-        "threading.Event().wait()"
-    )
+    child = "import threading;threading.Event().wait()"
     subprocess.Popen(
         [sys.executable, "-I", "-B", "-c", child],
         stdin=subprocess.DEVNULL,
@@ -131,11 +163,7 @@ def _zero_stdout_write(final_path: Path) -> None:
 
 def _finite_descendant(final_path: Path) -> None:
     sys.stdin.buffer.read()
-    descendant = (
-        "import os,time;"
-        "time.sleep(0.15);"
-        "os.write(1,b'descendant')"
-    )
+    descendant = "import os,time;time.sleep(0.15);os.write(1,b'descendant')"
     subprocess.Popen(
         [sys.executable, "-I", "-B", "-c", descendant],
         stdin=subprocess.DEVNULL,
@@ -276,9 +304,7 @@ def _dual_backpressure(
             raise RuntimeError("double could not signal stdout return")
         count = int(written.value)
         if not succeeded or not 1 <= count <= len(payload):
-            raise RuntimeError(
-                f"double stdout WriteFile failed: {write_error}:{count}"
-            )
+            raise RuntimeError(f"double stdout WriteFile failed: {write_error}:{count}")
         _write_all(1, payload[count:])
         if wait(stdin_gate, 0xFFFFFFFF) != 0:
             raise RuntimeError("double stdin gate failed")
@@ -296,6 +322,8 @@ def main() -> None:
         "scenario",
         choices=(
             "success",
+            "final-from-file",
+            "message-failure",
             "exit",
             "hang",
             "no-read-hang",
@@ -317,6 +345,7 @@ def main() -> None:
         ),
     )
     parser.add_argument("--final", type=Path, required=True)
+    parser.add_argument("--payload-file", type=Path)
     parser.add_argument("--value", type=int, default=0)
     parser.add_argument("--sentinel", action="append", type=int, default=[])
     parser.add_argument("--stdout-bytes", type=int, default=0)
@@ -326,6 +355,14 @@ def main() -> None:
     args = parser.parse_args()
     if args.scenario == "success":
         _success(args.final)
+    if args.scenario == "final-from-file":
+        if args.payload_file is None:
+            parser.error("final-from-file requires --payload-file")
+        _final_from_file(args.final, args.payload_file)
+    if args.scenario == "message-failure":
+        if args.payload_file is None:
+            parser.error("message-failure requires --payload-file")
+        _message_failure(args.payload_file, exit_code=args.value)
     if args.scenario == "exit":
         _success(args.final, exit_code=args.value)
     if args.scenario == "hang":

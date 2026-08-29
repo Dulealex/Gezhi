@@ -187,7 +187,7 @@ def test_native_text_resume_publishes_canonical_success_and_stops_at_read(
             {
                 "code": "literature.resume.stage_blocked.v1",
                 "context": {
-                    "reason": "reader_prerequisite_unavailable",
+                    "reason": "codex_runtime_unavailable",
                     "stage": "read",
                 },
             }
@@ -344,7 +344,7 @@ def test_native_text_resume_publishes_canonical_success_and_stops_at_read(
 
 
 @pytest.mark.parametrize("launcher_index", [0, 1])
-def test_canonical_success_has_exact_human_reader_prerequisite_receipt(
+def test_canonical_success_has_exact_human_codex_runtime_receipt(
     resume_workspace: tuple[Path, Path],
     launcher_index: int,
 ) -> None:
@@ -376,7 +376,7 @@ def test_canonical_success_has_exact_human_reader_prerequisite_receipt(
         "开始阶段：ocr",
         "停止阶段：read",
         f"Work ID：{added['work_id']}",
-        "原因：read 阶段已阻塞（reader_prerequisite_unavailable）",
+        "原因：read 阶段已阻塞（codex_runtime_unavailable）",
         (
             "下一步：修复该前置条件后重新运行 resume；"
             "awaiting_review 时对列出的 Candidate 显式 review"
@@ -549,7 +549,7 @@ def test_committed_canonical_run_with_missing_current_repairs_only_the_pointer(
         {
             "code": "literature.resume.stage_blocked.v1",
             "context": {
-                "reason": "reader_prerequisite_unavailable",
+                    "reason": "codex_runtime_unavailable",
                 "stage": "read",
             },
         }

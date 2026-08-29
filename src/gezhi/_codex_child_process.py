@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Literal, Protocol, TypeAlias
 
 from gezhi._codex_role_plan import (
+    CaptureProfileV1,
     FrozenCodexLaunchPlanV1,
     _require_codex_launch_plan_v1,
 )
@@ -31,6 +32,21 @@ CODEX_CHILD_POLL_QUANTUM_MS_V1 = 50
 CODEX_JOB_STOP_EXIT_DWORD_V1 = 0x475A0001
 KNOWLEDGE_EVENTS_CAPTURE_CAP_V1 = 16_777_216
 KNOWLEDGE_FINAL_CAPTURE_CAP_V1 = 1_048_576
+LITERATURE_EVENTS_CAPTURE_CAP_V1 = 16_777_216
+LITERATURE_FINAL_CAPTURE_CAP_V1 = 1_048_576
+
+
+def _events_capture_cap_v1(capture_profile: CaptureProfileV1) -> int:
+    if capture_profile == "knowledge":
+        return KNOWLEDGE_EVENTS_CAPTURE_CAP_V1
+    return LITERATURE_EVENTS_CAPTURE_CAP_V1
+
+
+def _final_capture_cap_v1(capture_profile: CaptureProfileV1) -> int:
+    if capture_profile == "knowledge":
+        return KNOWLEDGE_FINAL_CAPTURE_CAP_V1
+    return LITERATURE_FINAL_CAPTURE_CAP_V1
+
 
 MechanicalOutcomeV1: TypeAlias = Literal[
     "clean",
@@ -1036,7 +1052,7 @@ def _collector_worker(
     activation: threading.Event,
     precommit_rejected: threading.Event,
     *,
-    knowledge: bool,
+    events_capture_cap: int,
     test_hooks: CodexChildTestHooksV1 | None,
 ) -> None:
     failure: str | None = None
@@ -1086,14 +1102,13 @@ def _collector_worker(
                 payload = buffer.raw[:count]
                 keep = len(payload)
                 sink_was_available = not drain_only
-                if knowledge:
-                    keep = min(
-                        len(payload),
-                        max(0, KNOWLEDGE_EVENTS_CAPTURE_CAP_V1 - retained),
-                    )
-                    if len(payload) > keep:
-                        overflow = True
-                        drain_only = True
+                keep = min(
+                    len(payload),
+                    max(0, events_capture_cap - retained),
+                )
+                if len(payload) > keep:
+                    overflow = True
+                    drain_only = True
                 if keep and sink_was_available:
                     try:
                         _write_events_sink_all(events_fd.value, payload[:keep])
@@ -1514,7 +1529,7 @@ def _prepare_attempt(
                 precommit_rejected,
             ),
             kwargs={
-                "knowledge": plan.capture_profile == "knowledge",
+                "events_capture_cap": _events_capture_cap_v1(plan.capture_profile),
                 "test_hooks": test_hooks,
             },
             name=f"gezhi-codex-stdout-{plan.attempt_ordinal}",
@@ -1776,11 +1791,8 @@ def _read_final_source(
         size = ctypes.c_longlong()
         if not _GET_FILE_SIZE_EX(source.value, ctypes.byref(size)) or size.value < 0:
             raise _win32_error("GetFileSizeEx(final) failed")
-        limit = (
-            KNOWLEDGE_FINAL_CAPTURE_CAP_V1
-            if plan.capture_profile == "knowledge"
-            else int(size.value)
-        )
+        final_capture_cap = _final_capture_cap_v1(plan.capture_profile)
+        limit = final_capture_cap
         raw_fd = os.open(
             private_capture,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
@@ -1807,7 +1819,7 @@ def _read_final_source(
                 raise CodexChildUnsafeHoldErrorV1("final read overreported bytes")
             _write_all_fd(fd.value, buffer.raw[:count])
             retained += count
-        if plan.capture_profile == "knowledge" and retained == limit:
+        if retained == limit:
             witness = ctypes.create_string_buffer(1)
             read = ctypes.c_ulong()
             if not _READ_FILE(source.value, witness, 1, ctypes.byref(read), None):
@@ -1815,11 +1827,16 @@ def _read_final_source(
             overflow = read.value == 1
         elif retained < int(size.value):
             raise CodexChildUnsafeHoldErrorV1("final source truncated during read")
-        if early_overflow_identity is not None and not overflow:
+        if (
+            early_overflow_identity is not None
+            and identity != early_overflow_identity
+        ):
             raise CodexChildUnsafeHoldErrorV1(
                 "final generation changed after overflow witness"
-                if identity != early_overflow_identity
-                else "final overflow was not independently confirmed"
+            )
+        if early_overflow_identity is not None and not overflow:
+            raise CodexChildUnsafeHoldErrorV1(
+                "final overflow was not independently confirmed"
             )
     finally:
         if fd is not None and not fd.closed:
@@ -1872,12 +1889,13 @@ def _install_captures(
         events_private,
         overflow=events_overflow,
     )
-    if plan.capture_profile == "knowledge" and (
-        (events_overflow and events_preview.byte_length != KNOWLEDGE_EVENTS_CAPTURE_CAP_V1)
-        or events_preview.byte_length > KNOWLEDGE_EVENTS_CAPTURE_CAP_V1
-    ):
+    events_capture_cap = _events_capture_cap_v1(plan.capture_profile)
+    if (
+        events_overflow
+        and events_preview.byte_length != events_capture_cap
+    ) or events_preview.byte_length > events_capture_cap:
         raise CodexChildUnsafeHoldErrorV1(
-            "Knowledge events overflow did not retain the exact cap prefix"
+            "Role events overflow did not retain the exact cap prefix"
         )
     if final_capture.existed:
         assert final_capture.private_capture_path is not None
@@ -1885,15 +1903,16 @@ def _install_captures(
             final_capture.private_capture_path,
             overflow=final_capture.overflow,
         )
-        if plan.capture_profile == "knowledge" and (
+        final_capture_cap = _final_capture_cap_v1(plan.capture_profile)
+        if (
             (
                 final_capture.overflow
-                and final_preview.byte_length != KNOWLEDGE_FINAL_CAPTURE_CAP_V1
+                and final_preview.byte_length != final_capture_cap
             )
-            or final_preview.byte_length > KNOWLEDGE_FINAL_CAPTURE_CAP_V1
+            or final_preview.byte_length > final_capture_cap
         ):
             raise CodexChildUnsafeHoldErrorV1(
-                "Knowledge final overflow did not retain the exact cap prefix"
+                "Role final overflow did not retain the exact cap prefix"
             )
     events_formal = staging / "events.jsonl"
     os.replace(events_private, events_formal)
@@ -2426,15 +2445,14 @@ def _run_codex_child_core_v1(
                     f"wait_root:{ctypes.get_last_error()}:{verdict}"
                 )
         if (
-            plan.capture_profile == "knowledge"
-            and plan.final_spool_path is not None
+            plan.final_spool_path is not None
             and not job_empty
             and not final_probe_disabled
         ):
             try:
                 witness = _active_final_probe(
                     plan.final_spool_path,
-                    cap=KNOWLEDGE_FINAL_CAPTURE_CAP_V1,
+                    cap=_final_capture_cap_v1(plan.capture_profile),
                     ledger=prepared.ledger,
                 )
             except CodexChildWin32ErrorV1 as error:

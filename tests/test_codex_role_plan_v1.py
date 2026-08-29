@@ -73,11 +73,22 @@ def _paths(tmp_path: Path) -> dict[str, Path]:
     }
 
 
-def _workspace(paths: dict[str, Path]) -> FrozenCodexAttemptWorkspaceV1:
+def _workspace(
+    paths: dict[str, Path],
+    *,
+    role: str = "literature_reader_v1",
+) -> FrozenCodexAttemptWorkspaceV1:
+    if role == "literature_reader_v1":
+        return freeze_codex_attempt_workspace_v1(
+            role="literature_reader_v1",
+            attempt_root=paths["attempt"],
+            attempt_ordinal=1,
+            literature_authoritative_root=paths["literature"],
+        )
     return freeze_codex_attempt_workspace_v1(
+        role="knowledge_answerer_v1",
         attempt_root=paths["attempt"],
         attempt_ordinal=1,
-        literature_authoritative_root=paths["literature"],
         knowledge_authoritative_root=paths["knowledge"],
     )
 
@@ -248,7 +259,7 @@ def test_role_plan_rejects_case_colliding_environment_names(tmp_path: Path) -> N
             role="knowledge_answerer_v1",
             prompt=b"question",
             attempt_ordinal=1,
-            workspace=_workspace(paths),
+            workspace=_workspace(paths, role="knowledge_answerer_v1"),
             schema_path=paths["schema"],
             codex_home=paths["codex_home"],
             source_environment={
@@ -259,6 +270,24 @@ def test_role_plan_rejects_case_colliding_environment_names(tmp_path: Path) -> N
         )
 
 
+def test_role_plan_rejects_a_workspace_sealed_for_another_role(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+
+    with pytest.raises(CodexRolePlanErrorV1, match="workspace role does not match"):
+        freeze_codex_role_launch_v1(
+            runtime=resolve_codex_runtime_v1(paths["project"]),
+            role="knowledge_answerer_v1",
+            prompt=b"question",
+            attempt_ordinal=1,
+            workspace=_workspace(paths),
+            schema_path=paths["schema"],
+            codex_home=paths["codex_home"],
+            source_environment={"SystemRoot": os.environ["SystemRoot"]},
+        )
+
+
 def test_role_plan_rejects_an_attempt_workspace_inside_the_project(
     tmp_path: Path,
 ) -> None:
@@ -266,10 +295,10 @@ def test_role_plan_rejects_an_attempt_workspace_inside_the_project(
     inside_attempt = paths["project"] / "attempt"
     _create_attempt_root(inside_attempt)
     workspace = freeze_codex_attempt_workspace_v1(
+        role="literature_reader_v1",
         attempt_root=inside_attempt,
         attempt_ordinal=1,
         literature_authoritative_root=paths["literature"],
-        knowledge_authoritative_root=paths["knowledge"],
     )
 
     with pytest.raises(CodexRolePlanErrorV1, match="outside the project root"):
@@ -363,6 +392,40 @@ def test_attempt_workspace_rejects_an_unexpected_immediate_entry(
         _workspace(paths)
 
 
+def test_literature_workspace_does_not_probe_the_knowledge_root(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    workspace = freeze_codex_attempt_workspace_v1(
+        role="literature_reader_v1",
+        attempt_root=paths["attempt"],
+        attempt_ordinal=1,
+        literature_authoritative_root=paths["literature"],
+    )
+
+    assert workspace.literature_authoritative_root
+    assert workspace.literature_authoritative_root_identity is not None
+    assert workspace.knowledge_authoritative_root == ""
+    assert workspace.knowledge_authoritative_root_identity is None
+
+
+def test_knowledge_workspace_does_not_probe_the_literature_root(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    workspace = freeze_codex_attempt_workspace_v1(
+        role="knowledge_answerer_v1",
+        attempt_root=paths["attempt"],
+        attempt_ordinal=1,
+        knowledge_authoritative_root=paths["knowledge"],
+    )
+
+    assert workspace.knowledge_authoritative_root
+    assert workspace.knowledge_authoritative_root_identity is not None
+    assert workspace.literature_authoritative_root == ""
+    assert workspace.literature_authoritative_root_identity is None
+
+
 def test_attempt_workspace_rejects_overlap_with_authoritative_data(
     tmp_path: Path,
 ) -> None:
@@ -370,13 +433,11 @@ def test_attempt_workspace_rejects_overlap_with_authoritative_data(
     literature.mkdir()
     attempt = literature / "attempt"
     _create_attempt_root(attempt)
-    knowledge = tmp_path / "knowledge-authoritative"
-    knowledge.mkdir()
 
     with pytest.raises(CodexRolePlanErrorV1, match="physically isolated"):
         freeze_codex_attempt_workspace_v1(
+            role="literature_reader_v1",
             attempt_root=attempt,
             attempt_ordinal=1,
             literature_authoritative_root=literature,
-            knowledge_authoritative_root=knowledge,
         )

@@ -113,11 +113,11 @@ Literature 的条件式 final capture 不改变 production argv：它仍提供 f
 
 ## 5. cwd 与 path profile
 
-role builder 先形成一个 sealed attempt workspace。其 root 恰好只有 `captures`、`sqlite`、`temporary`、`working` 四个 immediate directory，四者在 plan formation 与 commitment 前复验时都为空；root 与四个 child 的 canonical path 和 FileIdentity 一并冻结。Literature/Knowledge authoritative root 同样取得 FileIdentity、只冻结 identity 而不冻结业务 entry set，并与 attempt root 物理隔离。attempt ordinal 只由 builder 派生 `captures/NN` 与 `captures/.NN.codex-stage`，调用方不能分别拼接这些路径。
+role builder 先形成一个绑定唯一 role 的 sealed attempt workspace。其 root 恰好只有 `captures`、`sqlite`、`temporary`、`working` 四个 immediate directory，四者在 plan formation 与 commitment 前复验时都为空；root 与四个 child 的 canonical path 和 FileIdentity 一并冻结。只有该 role 实际消费的 authoritative root 取得 FileIdentity：`literature_reader_v1`只证明 Literature root，`knowledge_answerer_v1`只证明 Knowledge root；未消费 Context 的 root 不做 physical open/probe。role-owned root只冻结 identity而不冻结业务 entry set，并与 attempt root物理隔离。attempt ordinal 只由 builder 派生 `captures/NN` 与 `captures/.NN.codex-stage`，调用方不能分别拼接这些路径；精确边界由 [ADR 0134](../adr/0134-prove-only-the-data-root-consumed-by-a-codex-role.md) 冻结。
 
-working directory、Schema、`CODEX_HOME`、`CODEX_SQLITE_HOME`、TEMP/TMP 与 capture parent 都必须在 commitment 前通过 no-follow、无 reparse 的 absolute local path validation。plan 到 commitment 之间，child module 重新打开并持有关键 path capability：attempt root 必须仍是同一 FileIdentity 且 immediate entry set 恰为上述四个目录；`captures`、`sqlite`、`temporary`、`working` 四个 child 必须仍是各自冻结的 FileIdentity 与 exact empty entry set；Literature/Knowledge authoritative root 与 `CODEX_HOME` 只复验 directory identity；project-pinned executable 必须仍匹配 runtime proof 的 identity、size 与 SHA-256；Schema 必须仍匹配 plan 冻结的 identity、size 与 SHA-256。同路径删除重建、pathname replacement 或原地内容修改均在 `CreateProcessW` 前拒绝。working directory：
+working directory、Schema、`CODEX_HOME`、`CODEX_SQLITE_HOME`、TEMP/TMP 与 capture parent 都必须在 commitment 前通过 no-follow、无 reparse 的 absolute local path validation。plan 到 commitment 之间，child module 重新打开并持有关键 path capability：attempt root 必须仍是同一 FileIdentity 且 immediate entry set 恰为上述四个目录；`captures`、`sqlite`、`temporary`、`working` 四个 child 必须仍是各自冻结的 FileIdentity 与 exact empty entry set；唯一 role-owned authoritative root 与 `CODEX_HOME` 只复验 directory identity；project-pinned executable 必须仍匹配 runtime proof 的 identity、size 与 SHA-256；Schema 必须仍匹配 plan 冻结的 identity、size 与 SHA-256。同路径删除重建、pathname replacement 或原地内容修改均在 `CreateProcessW` 前拒绝。working directory：
 
-- 已存在、attempt-private，且不是项目目录、Literature/Knowledge authoritative store 或它们的祖先；
+- 已存在、attempt-private，且不是项目目录、当前 role-owned authoritative store 或其祖先；
 - 不依赖 Git，故 argv 固定使用 `--skip-git-repo-check`；
 - 不含项目 `.codex`、`AGENTS.md`、rules、plugins、skills 或业务资产；
 - read-only sandbox 仍保留为第二道 model-tool 防线，不能替代禁用工具。
@@ -163,13 +163,14 @@ entries 按 canonical name 的 Unicode casefold ascending 排序，以 `name=val
 
 本合同只形成 [Codex Child Process v1](./codex-child-process-v1.md) 所需的 frozen launch plan。child module先完成 raw capture、Job tree settlement、timeout/cancel/overflow/lifecycle evidence 与 ledger=0，再返回 immutable evidence。
 
-Codex `0.146.0` raw JSONL event type/field 到 `runtime_unavailable`、`rate_limit`、`server_error`、`network` 的适配不在本文中。T14 Literature Reader 与 T22 Knowledge retry/capture adapter 必须在自己的 versioned role adapter 中：
+Codex `0.146.0` 的 `exec --json` 会把 Core 的结构化错误信息投影成只有 `message` 的 `error` / `turn.failed`，因此没有可供 role adapter 稳定区分 `runtime_unavailable`、`rate_limit`、`server_error`、`network` 或上下文不足的 machine discriminator。[ADR 0129](../adr/0129-retry-only-mechanically-classified-codex-timeouts.md) 要求 T14 Literature Reader adapter：
 
 - 只消费已经安装并冻结的 raw capture；
 - 禁止从 stderr、自然语言、exit `130`、`259` 或内部 Job DWORD猜测；
-- 遵守既有 priority/retry 合同；
-- 将未知 nonzero exit 最终映射为 `process_error`。
+- 只把 T13 terminal evidence 已机械证明的 `timeout` 作为可重试 failure class；
+- 不解析 `message`、stderr、自然语言或退出码来猜测 provider 类别；
+- 将已安全收尾的其他 provider terminal、未知 nonzero exit 与事件结构失败最终映射为 `process_error`，且不重试。
 
-因此 T13 terminal evidence 只拥有 raw capture、mechanical outcome、lifecycle facts 与可用的 monotonic anchors，不包含 role usage/metadata receipt。Literature receipt 由 T14 形成；Knowledge 的 provider/usage projection、`null`/`usage_unavailable` 与 retry receipt 由 T22 在已安装 capture 上形成。Issue T13 中的“usage/metadata receipt”交付项由这个显式的 role-owned post-capture seam 满足，而不是把 provider Schema 泄漏进共享 child module。
+因此 T13 terminal evidence 只拥有 raw capture、mechanical outcome、lifecycle facts 与可用的 monotonic anchors，不包含 role usage/metadata receipt。Literature receipt 由 T14 形成；Commitment 前由 resolver、认证或 launch-plan preflight 确认的 runtime failure 仍不创建 attempt，并保留 Reader 的 `codex_runtime_unavailable` blocked 路径。Knowledge 的 provider/usage/retry receipt 仍由 T22 拥有，但其既有 manifest Schema 与 diagnostic union 已单独冻结；T22 必须先以版本化决策解决相同 projection gap，不能从本合同推导 message parsing 或自动继承 Reader 的枚举变更。Issue T13 中的“usage/metadata receipt”交付项由这个显式的 role-owned post-capture seam 满足，而不是把 provider Schema 泄漏进共享 child module。
 
 未来 Bot 不能因复用 invocation/process module 而自动继承任一现有 role 的 provider、usage、retry、capture cap 或领域结果语义。

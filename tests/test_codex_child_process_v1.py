@@ -20,6 +20,8 @@ from gezhi._codex_child_process import (
     CODEX_JOB_STOP_EXIT_DWORD_V1,
     KNOWLEDGE_EVENTS_CAPTURE_CAP_V1,
     KNOWLEDGE_FINAL_CAPTURE_CAP_V1,
+    LITERATURE_EVENTS_CAPTURE_CAP_V1,
+    LITERATURE_FINAL_CAPTURE_CAP_V1,
     CodexChildTestHooksV1,
     CodexChildUnsafeHoldErrorV1,
     CodexChildWin32ErrorV1,
@@ -186,7 +188,11 @@ def _plan(
     )
 
 
-def _production_plan(tmp_path: Path):  # type: ignore[no-untyped-def]
+def _production_plan(
+    tmp_path: Path,
+    *,
+    role: str = "literature_reader_v1",
+):  # type: ignore[no-untyped-def]
     project = tmp_path / "project"
     project.mkdir()
     build_project_codex_runtime_fixture_v1(project)
@@ -202,15 +208,24 @@ def _production_plan(tmp_path: Path):  # type: ignore[no-untyped-def]
     codex_home = tmp_path / "codex-home"
     for path in (literature, knowledge, codex_home):
         path.mkdir()
-    workspace = freeze_codex_attempt_workspace_v1(
-        attempt_root=attempt,
-        attempt_ordinal=1,
-        literature_authoritative_root=literature,
-        knowledge_authoritative_root=knowledge,
+    workspace = (
+        freeze_codex_attempt_workspace_v1(
+            role="literature_reader_v1",
+            attempt_root=attempt,
+            attempt_ordinal=1,
+            literature_authoritative_root=literature,
+        )
+        if role == "literature_reader_v1"
+        else freeze_codex_attempt_workspace_v1(
+            role="knowledge_answerer_v1",
+            attempt_root=attempt,
+            attempt_ordinal=1,
+            knowledge_authoritative_root=knowledge,
+        )
     )
     plan = freeze_codex_role_launch_v1(
         runtime=resolve_codex_runtime_v1(project),
-        role="literature_reader_v1",
+        role=role,
         prompt=b"production-boundary-test",
         attempt_ordinal=1,
         workspace=workspace,
@@ -478,25 +493,71 @@ def test_active_final_overflow_witness_requests_one_job_stop(tmp_path: Path) -> 
     assert evidence.mechanical_outcome == "process_error"
 
 
-def test_literature_does_not_inherit_knowledge_events_cap(tmp_path: Path) -> None:
-    length = KNOWLEDGE_EVENTS_CAPTURE_CAP_V1 + 1
+def test_literature_active_final_overflow_stops_before_its_deadline(
+    tmp_path: Path,
+) -> None:
     plan = _plan(
         tmp_path,
-        "events-bytes",
+        "final-overflow-hang",
+        value=LITERATURE_FINAL_CAPTURE_CAP_V1 + 1,
+        timeout_seconds=10,
+        capture_profile="literature",
+    )
+    started = time.monotonic()
+
+    evidence = run_codex_child_v1(plan, NeverCancelledV1())
+
+    assert time.monotonic() - started < 5
+    assert evidence.final_message is not None
+    assert (
+        evidence.final_message.byte_length
+        == LITERATURE_FINAL_CAPTURE_CAP_V1
+    )
+    assert evidence.final_message.overflow
+    assert evidence.stop_calls == 1
+    assert evidence.mechanical_outcome == "process_error"
+
+
+@pytest.mark.parametrize(
+    ("length", "overflow"),
+    [
+        (LITERATURE_EVENTS_CAPTURE_CAP_V1, False),
+        (LITERATURE_EVENTS_CAPTURE_CAP_V1 + 1, True),
+    ],
+)
+def test_literature_events_overflow_latches_only_on_cap_plus_one(
+    tmp_path: Path,
+    length: int,
+    overflow: bool,
+) -> None:
+    plan = _plan(
+        tmp_path,
+        "events-overflow-hang" if overflow else "events-bytes",
         value=length,
-        timeout_seconds=30,
+        timeout_seconds=5,
         capture_profile="literature",
     )
 
     evidence = run_codex_child_v1(plan, NeverCancelledV1())
 
-    assert evidence.events.byte_length == length
-    assert not evidence.events.overflow
-    assert evidence.mechanical_outcome == "clean"
+    assert evidence.events.byte_length == LITERATURE_EVENTS_CAPTURE_CAP_V1
+    assert evidence.events.overflow is overflow
+    assert evidence.stop_calls == int(overflow)
+    assert evidence.mechanical_outcome == ("process_error" if overflow else "clean")
 
 
-def test_literature_does_not_inherit_knowledge_final_cap(tmp_path: Path) -> None:
-    length = KNOWLEDGE_FINAL_CAPTURE_CAP_V1 + 1
+@pytest.mark.parametrize(
+    ("length", "overflow"),
+    [
+        (LITERATURE_FINAL_CAPTURE_CAP_V1, False),
+        (LITERATURE_FINAL_CAPTURE_CAP_V1 + 1, True),
+    ],
+)
+def test_literature_final_overflow_retains_the_exact_prefix(
+    tmp_path: Path,
+    length: int,
+    overflow: bool,
+) -> None:
     plan = _plan(
         tmp_path,
         "final-bytes",
@@ -507,9 +568,12 @@ def test_literature_does_not_inherit_knowledge_final_cap(tmp_path: Path) -> None
     evidence = run_codex_child_v1(plan, NeverCancelledV1())
 
     assert evidence.final_message is not None
-    assert evidence.final_message.byte_length == length
-    assert not evidence.final_message.overflow
-    assert evidence.mechanical_outcome == "clean"
+    assert (
+        evidence.final_message.byte_length
+        == LITERATURE_FINAL_CAPTURE_CAP_V1
+    )
+    assert evidence.final_message.overflow is overflow
+    assert evidence.mechanical_outcome == ("process_error" if overflow else "clean")
 
 
 def test_stdout_chunk_boundaries_do_not_change_raw_bytes(tmp_path: Path) -> None:
@@ -2026,15 +2090,19 @@ def test_stale_plan_cannot_launch_after_attempt_root_generation_replacement(
 
 
 @pytest.mark.parametrize(
-    "directory_name",
-    ["literature-authoritative", "knowledge-authoritative"],
+    ("role", "directory_name"),
+    [
+        ("literature_reader_v1", "literature-authoritative"),
+        ("knowledge_answerer_v1", "knowledge-authoritative"),
+    ],
 )
 def test_stale_plan_cannot_launch_after_authoritative_root_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    role: str,
     directory_name: str,
 ) -> None:
-    plan, paths = _production_plan(tmp_path)
+    plan, paths = _production_plan(tmp_path, role=role)
     target = paths[directory_name]
     with windows_root.open_validated_data_root_v1(str(target)) as opened:
         old_identity = opened.inspection.identity
@@ -2405,15 +2473,23 @@ def test_precommit_cleanup_refuses_an_unknown_staging_entry(
     assert staging.exists()
 
 
+@pytest.mark.parametrize("capture_profile", ["knowledge", "literature"])
+@pytest.mark.parametrize(
+    "replacement_length",
+    [5, KNOWLEDGE_FINAL_CAPTURE_CAP_V1 + 1],
+)
 def test_final_generation_replacement_after_witness_is_unsafe_hold(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capture_profile: str,
+    replacement_length: int,
 ) -> None:
     plan = _plan(
         tmp_path,
         "final-overflow-hang",
         value=KNOWLEDGE_FINAL_CAPTURE_CAP_V1 + 1,
         timeout_seconds=60,
+        capture_profile=capture_profile,
     )
     real_probe = child_process._active_final_probe
     replaced = False
@@ -2428,7 +2504,7 @@ def test_final_generation_replacement_after_witness_is_unsafe_hold(
         identity = real_probe(path, cap=cap, ledger=ledger)
         if identity is not None and not replaced:
             replacement = Path(path).with_name("replacement.tmp")
-            replacement.write_bytes(b"small")
+            replacement.write_bytes(b"r" * replacement_length)
             deadline = time.monotonic() + 1
             while True:
                 try:

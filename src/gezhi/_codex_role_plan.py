@@ -85,6 +85,7 @@ class CodexRolePlanErrorV1(ValueError):
 
 @dataclass(frozen=True, slots=True, init=False)
 class FrozenCodexAttemptWorkspaceV1:
+    role: CodexRoleV1
     attempt_root: str
     attempt_root_identity: FileIdentity
     working_directory: str
@@ -98,9 +99,9 @@ class FrozenCodexAttemptWorkspaceV1:
     capture_directory: str
     staging_directory: str
     literature_authoritative_root: str
-    literature_authoritative_root_identity: FileIdentity
+    literature_authoritative_root_identity: FileIdentity | None
     knowledge_authoritative_root: str
-    knowledge_authoritative_root_identity: FileIdentity
+    knowledge_authoritative_root_identity: FileIdentity | None
     attempt_ordinal: int
     _workspace_seal: object = field(
         default=None,
@@ -235,14 +236,27 @@ def _require_codex_launch_plan_v1(
             _require_project_codex_runtime_v1(value.runtime)
         except CodexRuntimeResolutionErrorV1 as error:
             raise TypeError("the launch plan runtime proof is invalid") from error
+        role_root_is_valid = (
+            (
+                value.role == "literature_reader_v1"
+                and bool(value.literature_authoritative_root)
+                and value.literature_authoritative_root_identity is not None
+                and not value.knowledge_authoritative_root
+                and value.knowledge_authoritative_root_identity is None
+            )
+            or (
+                value.role == "knowledge_answerer_v1"
+                and bool(value.knowledge_authoritative_root)
+                and value.knowledge_authoritative_root_identity is not None
+                and not value.literature_authoritative_root
+                and value.literature_authoritative_root_identity is None
+            )
+        )
         if (
             not value.attempt_root
             or value.attempt_root_identity is None
             or value.attempt_root_entries != _ATTEMPT_ROOT_ENTRIES_V1
-            or not value.literature_authoritative_root
-            or value.literature_authoritative_root_identity is None
-            or not value.knowledge_authoritative_root
-            or value.knowledge_authoritative_root_identity is None
+            or not role_root_is_valid
         ):
             raise TypeError("the launch plan root proofs are invalid")
     else:
@@ -369,7 +383,11 @@ def _future_private_paths(
     return capture, staging
 
 
-def _source_environment(source: Mapping[str, str]) -> dict[str, str]:
+def validate_codex_source_environment_v1(
+    source: Mapping[str, str],
+) -> dict[str, str]:
+    """Validate every source entry before returning a case-folded index."""
+
     observed: dict[str, tuple[str, str]] = {}
     for name, value in source.items():
         if type(name) is not str or type(value) is not str:
@@ -392,7 +410,7 @@ def _environment_block(
     temporary_directory: str,
     sqlite_home: str,
 ) -> tuple[str, tuple[str, ...]]:
-    indexed = _source_environment(source)
+    indexed = validate_codex_source_environment_v1(source)
     system_root = indexed.get("systemroot")
     if not system_root or "\0" in system_root:
         raise CodexRolePlanErrorV1("SystemRoot is required")
@@ -475,15 +493,38 @@ def _paths_overlap(left: str, right: str) -> bool:
 
 def freeze_codex_attempt_workspace_v1(
     *,
+    role: CodexRoleV1,
     attempt_root: Path,
     attempt_ordinal: int,
-    literature_authoritative_root: Path,
-    knowledge_authoritative_root: Path,
+    literature_authoritative_root: Path | None = None,
+    knowledge_authoritative_root: Path | None = None,
 ) -> FrozenCodexAttemptWorkspaceV1:
-    """Prove one closed, empty attempt namespace outside both data stores."""
+    """Prove one closed attempt namespace outside the role-owned data store."""
 
     if type(attempt_ordinal) is not int or not 1 <= attempt_ordinal <= 999:
         raise CodexRolePlanErrorV1("attempt ordinal is invalid")
+    if role == "literature_reader_v1":
+        if (
+            not isinstance(literature_authoritative_root, Path)
+            or knowledge_authoritative_root is not None
+        ):
+            raise CodexRolePlanErrorV1(
+                "Literature workspace requires only the Literature root"
+            )
+        authoritative_input = literature_authoritative_root
+        authoritative_label = "Literature authoritative root"
+    elif role == "knowledge_answerer_v1":
+        if (
+            not isinstance(knowledge_authoritative_root, Path)
+            or literature_authoritative_root is not None
+        ):
+            raise CodexRolePlanErrorV1(
+                "Knowledge workspace requires only the Knowledge root"
+            )
+        authoritative_input = knowledge_authoritative_root
+        authoritative_label = "Knowledge authoritative root"
+    else:
+        raise CodexRolePlanErrorV1("Codex role is invalid")
     expected_children = _ATTEMPT_ROOT_ENTRIES_V1
     try:
         with open_validated_data_root_v1(str(attempt_root)) as opened:
@@ -519,30 +560,21 @@ def freeze_codex_attempt_workspace_v1(
             )
         child_paths[name] = canonical
         child_identities[name] = identity
-    literature, literature_identity, _literature_entries = (
+    authoritative, authoritative_identity, _authoritative_entries = (
         _canonical_directory_facts(
-        literature_authoritative_root,
-        label="Literature authoritative root",
+            authoritative_input,
+            label=authoritative_label,
         )
     )
-    knowledge, knowledge_identity, _knowledge_entries = (
-        _canonical_directory_facts(
-        knowledge_authoritative_root,
-        label="Knowledge authoritative root",
-        )
-    )
-    if (
-        _paths_overlap(literature, knowledge)
-        or _paths_overlap(canonical_attempt, literature)
-        or _paths_overlap(canonical_attempt, knowledge)
-    ):
+    if _paths_overlap(canonical_attempt, authoritative):
         raise CodexRolePlanErrorV1(
-            "attempt workspace and authoritative roots must be physically isolated"
+            "attempt workspace and authoritative root must be physically isolated"
         )
     capture_parent = child_paths["captures"]
     capture = str(Path(capture_parent) / f"{attempt_ordinal:02d}")
     staging = str(Path(capture_parent) / f".{attempt_ordinal:02d}.codex-stage")
     return _new_codex_attempt_workspace_v1(
+        role=role,
         attempt_root=canonical_attempt,
         attempt_root_identity=attempt_identity,
         working_directory=child_paths["working"],
@@ -555,10 +587,18 @@ def freeze_codex_attempt_workspace_v1(
         capture_parent_identity=child_identities["captures"],
         capture_directory=capture,
         staging_directory=staging,
-        literature_authoritative_root=literature,
-        literature_authoritative_root_identity=literature_identity,
-        knowledge_authoritative_root=knowledge,
-        knowledge_authoritative_root_identity=knowledge_identity,
+        literature_authoritative_root=(
+            authoritative if role == "literature_reader_v1" else ""
+        ),
+        literature_authoritative_root_identity=(
+            authoritative_identity if role == "literature_reader_v1" else None
+        ),
+        knowledge_authoritative_root=(
+            authoritative if role == "knowledge_answerer_v1" else ""
+        ),
+        knowledge_authoritative_root_identity=(
+            authoritative_identity if role == "knowledge_answerer_v1" else None
+        ),
         attempt_ordinal=attempt_ordinal,
     )
 
@@ -601,16 +641,23 @@ def freeze_codex_role_launch_v1(
     if type(attempt_ordinal) is not int or not 1 <= attempt_ordinal <= 999:
         raise CodexRolePlanErrorV1("attempt ordinal is invalid")
     workspace = _require_codex_attempt_workspace_v1(workspace)
+    if workspace.role != role:
+        raise CodexRolePlanErrorV1("workspace role does not match")
     if workspace.attempt_ordinal != attempt_ordinal:
         raise CodexRolePlanErrorV1("workspace attempt ordinal does not match")
     revalidated_workspace = freeze_codex_attempt_workspace_v1(
+        role=workspace.role,
         attempt_root=Path(workspace.attempt_root),
         attempt_ordinal=workspace.attempt_ordinal,
-        literature_authoritative_root=Path(
-            workspace.literature_authoritative_root
+        literature_authoritative_root=(
+            Path(workspace.literature_authoritative_root)
+            if workspace.literature_authoritative_root
+            else None
         ),
-        knowledge_authoritative_root=Path(
-            workspace.knowledge_authoritative_root
+        knowledge_authoritative_root=(
+            Path(workspace.knowledge_authoritative_root)
+            if workspace.knowledge_authoritative_root
+            else None
         ),
     )
     if revalidated_workspace != workspace:
@@ -650,6 +697,7 @@ def freeze_codex_role_launch_v1(
             workspace.literature_authoritative_root,
             workspace.knowledge_authoritative_root,
         )
+        if forbidden
     ):
         raise CodexRolePlanErrorV1(
             "CODEX_HOME must be isolated from project, attempt, and data roots"
@@ -795,7 +843,7 @@ def _freeze_test_double_launch_v1(
         )
     )
     capture, staging = _future_private_paths(capture_directory, staging_directory)
-    indexed = _source_environment(source_environment)
+    indexed = validate_codex_source_environment_v1(source_environment)
     system_root = indexed.get("systemroot")
     if not system_root:
         raise CodexRolePlanErrorV1("SystemRoot is required")
