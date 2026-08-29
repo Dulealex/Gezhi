@@ -63,6 +63,39 @@ def test_work_writer_is_bound_to_root_identity_and_work_id() -> None:
     other_root.close()
 
 
+def test_work_writer_proof_requires_the_exact_live_owner_thread() -> None:
+    lease = try_acquire_work_writer_v1(ROOT_IDENTITY, WORK_ID)
+    assert lease is not None
+    lease.assert_work_ownership_v1(ROOT_IDENTITY, WORK_ID)
+
+    with pytest.raises(WriterOwnershipLifecycleErrorV1):
+        lease.assert_work_ownership_v1((123, 789), WORK_ID)
+    with pytest.raises(WriterOwnershipLifecycleErrorV1):
+        lease.assert_work_ownership_v1(
+            ROOT_IDENTITY,
+            "wrk_223e4567-e89b-42d3-a456-426614174000",
+        )
+
+    observed: queue.Queue[BaseException | None] = queue.Queue()
+
+    def prove_from_wrong_thread() -> None:
+        try:
+            lease.assert_work_ownership_v1(ROOT_IDENTITY, WORK_ID)
+        except BaseException as error:  # noqa: BLE001 - exact lifecycle proof.
+            observed.put(error)
+        else:
+            observed.put(None)
+
+    thread = threading.Thread(target=prove_from_wrong_thread)
+    thread.start()
+    thread.join(timeout=2)
+    assert isinstance(observed.get_nowait(), WriterOwnershipLifecycleErrorV1)
+
+    lease.close()
+    with pytest.raises(WriterOwnershipLifecycleErrorV1):
+        lease.assert_work_ownership_v1(ROOT_IDENTITY, WORK_ID)
+
+
 def test_catalog_projection_has_a_distinct_root_bound_scope() -> None:
     lease = try_acquire_catalog_projection_v1(ROOT_IDENTITY)
     assert lease is not None

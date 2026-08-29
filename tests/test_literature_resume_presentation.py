@@ -117,9 +117,7 @@ def test_resume_stage_matrix_has_13_blocked_and_25_failed_sealed_witnesses() -> 
     )
     for outcome, code, matrix, expected_count in matrices:
         pairs = [
-            (stage, reason)
-            for stage, reasons in matrix.items()
-            for reason in reasons
+            (stage, reason) for stage, reasons in matrix.items() for reason in reasons
         ]
         assert len(pairs) == expected_count
         for stage, reason in pairs:
@@ -132,9 +130,7 @@ def test_resume_stage_matrix_has_13_blocked_and_25_failed_sealed_witnesses() -> 
             result = _stage_result(
                 stage,
                 start_stage=(
-                    "review"
-                    if stage in {"handoff", "knowledge_import"}
-                    else stage
+                    "review" if stage in {"handoff", "knowledge_import"} else stage
                 ),
                 pending_candidate_ids=pending,
             )
@@ -273,37 +269,93 @@ def test_resume_stage_receipt_rejects_cross_field_contradictions(
 
 
 @pytest.mark.parametrize(
+    ("stage", "reason"),
+    [
+        ("handoff", "handoff_blocked"),
+        ("knowledge_import", "import_blocked"),
+    ],
+)
+def test_backlog_only_stop_accepts_empty_pending_and_actual_start_stage(
+    stage: str,
+    reason: str,
+) -> None:
+    result = _stage_result(
+        stage,
+        start_stage=stage,
+        pending_candidate_ids=[],
+    )
+    receipt = ResumeReceiptV1(
+        outcome="blocked",
+        result=result,
+        diagnostic={
+            "code": "literature.resume.stage_blocked.v1",
+            "context": {"reason": reason, "stage": stage},
+        },
+    )
+
+    assert json.loads(build_resume_json_buffer_v1(receipt))["result"] == result
+
+
+def test_awaiting_review_can_follow_a_review_repair_and_authorized_backlog() -> None:
+    result = _stage_result(
+        "review",
+        advanced_stages=["review", "handoff", "knowledge_import"],
+        pending_candidate_ids=[CANDIDATE_ID],
+    )
+    receipt = ResumeReceiptV1(
+        outcome="blocked",
+        result=result,
+        diagnostic={
+            "code": "literature.resume.stage_blocked.v1",
+            "context": {"reason": "awaiting_review", "stage": "review"},
+        },
+    )
+
+    assert json.loads(build_resume_json_buffer_v1(receipt))["result"] == result
+
+
+def test_review_failure_can_preserve_other_proven_pending_candidates() -> None:
+    result = _stage_result(
+        "review",
+        pending_candidate_ids=[CANDIDATE_ID],
+    )
+    receipt = ResumeReceiptV1(
+        outcome="failed",
+        result=result,
+        diagnostic={
+            "code": "literature.resume.stage_failed.v1",
+            "context": {
+                "reason": "review_state_invalid",
+                "stage": "review",
+            },
+        },
+    )
+
+    assert json.loads(build_resume_json_buffer_v1(receipt))["result"] == result
+
+
+@pytest.mark.parametrize(
     ("stage", "reason", "result_patch"),
     [
         (
             "handoff",
             "handoff_blocked",
-            {"start_stage": "review", "pending_candidate_ids": []},
-        ),
-        (
-            "handoff",
-            "handoff_blocked",
             {
-                "start_stage": "handoff",
-                "pending_candidate_ids": [CANDIDATE_ID],
+                "start_stage": "knowledge_import",
+                "pending_candidate_ids": [],
             },
         ),
         (
             "knowledge_import",
             "import_blocked",
-            {"start_stage": "review", "pending_candidate_ids": []},
-        ),
-        (
-            "knowledge_import",
-            "import_blocked",
             {
-                "start_stage": "knowledge_import",
-                "pending_candidate_ids": [CANDIDATE_ID],
+                "advanced_stages": ["knowledge_import"],
+                "pending_candidate_ids": [],
             },
         ),
     ],
 )
-def test_retained_backlog_stage_requires_review_origin_and_pending_witness(
+def test_backlog_stop_rejects_impossible_progress(
     stage: str,
     reason: str,
     result_patch: dict[str, object],

@@ -35,7 +35,7 @@ from gezhi._windows_data_root import (
     ValidatedDataRootV1,
     open_validated_data_root_v1,
 )
-from gezhi._windows_ownership import try_acquire_work_writer_v1
+from gezhi._windows_ownership import WriterOwnershipV1, try_acquire_work_writer_v1
 
 _WORK_ID = re.compile(
     r"^wrk_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
@@ -62,6 +62,20 @@ ReviewActionV1: TypeAlias = Literal["accept", "reject", "defer"]
 ReviewStatusV1: TypeAlias = Literal["accepted", "rejected", "deferred"]
 HandoffActionV1: TypeAlias = Literal["accept", "withdraw", "none"]
 IntakeStatusV1: TypeAlias = Literal["active", "withdrawn"]
+IntakeBlockedReasonV1: TypeAlias = Literal[
+    "data_root_unsafe",
+    "data_root_unavailable",
+    "registry_unavailable",
+    "registry_busy",
+    "import_blocked",
+]
+IntakeFailedReasonV1: TypeAlias = Literal[
+    "data_root_integrity_lost",
+    "revision_conflict",
+    "registry_conflict",
+    "commit_failed",
+    "import_failed",
+]
 ReviewBlockedReasonV1: TypeAlias = Literal[
     "candidate_invalid",
     "candidate_not_found",
@@ -163,13 +177,13 @@ class IntakeAppliedV1:
 
 @dataclass(frozen=True, slots=True)
 class IntakeBlockedV1:
-    reason: str
+    reason: IntakeBlockedReasonV1
     data_root: DataRootKindV1 | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class IntakeFailedV1:
-    reason: str
+    reason: IntakeFailedReasonV1
     data_root: DataRootKindV1 | None = None
 
 
@@ -178,6 +192,43 @@ KnowledgeIntakeVerdictV1: TypeAlias = IntakeAppliedV1 | IntakeBlockedV1 | Intake
 
 class KnowledgeIntakeV1(Protocol):
     def apply(self, handoff: ReviewedHandoffBytesV1) -> KnowledgeIntakeVerdictV1: ...
+
+
+WorkReviewStageV1: TypeAlias = Literal["review", "handoff", "knowledge_import"]
+WorkReviewBlockedReasonV1: TypeAlias = Literal[
+    "data_root_unsafe",
+    "data_root_unavailable",
+    "handoff_blocked",
+    "registry_unavailable",
+    "registry_busy",
+    "import_blocked",
+]
+WorkReviewFailedReasonV1: TypeAlias = Literal[
+    "data_root_integrity_lost",
+    "review_state_invalid",
+    "asset_integrity_lost",
+    "commit_failed",
+    "revision_conflict",
+    "registry_conflict",
+    "handoff_failed",
+    "import_failed",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkReviewStopV1:
+    outcome: Literal["blocked", "failed"]
+    stage: WorkReviewStageV1
+    reason: WorkReviewBlockedReasonV1 | WorkReviewFailedReasonV1
+    data_root: DataRootKindV1 | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkReviewContinuationV1:
+    pending_candidate_ids: tuple[str, ...]
+    advanced_stages: tuple[WorkReviewStageV1, ...]
+    start_stage: WorkReviewStageV1 | Literal["complete"]
+    stop: WorkReviewStopV1 | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -851,6 +902,20 @@ class _ImportAttemptV1:
     @property
     def revision(self) -> int:
         return self.decision.revision
+
+
+@dataclass(frozen=True, slots=True)
+class _ImportContinuationBlockedV1:
+    reason: IntakeBlockedReasonV1
+    data_root: DataRootKindV1 | None
+    progress: ReviewProgressV1
+
+
+@dataclass(frozen=True, slots=True)
+class _ImportContinuationFailedV1:
+    reason: IntakeFailedReasonV1
+    data_root: DataRootKindV1 | None
+    progress: ReviewProgressV1
 
 
 def _utc_now_v1() -> str:
@@ -1957,19 +2022,22 @@ def _review_authority_snapshot(
     candidate: _CandidateAuthorityV1,
     *,
     root: ValidatedDataRootV1,
+    repair_missing_current: bool = True,
 ) -> tuple[
     Path,
     Path,
     tuple[_DecisionV1, ...],
+    frozenset[int],
     tuple[_ImportAttemptV1, ...],
     tuple[_ImportReceiptV1, ...],
+    bool,
 ]:
     reviews = candidate.source.work_directory / "reviews"
     _ensure_review_directory(reviews)
     _ensure_review_directory(reviews / ".staging")
     candidate_directory = reviews / candidate.candidate_id
     _ensure_review_directory(candidate_directory)
-    decisions, repair_current = _load_decision_history(
+    decisions, current_repair_required = _load_decision_history(
         candidate_directory,
         candidate,
     )
@@ -2006,9 +2074,15 @@ def _review_authority_snapshot(
     unresolved = [
         attempt for attempt in attempts if attempt.revision not in imported_revisions
     ]
-    if len(unresolved) > 1 or (unresolved and unresolved[0].revision != len(decisions)):
+    if len(unresolved) > 1:
         raise _ReviewStateInvalidV1("Review import attempt recovery is ambiguous")
-    if repair_current:
+    if unresolved and unresolved[0].revision != len(decisions):
+        historical = unresolved[0]
+        if historical.action != "withdraw" or any(
+            receipt.revision > historical.revision for receipt in imports
+        ):
+            raise _ReviewStateInvalidV1("Review import attempt recovery is ambiguous")
+    if current_repair_required and repair_missing_current:
         try:
             _replace_review_current(
                 candidate_directory,
@@ -2021,7 +2095,15 @@ def _review_authority_snapshot(
                 decisions[-1],
                 previously_imported=bool(accepted_import_revisions),
             ) from error
-    return reviews, candidate_directory, decisions, attempts, imports
+    return (
+        reviews,
+        candidate_directory,
+        decisions,
+        no_actions,
+        attempts,
+        imports,
+        current_repair_required,
+    )
 
 
 def _publish_import_attempt(
@@ -2130,7 +2212,7 @@ def _continue_import_attempt(
     *,
     root: ValidatedDataRootV1,
     knowledge_intake: KnowledgeIntakeV1 | None,
-) -> _ImportReceiptV1 | ReviewBlockedV1 | ReviewFailedV1:
+) -> _ImportReceiptV1 | _ImportContinuationBlockedV1 | _ImportContinuationFailedV1:
     committed = _progress(
         candidate,
         attempt.decision,
@@ -2142,7 +2224,7 @@ def _continue_import_attempt(
         intake_status=None,
     )
     if knowledge_intake is None:
-        return ReviewBlockedV1(ReviewCauseV1("import_blocked"), committed)
+        return _ImportContinuationBlockedV1("import_blocked", None, committed)
     try:
         intake_verdict = knowledge_intake.apply(attempt.handoff)
     except Exception as error:
@@ -2150,28 +2232,55 @@ def _continue_import_attempt(
             "KnowledgeIntake completion is uncertain"
         ) from error
     if type(intake_verdict) is IntakeBlockedV1:
+        if intake_verdict.reason not in {
+            "data_root_unsafe",
+            "data_root_unavailable",
+            "registry_unavailable",
+            "registry_busy",
+            "import_blocked",
+        }:
+            raise ReviewIndeterminateV1(
+                "KnowledgeIntake returned an unknown blocked reason"
+            )
         if intake_verdict.reason in {"data_root_unsafe", "data_root_unavailable"}:
             if intake_verdict.data_root != "knowledge":
                 raise ReviewIndeterminateV1(
                     "KnowledgeIntake returned an invalid Data Root block"
                 )
-            reason = cast(ReviewBlockedReasonV1, intake_verdict.reason)
-            return ReviewBlockedV1(
-                ReviewCauseV1(reason, "knowledge"),
-                committed,
+        elif intake_verdict.data_root is not None:
+            raise ReviewIndeterminateV1(
+                "KnowledgeIntake returned a spurious Data Root block"
             )
-        return ReviewBlockedV1(ReviewCauseV1("import_blocked"), committed)
+        return _ImportContinuationBlockedV1(
+            cast(IntakeBlockedReasonV1, intake_verdict.reason),
+            intake_verdict.data_root,
+            committed,
+        )
     if type(intake_verdict) is IntakeFailedV1:
+        if intake_verdict.reason not in {
+            "data_root_integrity_lost",
+            "revision_conflict",
+            "registry_conflict",
+            "commit_failed",
+            "import_failed",
+        }:
+            raise ReviewIndeterminateV1(
+                "KnowledgeIntake returned an unknown failed reason"
+            )
         if intake_verdict.reason == "data_root_integrity_lost":
             if intake_verdict.data_root != "knowledge":
                 raise ReviewIndeterminateV1(
                     "KnowledgeIntake returned an invalid Data Root failure"
                 )
-            return ReviewFailedV1(
-                ReviewCauseV1("data_root_integrity_lost", "knowledge"),
-                committed,
+        elif intake_verdict.data_root is not None:
+            raise ReviewIndeterminateV1(
+                "KnowledgeIntake returned a spurious Data Root failure"
             )
-        return ReviewFailedV1(ReviewCauseV1("import_failed"), committed)
+        return _ImportContinuationFailedV1(
+            cast(IntakeFailedReasonV1, intake_verdict.reason),
+            intake_verdict.data_root,
+            committed,
+        )
     if type(intake_verdict) is not IntakeAppliedV1:
         raise ReviewIndeterminateV1("KnowledgeIntake returned an unknown verdict")
     expected_status: IntakeStatusV1 = (
@@ -2200,6 +2309,1147 @@ def _continue_import_attempt(
         intake_status=intake_verdict.intake_status,
         revision=attempt.revision,
     )
+
+
+def _review_import_stop(
+    stopped: _ImportContinuationBlockedV1 | _ImportContinuationFailedV1,
+) -> ReviewBlockedV1 | ReviewFailedV1:
+    """Project the closed Knowledge verdict onto the public review union."""
+
+    if type(stopped) is _ImportContinuationBlockedV1:
+        if stopped.data_root is not None:
+            blocked_reason = cast(ReviewBlockedReasonV1, stopped.reason)
+            return ReviewBlockedV1(
+                ReviewCauseV1(blocked_reason, stopped.data_root),
+                stopped.progress,
+            )
+        return ReviewBlockedV1(
+            ReviewCauseV1("import_blocked"),
+            stopped.progress,
+        )
+    if type(stopped) is _ImportContinuationFailedV1:
+        if stopped.data_root is not None:
+            failed_reason = cast(ReviewFailedReasonV1, stopped.reason)
+            return ReviewFailedV1(
+                ReviewCauseV1(failed_reason, stopped.data_root),
+                stopped.progress,
+            )
+        return ReviewFailedV1(
+            ReviewCauseV1("import_failed"),
+            stopped.progress,
+        )
+    raise ReviewIndeterminateV1("Import continuation returned an invalid stop")
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkCandidateReviewV1:
+    candidate: _CandidateAuthorityV1
+    candidate_directory: Path
+    decisions: tuple[_DecisionV1, ...]
+    no_actions: frozenset[int]
+    attempts: tuple[_ImportAttemptV1, ...]
+    imports: tuple[_ImportReceiptV1, ...]
+    current_repair_required: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkDecisionObligationV1:
+    item: _WorkCandidateReviewV1
+    decision: _DecisionV1
+    action: Literal["accept", "withdraw", "none"]
+    handoff_required: bool
+    import_required: bool
+    no_action_required: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkReviewPlanV1:
+    snapshots: tuple[_WorkCandidateReviewV1, ...]
+    pending_candidate_ids: tuple[str, ...]
+    obligations: tuple[_WorkDecisionObligationV1, ...]
+    start_stage: WorkReviewStageV1 | Literal["complete"]
+    stop: WorkReviewStopV1 | None
+
+
+class _WorkStageFailureV1(RuntimeError):
+    def __init__(
+        self,
+        stage: WorkReviewStageV1,
+        reason: WorkReviewFailedReasonV1,
+    ) -> None:
+        super().__init__(f"Work review continuation failed at {stage}: {reason}")
+        self.stage = stage
+        self.reason = reason
+
+
+def _require_recoverable_review_staging_target(
+    target: Path,
+    payload: bytes,
+    *,
+    allow_missing: bool,
+) -> None:
+    state = _inspect_exact_file(target, payload)
+    if state == "exact" or (state == "missing" and allow_missing):
+        return
+    raise ReviewIndeterminateV1("Work Review staging target is not safely recoverable")
+
+
+def _validate_work_review_staged_file(
+    path: Path,
+    name: str,
+    *,
+    items: dict[str, _WorkCandidateReviewV1],
+    obligations: dict[tuple[str, int], _WorkDecisionObligationV1],
+) -> None:
+    document, payload = _read_review_file(path)
+    candidate_id = document.get("candidate_id")
+    revision = document.get("review_revision")
+    if type(candidate_id) is not str or type(revision) is not int or revision < 1:
+        raise ReviewIndeterminateV1("Work Review staging file identity is invalid")
+    item = items.get(candidate_id)
+    if item is None or revision > len(item.decisions):
+        raise ReviewIndeterminateV1(
+            "Work Review staging file is not bound to authority"
+        )
+    decision = item.decisions[revision - 1]
+    obligation = obligations.get((candidate_id, revision))
+    schema = document.get("schema_version")
+    target: Path | None = None
+    allow_missing_target = False
+    expected_name: str
+    expected_payload: bytes
+    target_payload: bytes | None = None
+    if schema == "gezhi.review_decision.v1":
+        expected_name = (
+            rf"{re.escape(candidate_id)}\.{revision}\."
+            r"[0-9a-f]{32}\.json"
+        )
+        staged_decision = _decision_from_file(
+            path,
+            candidate=item.candidate,
+            expected_revision=revision,
+        )
+        expected_payload = staged_decision.payload
+        target_payload = decision.payload
+        target = item.candidate_directory / f"{revision}.json"
+    elif schema == "gezhi.review_decision_current.v1":
+        expected_name = (
+            rf"{re.escape(candidate_id)}\.current\."
+            r"[0-9a-f]{32}\.tmp"
+        )
+        expected_payload = _canonical_file_bytes(
+            _current_document(item.candidate, decision)
+        )
+    elif schema == "gezhi.review_no_action_receipt.v1":
+        expected_name = (
+            rf"no_actions\.{revision}\.json\."
+            r"[0-9a-f]{32}\.tmp"
+        )
+        expected_payload = _canonical_file_bytes(
+            _no_action_document(item.candidate, decision)
+        )
+        target = item.candidate_directory / "no_actions" / f"{revision}.json"
+        allow_missing_target = obligation is not None and obligation.no_action_required
+    elif schema == "gezhi.review_import_attempt.v1":
+        expected_name = (
+            rf"import_attempts\.{revision}\.json\."
+            r"[0-9a-f]{32}\.tmp"
+        )
+        attempt = next(
+            (
+                candidate_attempt
+                for candidate_attempt in item.attempts
+                if candidate_attempt.revision == revision
+            ),
+            None,
+        )
+        if attempt is None:
+            if (
+                obligation is None
+                or not obligation.import_required
+                or obligation.action == "none"
+            ):
+                raise ReviewIndeterminateV1("Staged import attempt is not authorized")
+            attempt = _import_binding(item.candidate, decision)
+            if attempt.action != obligation.action:
+                raise ReviewIndeterminateV1("Staged import attempt action is invalid")
+        expected_payload = _canonical_file_bytes(
+            _import_attempt_document(item.candidate, attempt)
+        )
+        target = item.candidate_directory / "import_attempts" / f"{revision}.json"
+        allow_missing_target = obligation is not None and obligation.import_required
+    elif schema == "gezhi.review_import_receipt.v1":
+        expected_name = (
+            rf"imports\.{revision}\.json\."
+            r"[0-9a-f]{32}\.tmp"
+        )
+        attempt = next(
+            (
+                candidate_attempt
+                for candidate_attempt in item.attempts
+                if candidate_attempt.revision == revision
+            ),
+            None,
+        )
+        if attempt is None:
+            raise ReviewIndeterminateV1("Staged import receipt attempt is missing")
+        intake_status: IntakeStatusV1 = (
+            "active" if attempt.action == "accept" else "withdrawn"
+        )
+        expected_payload = _canonical_file_bytes(
+            _import_receipt_document(
+                item.candidate,
+                attempt,
+                intake_status,
+            )
+        )
+        target = item.candidate_directory / "imports" / f"{revision}.json"
+        allow_missing_target = obligation is not None and obligation.import_required
+    else:
+        raise ReviewIndeterminateV1("Work Review staging file schema is invalid")
+    if target_payload is None:
+        target_payload = expected_payload
+    if (
+        re.fullmatch(expected_name, name, re.ASCII) is None
+        or payload != expected_payload
+    ):
+        raise ReviewIndeterminateV1("Work Review staging file differs from authority")
+    if target is not None:
+        _require_recoverable_review_staging_target(
+            target,
+            target_payload,
+            allow_missing=allow_missing_target,
+        )
+
+
+def _validate_work_review_staging(
+    authority: ActiveSourceAuthorityV1,
+    snapshots: tuple[_WorkCandidateReviewV1, ...],
+    obligations: tuple[_WorkDecisionObligationV1, ...],
+) -> None:
+    reviews = authority.work_directory / "reviews"
+    try:
+        if not _optional_authority_directory(
+            reviews,
+            label="Work Review directory",
+        ):
+            return
+        staging = reviews / ".staging"
+        if not _optional_authority_directory(
+            staging,
+            label="Work Review staging directory",
+        ):
+            return
+        names = _review_authority_entry_names(
+            staging,
+            label="Work Review staging inventory",
+        )
+        if any(name != ".files" for name in names):
+            raise ReviewIndeterminateV1(
+                "Work Review staging contains quarantined authority"
+            )
+        if ".files" not in names:
+            return
+        files = staging / ".files"
+        if not _optional_authority_directory(
+            files,
+            label="Work Review staging files directory",
+        ):
+            raise ReviewIndeterminateV1(
+                "Work Review staging files directory disappeared"
+            )
+        items = {item.candidate.candidate_id: item for item in snapshots}
+        obligations_by_revision = {
+            (
+                obligation.item.candidate.candidate_id,
+                obligation.decision.revision,
+            ): obligation
+            for obligation in obligations
+        }
+        for name in _review_authority_entry_names(
+            files,
+            label="Work Review staging files inventory",
+        ):
+            _validate_work_review_staged_file(
+                files / name,
+                name,
+                items=items,
+                obligations=obligations_by_revision,
+            )
+    except _ReviewStateInvalidV1 as error:
+        raise ReviewIndeterminateV1(
+            "Work Review staging authority is invalid"
+        ) from error
+
+
+def _work_review_candidate_ids(
+    authority: ActiveSourceAuthorityV1,
+) -> tuple[str, ...]:
+    reviews = authority.work_directory / "reviews"
+    if not _optional_authority_directory(reviews, label="Work Review directory"):
+        return ()
+    candidate_ids: list[str] = []
+    for name in _review_authority_entry_names(
+        reviews,
+        label="Work Review inventory",
+    ):
+        if name == ".staging":
+            if not _optional_authority_directory(
+                reviews / name,
+                label="Work Review staging directory",
+            ):
+                raise ReviewIndeterminateV1("Work Review staging directory disappeared")
+            continue
+        if _CANDIDATE_ID.fullmatch(name) is None:
+            raise _ReviewStateInvalidV1(
+                "Work Review namespace contains a foreign entry"
+            )
+        if not _optional_authority_directory(
+            reviews / name,
+            label="Work Candidate Review directory",
+        ):
+            raise ReviewIndeterminateV1("Work Candidate Review directory disappeared")
+        candidate_ids.append(name)
+    candidate_ids.sort(key=lambda value: value.encode("ascii"))
+    return tuple(candidate_ids)
+
+
+def _work_review_progress(
+    *,
+    pending_candidate_ids: tuple[str, ...],
+    advanced: set[WorkReviewStageV1],
+    start_stage: WorkReviewStageV1 | Literal["complete"],
+) -> WorkReviewContinuationV1:
+    ordered = tuple(
+        stage
+        for stage in ("review", "handoff", "knowledge_import")
+        if stage in advanced
+    )
+    return WorkReviewContinuationV1(
+        pending_candidate_ids=pending_candidate_ids,
+        advanced_stages=cast(tuple[WorkReviewStageV1, ...], ordered),
+        start_stage=start_stage,
+        stop=None,
+    )
+
+
+def _work_review_stopped(
+    *,
+    outcome: Literal["blocked", "failed"],
+    stage: WorkReviewStageV1,
+    reason: WorkReviewBlockedReasonV1 | WorkReviewFailedReasonV1,
+    pending_candidate_ids: tuple[str, ...],
+    advanced: set[WorkReviewStageV1],
+    start_stage: WorkReviewStageV1 | Literal["complete"],
+    data_root: DataRootKindV1 | None = None,
+) -> WorkReviewContinuationV1:
+    progress = _work_review_progress(
+        pending_candidate_ids=pending_candidate_ids,
+        advanced=advanced,
+        start_stage=start_stage,
+    )
+    return WorkReviewContinuationV1(
+        pending_candidate_ids=progress.pending_candidate_ids,
+        advanced_stages=progress.advanced_stages,
+        start_stage=progress.start_stage,
+        stop=WorkReviewStopV1(
+            outcome=outcome,
+            stage=stage,
+            reason=reason,
+            data_root=data_root,
+        ),
+    )
+
+
+def _work_handoff_state(
+    item: _WorkCandidateReviewV1,
+    decision: _DecisionV1,
+    action: Literal["accept", "withdraw"],
+) -> Literal["exact", "missing"]:
+    handoff_id, expected = _handoff_bytes(item.candidate, decision, action)
+    handoffs = item.candidate.source.work_directory / "handoffs"
+    formal_state = _inspect_handoff_directory(handoffs / handoff_id, expected)
+    if formal_state == "unknown":
+        raise ReviewIndeterminateV1("Formal Handoff availability is uncertain")
+    if formal_state == "different":
+        raise _WorkStageFailureV1("handoff", "asset_integrity_lost")
+    if formal_state == "exact":
+        return "exact"
+    staged_state = _inspect_handoff_directory(
+        handoffs / ".staging" / handoff_id,
+        expected,
+    )
+    if staged_state == "unknown":
+        raise ReviewIndeterminateV1("Staged Handoff availability is uncertain")
+    if staged_state == "different":
+        raise _WorkStageFailureV1("handoff", "asset_integrity_lost")
+    return "missing"
+
+
+def _expected_work_handoffs(
+    snapshots: tuple[_WorkCandidateReviewV1, ...],
+) -> dict[str, ReviewedHandoffBytesV1]:
+    expected: dict[str, ReviewedHandoffBytesV1] = {}
+    for item in snapshots:
+        for decision in item.decisions:
+            action: Literal["accept", "withdraw"] | None
+            if decision.status == "accepted":
+                action = "accept"
+            elif any(
+                receipt.action == "accept" and receipt.revision < decision.revision
+                for receipt in item.imports
+            ):
+                action = "withdraw"
+            else:
+                action = None
+            if action is None:
+                continue
+            handoff_id, handoff = _handoff_bytes(
+                item.candidate,
+                decision,
+                action,
+            )
+            prior = expected.get(handoff_id)
+            if prior is not None and prior != handoff:
+                raise _WorkStageFailureV1("handoff", "asset_integrity_lost")
+            expected[handoff_id] = handoff
+    return expected
+
+
+def _validate_work_handoff_authority(
+    authority: ActiveSourceAuthorityV1,
+    snapshots: tuple[_WorkCandidateReviewV1, ...],
+) -> None:
+    handoffs = authority.work_directory / "handoffs"
+    try:
+        if not _optional_authority_directory(
+            handoffs,
+            label="Work Handoff directory",
+        ):
+            return
+        expected = _expected_work_handoffs(snapshots)
+        names = _review_authority_entry_names(
+            handoffs,
+            label="Work Handoff inventory",
+        )
+        for name in names:
+            if name == ".staging":
+                continue
+            handoff = expected.get(name)
+            if _HANDOFF_ID.fullmatch(name) is None or handoff is None:
+                raise _WorkStageFailureV1("handoff", "asset_integrity_lost")
+            formal_state = _inspect_handoff_directory(handoffs / name, handoff)
+            if formal_state == "unknown" or formal_state == "missing":
+                raise ReviewIndeterminateV1("Formal Handoff availability is uncertain")
+            if formal_state == "different":
+                raise _WorkStageFailureV1("handoff", "asset_integrity_lost")
+        staging = handoffs / ".staging"
+        if not _optional_authority_directory(
+            staging,
+            label="Work Handoff staging directory",
+        ):
+            return
+        staging_names = _review_authority_entry_names(
+            staging,
+            label="Work Handoff staging inventory",
+        )
+        for name in staging_names:
+            if name == ".files":
+                files = staging / name
+                if not _optional_authority_directory(
+                    files,
+                    label="Work Handoff staging files directory",
+                ):
+                    raise ReviewIndeterminateV1(
+                        "Work Handoff staging files directory disappeared"
+                    )
+                if _review_authority_entry_names(
+                    files,
+                    label="Work Handoff staging files inventory",
+                ):
+                    raise _WorkStageFailureV1(
+                        "handoff",
+                        "asset_integrity_lost",
+                    )
+                continue
+            handoff = expected.get(name)
+            if _HANDOFF_ID.fullmatch(name) is None or handoff is None:
+                raise _WorkStageFailureV1("handoff", "asset_integrity_lost")
+            staged_state = _inspect_handoff_directory(staging / name, handoff)
+            if staged_state == "unknown" or staged_state == "missing":
+                raise ReviewIndeterminateV1("Staged Handoff availability is uncertain")
+            if staged_state == "different":
+                raise _WorkStageFailureV1("handoff", "asset_integrity_lost")
+            formal_state = _inspect_handoff_directory(handoffs / name, handoff)
+            if formal_state == "unknown":
+                raise ReviewIndeterminateV1("Formal Handoff availability is uncertain")
+            if formal_state != "missing":
+                raise _WorkStageFailureV1("handoff", "asset_integrity_lost")
+    except _ReviewStateInvalidV1 as error:
+        raise _WorkStageFailureV1(
+            "handoff",
+            "asset_integrity_lost",
+        ) from error
+
+
+def _work_decision_obligations(
+    item: _WorkCandidateReviewV1,
+) -> tuple[_WorkDecisionObligationV1, ...]:
+    receipts_by_revision = {receipt.revision: receipt for receipt in item.imports}
+    obligations: list[_WorkDecisionObligationV1] = []
+    for decision in item.decisions:
+        if decision.revision in receipts_by_revision:
+            continue
+        previously_imported = any(
+            receipt.action == "accept" and receipt.revision < decision.revision
+            for receipt in item.imports
+        )
+        action: Literal["accept", "withdraw", "none"]
+        if decision.status == "accepted":
+            action = "accept"
+        elif previously_imported:
+            action = "withdraw"
+        else:
+            action = "none"
+        if action == "none":
+            if decision.revision not in item.no_actions:
+                obligations.append(
+                    _WorkDecisionObligationV1(
+                        item=item,
+                        decision=decision,
+                        action="none",
+                        handoff_required=True,
+                        import_required=False,
+                        no_action_required=True,
+                    )
+                )
+            continue
+
+        import_required = action == "withdraw" or decision.revision == len(
+            item.decisions
+        )
+        if import_required and any(
+            receipt.revision > decision.revision for receipt in item.imports
+        ):
+            raise _WorkStageFailureV1(
+                "knowledge_import",
+                "revision_conflict",
+            )
+        handoff_state = _work_handoff_state(item, decision, action)
+        handoff_required = handoff_state == "missing"
+        if handoff_required or import_required:
+            obligations.append(
+                _WorkDecisionObligationV1(
+                    item=item,
+                    decision=decision,
+                    action=action,
+                    handoff_required=handoff_required,
+                    import_required=import_required,
+                    no_action_required=False,
+                )
+            )
+    return tuple(obligations)
+
+
+def _build_work_review_plan_v1(
+    authority: ActiveSourceAuthorityV1,
+    current_candidate_ids: tuple[str, ...],
+    *,
+    root: ValidatedDataRootV1,
+) -> _WorkReviewPlanV1:
+    review_candidate_ids = _work_review_candidate_ids(authority)
+    review_candidate_set = set(review_candidate_ids)
+    current_candidate_set = set(current_candidate_ids)
+    all_candidate_ids = sorted(
+        current_candidate_set | review_candidate_set,
+        key=lambda value: value.encode("ascii"),
+    )
+    snapshot_map: dict[str, _WorkCandidateReviewV1] = {}
+    deterministic_failures: list[tuple[WorkReviewFailedReasonV1, str]] = []
+    invalid_candidate_ids: set[str] = set()
+    for candidate_id in all_candidate_ids:
+        try:
+            candidate = _find_candidate_authority_v1(candidate_id, root=root)
+            if candidate.source.work_id != authority.work_id:
+                raise _CandidateIntegrityLostV1(
+                    "Review Candidate belongs to a different Work"
+                )
+            if candidate_id in current_candidate_set and (
+                candidate.source.source_id != authority.source_id
+                or not candidate.is_current_materialization
+            ):
+                raise _CandidateIntegrityLostV1(
+                    "Current Candidate is not bound to the Active Source"
+                )
+            if candidate_id not in review_candidate_set:
+                continue
+            (
+                _reviews,
+                candidate_directory,
+                decisions,
+                no_actions,
+                attempts,
+                imports,
+                current_repair_required,
+            ) = _review_authority_snapshot(
+                candidate,
+                root=root,
+                repair_missing_current=False,
+            )
+            snapshot_map[candidate_id] = _WorkCandidateReviewV1(
+                candidate=candidate,
+                candidate_directory=candidate_directory,
+                decisions=decisions,
+                no_actions=no_actions,
+                attempts=attempts,
+                imports=imports,
+                current_repair_required=current_repair_required,
+            )
+        except (_CandidateNotFoundV1, _CandidateIntegrityLostV1):
+            deterministic_failures.append(("asset_integrity_lost", candidate_id))
+            invalid_candidate_ids.add(candidate_id)
+        except _ReviewStateInvalidV1:
+            deterministic_failures.append(("review_state_invalid", candidate_id))
+            invalid_candidate_ids.add(candidate_id)
+        except _ReviewCommitFailedV1:
+            deterministic_failures.append(("commit_failed", candidate_id))
+            invalid_candidate_ids.add(candidate_id)
+        except _DataRootIntegrityLostV1:
+            return _WorkReviewPlanV1(
+                snapshots=(),
+                pending_candidate_ids=(),
+                obligations=(),
+                start_stage="review",
+                stop=WorkReviewStopV1(
+                    outcome="failed",
+                    stage="review",
+                    reason="data_root_integrity_lost",
+                    data_root="literature",
+                ),
+            )
+
+    pending_candidate_ids = tuple(
+        candidate_id
+        for candidate_id in current_candidate_ids
+        if candidate_id not in invalid_candidate_ids
+        and (
+            candidate_id not in review_candidate_set
+            or not snapshot_map[candidate_id].decisions
+        )
+    )
+    snapshots = tuple(snapshot_map.values())
+    if deterministic_failures:
+        reason, _candidate_id = min(
+            deterministic_failures,
+            key=lambda failure: (
+                (
+                    "review_state_invalid",
+                    "asset_integrity_lost",
+                    "commit_failed",
+                ).index(failure[0]),
+                failure[1].encode("ascii"),
+            ),
+        )
+        return _WorkReviewPlanV1(
+            snapshots=snapshots,
+            pending_candidate_ids=pending_candidate_ids,
+            obligations=(),
+            start_stage="review",
+            stop=WorkReviewStopV1(
+                outcome="failed",
+                stage="review",
+                reason=reason,
+            ),
+        )
+
+    obligations: list[_WorkDecisionObligationV1] = []
+    obligation_failures: list[tuple[str, _WorkStageFailureV1]] = []
+    for item in snapshots:
+        try:
+            obligations.extend(_work_decision_obligations(item))
+        except _WorkStageFailureV1 as error:
+            obligation_failures.append((item.candidate.candidate_id, error))
+    try:
+        _validate_work_handoff_authority(authority, snapshots)
+    except _WorkStageFailureV1 as error:
+        obligation_failures.append(("", error))
+    obligations.sort(
+        key=lambda obligation: (
+            obligation.item.candidate.candidate_id.encode("ascii"),
+            obligation.decision.revision,
+        )
+    )
+    _validate_work_review_staging(
+        authority,
+        snapshots,
+        tuple(obligations),
+    )
+    obligation_stages: tuple[WorkReviewStageV1, ...] = (
+        *(
+            "handoff" if obligation.handoff_required else "knowledge_import"
+            for obligation in obligations
+        ),
+        *(error.stage for _candidate_id, error in obligation_failures),
+    )
+    start_stage: WorkReviewStageV1 | Literal["complete"] = (
+        "review"
+        if pending_candidate_ids
+        or any(item.current_repair_required for item in snapshots)
+        else min(
+            obligation_stages,
+            key=("review", "handoff", "knowledge_import").index,
+        )
+        if obligation_stages
+        else "complete"
+    )
+    selected_failure: _WorkStageFailureV1 | None = None
+    if obligation_failures:
+        _candidate_id, selected_failure = min(
+            obligation_failures,
+            key=lambda candidate_failure: (
+                ("review", "handoff", "knowledge_import").index(
+                    candidate_failure[1].stage
+                ),
+                (
+                    "revision_conflict",
+                    "asset_integrity_lost",
+                    "commit_failed",
+                    "handoff_failed",
+                    "registry_conflict",
+                    "import_failed",
+                ).index(candidate_failure[1].reason),
+                candidate_failure[0].encode("ascii"),
+            ),
+        )
+    return _WorkReviewPlanV1(
+        snapshots=snapshots,
+        pending_candidate_ids=pending_candidate_ids,
+        obligations=tuple(obligations),
+        start_stage=start_stage,
+        stop=(
+            None
+            if selected_failure is None
+            else WorkReviewStopV1(
+                outcome="failed",
+                stage=selected_failure.stage,
+                reason=selected_failure.reason,
+            )
+        ),
+    )
+
+
+def _work_stop_from_import_verdict(
+    verdict: _ImportContinuationBlockedV1 | _ImportContinuationFailedV1,
+    *,
+    pending_candidate_ids: tuple[str, ...],
+    advanced: set[WorkReviewStageV1],
+    start_stage: WorkReviewStageV1 | Literal["complete"],
+) -> WorkReviewContinuationV1:
+    if verdict.data_root is not None:
+        root_reason = cast(
+            WorkReviewBlockedReasonV1 | WorkReviewFailedReasonV1,
+            verdict.reason,
+        )
+        return _work_review_stopped(
+            outcome=(
+                "blocked" if type(verdict) is _ImportContinuationBlockedV1 else "failed"
+            ),
+            stage="knowledge_import",
+            reason=root_reason,
+            data_root=verdict.data_root,
+            pending_candidate_ids=pending_candidate_ids,
+            advanced=advanced,
+            start_stage=start_stage,
+        )
+    if type(verdict) is _ImportContinuationBlockedV1:
+        blocked_reason = cast(WorkReviewBlockedReasonV1, verdict.reason)
+        return _work_review_stopped(
+            outcome="blocked",
+            stage="knowledge_import",
+            reason=blocked_reason,
+            pending_candidate_ids=pending_candidate_ids,
+            advanced=advanced,
+            start_stage=start_stage,
+        )
+    failed_reason = cast(WorkReviewFailedReasonV1, verdict.reason)
+    return _work_review_stopped(
+        outcome="failed",
+        stage="knowledge_import",
+        reason=failed_reason,
+        pending_candidate_ids=pending_candidate_ids,
+        advanced=advanced,
+        start_stage=start_stage,
+    )
+
+
+def continue_work_review_v1(
+    authority: ActiveSourceAuthorityV1,
+    current_candidate_ids: tuple[str, ...],
+    *,
+    owner: WriterOwnershipV1,
+    root: ValidatedDataRootV1,
+    knowledge_intake: KnowledgeIntakeV1 | None,
+) -> WorkReviewContinuationV1:
+    """Observe pending review and continue only already-authorized obligations."""
+
+    if (
+        type(current_candidate_ids) is not tuple
+        or len(current_candidate_ids) > 12
+        or len(current_candidate_ids) != len(set(current_candidate_ids))
+        or any(
+            type(candidate_id) is not str
+            or _CANDIDATE_ID.fullmatch(candidate_id) is None
+            for candidate_id in current_candidate_ids
+        )
+    ):
+        raise TypeError("Current Candidate sequence is invalid")
+    root_identity = root.inspection.identity
+    if root_identity is None:
+        raise ReviewIndeterminateV1("Literature root identity is unavailable")
+    owner.assert_work_ownership_v1(root_identity, authority.work_id)
+    try:
+        _root_checkpoint(root)
+    except AddStoppedV1:
+        return _work_review_stopped(
+            outcome="failed",
+            stage="review",
+            reason="data_root_integrity_lost",
+            data_root="literature",
+            pending_candidate_ids=(),
+            advanced=set(),
+            start_stage="review",
+        )
+
+    plan = _build_work_review_plan_v1(
+        authority,
+        current_candidate_ids,
+        root=root,
+    )
+    pending_candidate_ids = plan.pending_candidate_ids
+    advanced: set[WorkReviewStageV1] = set()
+    start_stage = plan.start_stage
+    if plan.stop is not None and plan.stop.stage == "review":
+        return _work_review_stopped(
+            outcome=plan.stop.outcome,
+            stage=plan.stop.stage,
+            reason=plan.stop.reason,
+            data_root=plan.stop.data_root,
+            pending_candidate_ids=pending_candidate_ids,
+            advanced=advanced,
+            start_stage=start_stage,
+        )
+
+    review_repaired = False
+    for item in plan.snapshots:
+        if not item.current_repair_required:
+            continue
+        try:
+            _replace_review_current(
+                item.candidate_directory,
+                item.candidate,
+                item.decisions[-1],
+                root=root,
+            )
+        except _DataRootIntegrityLostV1:
+            return _work_review_stopped(
+                outcome="failed",
+                stage="review",
+                reason="data_root_integrity_lost",
+                data_root="literature",
+                pending_candidate_ids=pending_candidate_ids,
+                advanced=advanced,
+                start_stage=start_stage,
+            )
+        review_repaired = True
+    if review_repaired:
+        advanced.add("review")
+
+    if plan.stop is not None:
+        return _work_review_stopped(
+            outcome=plan.stop.outcome,
+            stage=plan.stop.stage,
+            reason=plan.stop.reason,
+            data_root=plan.stop.data_root,
+            pending_candidate_ids=pending_candidate_ids,
+            advanced=advanced,
+            start_stage=start_stage,
+        )
+
+    obligations = plan.obligations
+    committed_handoffs: dict[tuple[str, int], tuple[str, ReviewedHandoffBytesV1]] = {}
+    handoff_changed = False
+    no_action_changed = False
+    for obligation in obligations:
+        if not obligation.handoff_required:
+            continue
+        item = obligation.item
+        decision = obligation.decision
+        if obligation.action == "none":
+            try:
+                _commit_no_action_receipt(
+                    item.candidate_directory,
+                    item.candidate,
+                    decision,
+                    root=root,
+                )
+            except _DataRootIntegrityLostV1:
+                return _work_review_stopped(
+                    outcome="failed",
+                    stage="handoff",
+                    reason="data_root_integrity_lost",
+                    data_root="literature",
+                    pending_candidate_ids=pending_candidate_ids,
+                    advanced=advanced,
+                    start_stage=start_stage,
+                )
+            except _HandoffFailedV1:
+                return _work_review_stopped(
+                    outcome="failed",
+                    stage="handoff",
+                    reason="commit_failed",
+                    pending_candidate_ids=pending_candidate_ids,
+                    advanced=advanced,
+                    start_stage=start_stage,
+                )
+            handoff_changed = True
+            no_action_changed = True
+            continue
+        action = cast(Literal["accept", "withdraw"], obligation.action)
+        try:
+            committed_handoffs[(item.candidate.candidate_id, decision.revision)] = (
+                _commit_or_reuse_handoff(
+                    item.candidate,
+                    decision,
+                    action,
+                    root=root,
+                )
+            )
+        except _DataRootIntegrityLostV1:
+            return _work_review_stopped(
+                outcome="failed",
+                stage="handoff",
+                reason="data_root_integrity_lost",
+                data_root="literature",
+                pending_candidate_ids=pending_candidate_ids,
+                advanced=advanced,
+                start_stage=start_stage,
+            )
+        except _HandoffFailedV1:
+            return _work_review_stopped(
+                outcome="failed",
+                stage="handoff",
+                reason="commit_failed",
+                pending_candidate_ids=pending_candidate_ids,
+                advanced=advanced,
+                start_stage=start_stage,
+            )
+        handoff_changed = True
+    if handoff_changed:
+        advanced.add("handoff")
+
+    knowledge_changed = no_action_changed
+    for obligation in obligations:
+        if not obligation.import_required:
+            continue
+        item = obligation.item
+        decision = obligation.decision
+        action = cast(Literal["accept", "withdraw"], obligation.action)
+        imported_revisions = {receipt.revision for receipt in item.imports}
+        attempt = next(
+            (
+                candidate_attempt
+                for candidate_attempt in item.attempts
+                if candidate_attempt.revision == decision.revision
+                and candidate_attempt.revision not in imported_revisions
+            ),
+            None,
+        )
+        if knowledge_intake is None:
+            return _work_review_stopped(
+                outcome="blocked",
+                stage="knowledge_import",
+                reason="import_blocked",
+                pending_candidate_ids=pending_candidate_ids,
+                advanced=advanced,
+                start_stage=start_stage,
+            )
+        if attempt is None:
+            committed_handoff = committed_handoffs.get(
+                (item.candidate.candidate_id, decision.revision)
+            )
+            if committed_handoff is None:
+                handoff_id, _expected_handoff = _handoff_bytes(
+                    item.candidate,
+                    decision,
+                    action,
+                )
+                try:
+                    handoff = _read_formal_handoff(
+                        item.candidate.source.work_directory / "handoffs" / handoff_id,
+                        handoff_id,
+                        item.candidate,
+                        decision,
+                        action,
+                    )
+                except _HandoffFailedV1:
+                    advanced.discard("handoff")
+                    return _work_review_stopped(
+                        outcome="failed",
+                        stage="handoff",
+                        reason="asset_integrity_lost",
+                        pending_candidate_ids=pending_candidate_ids,
+                        advanced=advanced,
+                        start_stage=start_stage,
+                    )
+            else:
+                handoff_id, handoff = committed_handoff
+            attempt = _ImportAttemptV1(
+                action=action,
+                decision=decision,
+                handoff_id=handoff_id,
+                handoff=handoff,
+            )
+            try:
+                _publish_import_attempt(
+                    item.candidate_directory,
+                    item.candidate,
+                    attempt,
+                    root=root,
+                )
+            except _DataRootIntegrityLostV1:
+                return _work_review_stopped(
+                    outcome="failed",
+                    stage="knowledge_import",
+                    reason="data_root_integrity_lost",
+                    data_root="literature",
+                    pending_candidate_ids=pending_candidate_ids,
+                    advanced=advanced,
+                    start_stage=start_stage,
+                )
+            except _ImportFailedV1:
+                return _work_review_stopped(
+                    outcome="failed",
+                    stage="knowledge_import",
+                    reason="commit_failed",
+                    pending_candidate_ids=pending_candidate_ids,
+                    advanced=advanced,
+                    start_stage=start_stage,
+                )
+        continuation = _continue_import_attempt(
+            item.candidate_directory,
+            item.candidate,
+            attempt,
+            "unchanged",
+            root=root,
+            knowledge_intake=knowledge_intake,
+        )
+        if type(continuation) in {
+            _ImportContinuationBlockedV1,
+            _ImportContinuationFailedV1,
+        }:
+            return _work_stop_from_import_verdict(
+                cast(
+                    _ImportContinuationBlockedV1 | _ImportContinuationFailedV1,
+                    continuation,
+                ),
+                pending_candidate_ids=pending_candidate_ids,
+                advanced=advanced,
+                start_stage=start_stage,
+            )
+        if type(continuation) is not _ImportReceiptV1:
+            raise ReviewIndeterminateV1(
+                "Import continuation returned an invalid verdict"
+            )
+        knowledge_changed = True
+    if knowledge_changed:
+        advanced.add("knowledge_import")
+
+    return _work_review_progress(
+        pending_candidate_ids=pending_candidate_ids,
+        advanced=advanced,
+        start_stage=start_stage,
+    )
+
+
+def verify_work_review_continuation_v1(
+    authority: ActiveSourceAuthorityV1,
+    current_candidate_ids: tuple[str, ...],
+    continuation: WorkReviewContinuationV1,
+    *,
+    owner: WriterOwnershipV1,
+    root: ValidatedDataRootV1,
+) -> WorkReviewContinuationV1:
+    """Rebuild work-level Review authority before a Resume result is sealed."""
+
+    if type(continuation) is not WorkReviewContinuationV1:
+        raise TypeError("Work Review continuation is invalid")
+    root_identity = root.inspection.identity
+    if root_identity is None:
+        raise ReviewIndeterminateV1("Literature root identity is unavailable")
+    owner.assert_work_ownership_v1(root_identity, authority.work_id)
+    try:
+        _root_checkpoint(root)
+    except AddStoppedV1:
+        return _work_review_stopped(
+            outcome="failed",
+            stage="review",
+            reason="data_root_integrity_lost",
+            data_root="literature",
+            pending_candidate_ids=(),
+            advanced=set(),
+            start_stage="review",
+        )
+
+    plan = _build_work_review_plan_v1(
+        authority,
+        current_candidate_ids,
+        root=root,
+    )
+    if plan.stop is not None and plan.stop.data_root == "literature":
+        return _work_review_stopped(
+            outcome=plan.stop.outcome,
+            stage=plan.stop.stage,
+            reason=plan.stop.reason,
+            data_root="literature",
+            pending_candidate_ids=(),
+            advanced=set(),
+            start_stage="review",
+        )
+    if plan.pending_candidate_ids != continuation.pending_candidate_ids:
+        raise ReviewIndeterminateV1(
+            "Work Review pending authority changed before Resume sealing"
+        )
+    if any(item.current_repair_required for item in plan.snapshots):
+        raise ReviewIndeterminateV1(
+            "Work Review current authority changed before Resume sealing"
+        )
+    if plan.stop is not None:
+        if continuation.stop is None or continuation.stop.stage != plan.stop.stage:
+            raise ReviewIndeterminateV1(
+                "Work Review stop changed before Resume sealing"
+            )
+        return WorkReviewContinuationV1(
+            pending_candidate_ids=continuation.pending_candidate_ids,
+            advanced_stages=continuation.advanced_stages,
+            start_stage=continuation.start_stage,
+            stop=plan.stop,
+        )
+
+    earliest_obligation: WorkReviewStageV1 | None = None
+    if any(obligation.handoff_required for obligation in plan.obligations):
+        earliest_obligation = "handoff"
+    elif any(obligation.import_required for obligation in plan.obligations):
+        earliest_obligation = "knowledge_import"
+    if continuation.stop is None:
+        if earliest_obligation is not None:
+            raise ReviewIndeterminateV1(
+                "Authorized Review backlog changed before Resume sealing"
+            )
+    elif continuation.stop.stage != earliest_obligation:
+        raise ReviewIndeterminateV1(
+            "Work Review stop is no longer bound to outstanding authority"
+        )
+    return continuation
 
 
 def review_candidate_v1(
@@ -2279,9 +3529,15 @@ def review_candidate_v1(
             "defer": "deferred",
         }[command.action]
         try:
-            reviews, candidate_directory, history, attempts, prior_imports = (
-                _review_authority_snapshot(candidate, root=root)
-            )
+            (
+                reviews,
+                candidate_directory,
+                history,
+                _no_actions,
+                attempts,
+                prior_imports,
+                _current_repair_required,
+            ) = _review_authority_snapshot(candidate, root=root)
         except _DecisionCommittedDataRootLostV1 as error:
             if error.previously_imported is None:
                 raise ReviewIndeterminateV1(
@@ -2320,11 +3576,16 @@ def review_candidate_v1(
                 root=root,
                 knowledge_intake=knowledge_intake,
             )
-            if (
-                type(continuation) is ReviewBlockedV1
-                or type(continuation) is ReviewFailedV1
-            ):
-                return continuation
+            if type(continuation) in {
+                _ImportContinuationBlockedV1,
+                _ImportContinuationFailedV1,
+            }:
+                return _review_import_stop(
+                    cast(
+                        _ImportContinuationBlockedV1 | _ImportContinuationFailedV1,
+                        continuation,
+                    )
+                )
             if type(continuation) is not _ImportReceiptV1:
                 raise ReviewIndeterminateV1(
                     "Import continuation returned an invalid verdict"
@@ -2490,11 +3751,16 @@ def review_candidate_v1(
             root=root,
             knowledge_intake=knowledge_intake,
         )
-        if (
-            type(continuation) is ReviewBlockedV1
-            or type(continuation) is ReviewFailedV1
-        ):
-            return continuation
+        if type(continuation) in {
+            _ImportContinuationBlockedV1,
+            _ImportContinuationFailedV1,
+        }:
+            return _review_import_stop(
+                cast(
+                    _ImportContinuationBlockedV1 | _ImportContinuationFailedV1,
+                    continuation,
+                )
+            )
         if type(continuation) is not _ImportReceiptV1:
             raise ReviewIndeterminateV1(
                 "Import continuation returned an invalid verdict"
