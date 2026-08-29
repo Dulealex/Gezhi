@@ -2740,12 +2740,13 @@ def _stop_stage(
     outcome: ResumeOutcome,
     stage: ResumeStage,
     reason: str,
+    pending_candidate_ids: tuple[str, ...] = (),
 ) -> NoReturn:
     _fresh_authority_or_stop(authority, root)
     result = ResumeWorkResultV1(
         active_source_id=authority.source_id,
         advanced_stages=advanced_stages,
-        pending_candidate_ids=(),
+        pending_candidate_ids=pending_candidate_ids,
         pipeline_complete=False,
         start_stage=start_stage,
         stop_stage=stage,
@@ -3317,7 +3318,7 @@ def resume_work(
         )
 
         try:
-            advance_reader_v1(
+            reader = advance_reader_v1(
                 authority,
                 canonical.current,
                 root=root,
@@ -3356,14 +3357,88 @@ def resume_work(
             raise ResumeStoppedV1("failed", "recovery_failed") from error
         except ReaderRecoveryUncertainV1 as error:
             raise ResumeStoppedV1("failed", "recovery_failed") from error
-        _stop_stage(
-            authority,
-            root,
-            start_stage=start_stage,
-            advanced_stages=advanced_stages,
-            outcome="blocked",
-            stage="read",
-            reason="reader_prerequisite_unavailable",
+
+        from gezhi._literature_candidate import (
+            CandidateMaterializationAuthorityStoppedV1,
+            CandidateMaterializationRecoveryUncertainV1,
+            CandidateMaterializationStageStoppedV1,
+            advance_candidate_materialization_v1,
+        )
+
+        try:
+            materialized = advance_candidate_materialization_v1(
+                authority,
+                canonical.current,
+                reader,
+                root=root,
+            )
+        except CandidateMaterializationStageStoppedV1 as error:
+            _stop_stage(
+                authority,
+                root,
+                start_stage=start_stage,
+                advanced_stages=advanced_stages,
+                outcome=error.outcome,
+                stage="read",
+                reason=error.reason,
+            )
+        except CandidateMaterializationAuthorityStoppedV1 as error:
+            if error.reason == "data_root_integrity_lost":
+                raise ResumeStoppedV1(
+                    "failed",
+                    "data_root_integrity_lost",
+                    data_root="literature",
+                ) from error
+            if error.reason in {
+                "active_source_unavailable",
+                "active_source_invalid",
+            }:
+                _stop_stage(
+                    authority,
+                    root,
+                    start_stage=start_stage,
+                    advanced_stages=advanced_stages,
+                    outcome="failed",
+                    stage="read",
+                    reason="asset_integrity_lost",
+                )
+            raise ResumeStoppedV1("failed", "recovery_failed") from error
+        except CandidateMaterializationRecoveryUncertainV1 as error:
+            raise ResumeStoppedV1("failed", "recovery_failed") from error
+
+        completed_stages: tuple[ResumeStage, ...] = (
+            *advanced_stages,
+            *(("read",) if materialized.advanced else ()),
+        )
+        if materialized.pending_candidate_ids:
+            review_start: ResumeStage = (
+                start_stage
+                if advanced_stages or materialized.advanced
+                else "review"
+            )
+            _stop_stage(
+                authority,
+                root,
+                start_stage=review_start,
+                advanced_stages=completed_stages,
+                outcome="blocked",
+                stage="review",
+                reason="awaiting_review",
+                pending_candidate_ids=materialized.pending_candidate_ids,
+            )
+
+        _fresh_authority_or_stop(authority, root)
+        complete_start: ResumeStage | Literal["complete"] = (
+            start_stage if advanced_stages or materialized.advanced else "complete"
+        )
+        return ResumeWorkResultV1(
+            active_source_id=authority.source_id,
+            advanced_stages=completed_stages,
+            pending_candidate_ids=(),
+            pipeline_complete=True,
+            start_stage=complete_start,
+            stop_stage="complete",
+            work_id=authority.work_id,
         )
     finally:
         owner.close()
