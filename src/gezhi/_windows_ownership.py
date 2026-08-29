@@ -35,6 +35,7 @@ WriterScope: TypeAlias = Literal[
     "identity_intake",
     "work",
     "catalog_projection",
+    "knowledge_registry",
 ]
 _registry_guard = threading.Lock()
 _process_leases: dict[str, int] = {}
@@ -144,7 +145,10 @@ def _mutex_name(
     material = (
         f"{root_identity[0]}:{root_identity[1]}:{scope}:{work_id or '-'}"
     ).encode("ascii")
-    return "Global\\Gezhi.Literature.Writer." + hashlib.sha256(material).hexdigest()
+    context = "Knowledge" if scope == "knowledge_registry" else "Literature"
+    return (
+        f"Global\\Gezhi.{context}.Writer." + hashlib.sha256(material).hexdigest()
+    )
 
 
 def _try_acquire(
@@ -225,5 +229,15 @@ def try_acquire_catalog_projection_v1(
     return _try_acquire(
         root_identity,
         scope="catalog_projection",
+        work_id=None,
+    )
+
+
+def try_acquire_knowledge_registry_writer_v1(
+    root_identity: FileIdentity,
+) -> WriterOwnershipV1 | None:
+    return _try_acquire(
+        root_identity,
+        scope="knowledge_registry",
         work_id=None,
     )

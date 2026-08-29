@@ -4,8 +4,10 @@ import hashlib
 import json
 import re
 import shutil
+import sqlite3
 import uuid
 from collections.abc import Iterator
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -74,6 +76,7 @@ def _expected_review_result(
     import_status: str,
     revision: int,
     status: str,
+    intake_status: str | None = None,
 ) -> dict[str, object]:
     return {
         "candidate_id": template.candidate_id,
@@ -82,7 +85,7 @@ def _expected_review_result(
         "handoff_id": handoff_id,
         "handoff_status": handoff_status,
         "import_status": import_status,
-        "intake_status": None,
+        "intake_status": intake_status,
         "payload_sha256": template.payload_sha256,
         "review_revision": revision,
         "review_status": status,
@@ -358,6 +361,22 @@ def review_empty_root() -> Iterator[Path]:
         shutil.rmtree(resolved)
 
 
+@pytest.fixture
+def review_knowledge_root() -> Iterator[Path]:
+    container = Path(r"E:\Gezhi\data")
+    container.mkdir(parents=True, exist_ok=True)
+    suffix = "k" + uuid.uuid4().hex[:12]
+    root = container / suffix
+    root.mkdir()
+    try:
+        yield root
+    finally:
+        resolved = root.resolve(strict=True)
+        assert resolved.parent == container.resolve(strict=True)
+        assert resolved.name == suffix
+        shutil.rmtree(resolved)
+
+
 def _run_review(
     data_root: Path,
     candidate_id: str,
@@ -380,6 +399,31 @@ def _run_review(
     )
 
 
+def _run_review_with_knowledge(
+    literature_root: Path,
+    knowledge_root: Path,
+    candidate_id: str,
+    action: str,
+    *,
+    launcher_index: int,
+) -> object:
+    return run_launcher(
+        launcher_commands(
+            (
+                "--literature-data-root",
+                str(literature_root),
+                "--knowledge-data-root",
+                str(knowledge_root),
+                "literature",
+                "review",
+                candidate_id,
+                action,
+                "--json",
+            )
+        )[launcher_index]
+    )
+
+
 def _run_resume(
     data_root: Path,
     work_id: str,
@@ -391,6 +435,29 @@ def _run_resume(
             (
                 "--literature-data-root",
                 str(data_root),
+                "literature",
+                "resume",
+                work_id,
+                "--json",
+            )
+        )[launcher_index]
+    )
+
+
+def _run_resume_with_knowledge(
+    literature_root: Path,
+    knowledge_root: Path,
+    work_id: str,
+    *,
+    launcher_index: int,
+) -> object:
+    return run_launcher(
+        launcher_commands(
+            (
+                "--literature-data-root",
+                str(literature_root),
+                "--knowledge-data-root",
+                str(knowledge_root),
                 "literature",
                 "resume",
                 work_id,
@@ -722,14 +789,17 @@ def test_changed_nonaccepted_action_appends_revision_two_without_rewriting_one(
     }
 
 
-def test_accept_commits_self_contained_handoff_then_blocks_only_on_import(
+def test_accept_commits_handoff_then_reports_unavailable_knowledge_root(
     review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
 ) -> None:
     literature_root, template = review_candidate_root
+    missing_knowledge_root = literature_root.parent / "missing-knowledge"
+    assert not missing_knowledge_root.exists()
     expected_handoff_id = _handoff_id(template, action="accept", revision=1)
 
-    accepted = _run_review(
+    accepted = _run_review_with_knowledge(
         literature_root,
+        missing_knowledge_root,
         template.candidate_id,
         "--accept",
         launcher_index=1,
@@ -743,8 +813,8 @@ def test_accept_commits_self_contained_handoff_then_blocks_only_on_import(
         "command": "literature.review",
         "diagnostics": [
             {
-                "code": "literature.review.import_blocked.v1",
-                "context": {},
+                "code": "literature.review.data_root_unavailable.v1",
+                "context": {"data_root": "knowledge"},
             }
         ],
         "outcome": "blocked",
@@ -822,15 +892,18 @@ def test_accept_commits_self_contained_handoff_then_blocks_only_on_import(
         / "1.json"
     )
     candidate_reviews = decision_path.parent
-    assert not (candidate_reviews / "import_attempts").exists()
+    attempt_path = candidate_reviews / "import_attempts" / "1.json"
+    assert attempt_path.is_file()
     assert not (candidate_reviews / "imports").exists()
     immutable_before = (
         decision_path.read_bytes(),
         candidates_bytes,
         manifest_bytes,
+        attempt_path.read_bytes(),
     )
-    repeated = _run_review(
+    repeated = _run_review_with_knowledge(
         literature_root,
+        missing_knowledge_root,
         template.candidate_id,
         "--accept",
         launcher_index=0,
@@ -850,7 +923,200 @@ def test_accept_commits_self_contained_handoff_then_blocks_only_on_import(
         decision_path.read_bytes(),
         (handoff / "candidates.jsonl").read_bytes(),
         (handoff / "manifest.json").read_bytes(),
+        attempt_path.read_bytes(),
     ) == immutable_before
+
+
+@pytest.mark.parametrize("launcher_index", [0, 1])
+def test_public_review_accept_applies_candidate_to_knowledge(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+    review_knowledge_root: Path,
+    launcher_index: int,
+) -> None:
+    literature_root, template = review_candidate_root
+    handoff_id = _handoff_id(template, action="accept", revision=1)
+
+    completed = _run_review_with_knowledge(
+        literature_root,
+        review_knowledge_root,
+        template.candidate_id,
+        "--accept",
+        launcher_index=launcher_index,
+    )
+
+    assert completed.returncode == 0, (
+        completed.stdout + completed.stderr
+    ).decode(errors="replace")
+    assert completed.stderr == b""
+    assert json.loads(completed.stdout) == {
+        "command": "literature.review",
+        "diagnostics": [],
+        "outcome": "succeeded",
+        "result": _expected_review_result(
+            template,
+            decision_disposition="created",
+            handoff_action="accept",
+            handoff_id=handoff_id,
+            handoff_status="committed",
+            import_status="applied",
+            revision=1,
+            status="accepted",
+            intake_status="active",
+        ),
+        "schema_version": "gezhi.cli_result.v1",
+    }
+    candidate_reviews = (
+        literature_root
+        / "works"
+        / template.work_id
+        / "reviews"
+        / template.candidate_id
+    )
+    assert (candidate_reviews / "import_attempts" / "1.json").is_file()
+    assert (candidate_reviews / "imports" / "1.json").is_file()
+    literature_handoff = (
+        literature_root / "works" / template.work_id / "handoffs" / handoff_id
+    )
+    knowledge_handoff = review_knowledge_root / "imports" / handoff_id
+    assert (knowledge_handoff / "manifest.json").read_bytes() == (
+        literature_handoff / "manifest.json"
+    ).read_bytes()
+    assert (knowledge_handoff / "candidates.jsonl").read_bytes() == (
+        literature_handoff / "candidates.jsonl"
+    ).read_bytes()
+    assert (review_knowledge_root / "registry.sqlite3").is_file()
+
+
+@pytest.mark.parametrize("launcher_index", [0, 1])
+def test_public_review_withdraw_removes_candidate_from_active_intake(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+    review_knowledge_root: Path,
+    launcher_index: int,
+) -> None:
+    literature_root, template = review_candidate_root
+    accepted = _run_review_with_knowledge(
+        literature_root,
+        review_knowledge_root,
+        template.candidate_id,
+        "--accept",
+        launcher_index=launcher_index,
+    )
+    assert accepted.returncode == 0, (
+        accepted.stdout + accepted.stderr
+    ).decode(errors="replace")
+    handoff_id = _handoff_id(template, action="withdraw", revision=2)
+
+    withdrawn = _run_review_with_knowledge(
+        literature_root,
+        review_knowledge_root,
+        template.candidate_id,
+        "--reject",
+        launcher_index=launcher_index,
+    )
+
+    assert withdrawn.returncode == 0, (
+        withdrawn.stdout + withdrawn.stderr
+    ).decode(errors="replace")
+    assert withdrawn.stderr == b""
+    assert json.loads(withdrawn.stdout) == {
+        "command": "literature.review",
+        "diagnostics": [],
+        "outcome": "succeeded",
+        "result": _expected_review_result(
+            template,
+            decision_disposition="created",
+            handoff_action="withdraw",
+            handoff_id=handoff_id,
+            handoff_status="committed",
+            import_status="applied",
+            revision=2,
+            status="rejected",
+            intake_status="withdrawn",
+        ),
+        "schema_version": "gezhi.cli_result.v1",
+    }
+    registry_path = review_knowledge_root / "registry.sqlite3"
+    with closing(
+        sqlite3.connect(f"file:{registry_path}?mode=ro", uri=True)
+    ) as registry:
+        assert registry.execute(
+            "SELECT review_revision, intake_status FROM candidate_current"
+        ).fetchone() == (2, "withdrawn")
+        assert registry.execute("SELECT count(*) FROM candidate_content").fetchone() == (
+            1,
+        )
+        assert registry.execute("SELECT count(*) FROM handoff_revisions").fetchone() == (
+            2,
+        )
+
+
+@pytest.mark.parametrize("launcher_index", [0, 1])
+def test_public_resume_applies_a_previously_blocked_accept_import(
+    review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
+    review_knowledge_root: Path,
+    launcher_index: int,
+) -> None:
+    literature_root, template = review_candidate_root
+    missing_knowledge_root = review_knowledge_root.with_name(
+        review_knowledge_root.name + "-missing"
+    )
+    assert not missing_knowledge_root.exists()
+    accepted = _run_review_with_knowledge(
+        literature_root,
+        missing_knowledge_root,
+        template.candidate_id,
+        "--accept",
+        launcher_index=1 - launcher_index,
+    )
+    assert accepted.returncode == 2
+    accepted_document = json.loads(accepted.stdout)
+    assert accepted_document["result"]["import_status"] == "pending"
+
+    resumed = _run_resume_with_knowledge(
+        literature_root,
+        review_knowledge_root,
+        template.work_id,
+        launcher_index=launcher_index,
+    )
+
+    assert resumed.returncode == 0, (
+        resumed.stdout + resumed.stderr
+    ).decode(errors="replace")
+    assert resumed.stderr == b""
+    assert json.loads(resumed.stdout) == {
+        "command": "literature.resume",
+        "diagnostics": [],
+        "outcome": "succeeded",
+        "result": {
+            "active_source_id": template.source_id,
+            "advanced_stages": ["knowledge_import"],
+            "pending_candidate_ids": [],
+            "pipeline_complete": True,
+            "schema_version": "gezhi.literature_resume_result.v1",
+            "start_stage": "knowledge_import",
+            "stop_stage": "complete",
+            "work_id": template.work_id,
+        },
+        "schema_version": "gezhi.cli_result.v1",
+    }
+    candidate_reviews = (
+        literature_root
+        / "works"
+        / template.work_id
+        / "reviews"
+        / template.candidate_id
+    )
+    assert (candidate_reviews / "import_attempts" / "1.json").is_file()
+    assert (candidate_reviews / "imports" / "1.json").is_file()
+    with closing(
+        sqlite3.connect(
+            f"file:{review_knowledge_root / 'registry.sqlite3'}?mode=ro",
+            uri=True,
+        )
+    ) as registry:
+        assert registry.execute(
+            "SELECT review_revision, intake_status FROM candidate_current"
+        ).fetchone() == (1, "active")
 
 
 def test_single_unpointed_decision_recovers_current_without_new_revision(
@@ -982,12 +1248,15 @@ def test_candidate_from_an_inactive_historical_source_remains_reviewable(
     )
 
 
-def test_rehashed_tampered_handoff_is_rejected_against_source_authority(
+def test_rehashed_tampered_handoff_conflicts_with_committed_import_attempt(
     review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
 ) -> None:
     literature_root, template = review_candidate_root
-    accepted = _run_review(
+    missing_knowledge_root = literature_root.parent / "missing-knowledge"
+    assert not missing_knowledge_root.exists()
+    accepted = _run_review_with_knowledge(
         literature_root,
+        missing_knowledge_root,
         template.candidate_id,
         "--accept",
         launcher_index=1,
@@ -1003,8 +1272,9 @@ def test_rehashed_tampered_handoff_is_rejected_against_source_authority(
     manifest["candidates_sha256"] = hashlib.sha256(candidates_bytes).hexdigest()
     (handoff / "manifest.json").write_bytes(_canonical_file_bytes(manifest))
 
-    stopped = _run_review(
+    stopped = _run_review_with_knowledge(
         literature_root,
+        missing_knowledge_root,
         template.candidate_id,
         "--accept",
         launcher_index=0,
@@ -1014,18 +1284,9 @@ def test_rehashed_tampered_handoff_is_rejected_against_source_authority(
     document = json.loads(stopped.stdout)
     assert document["outcome"] == "failed"
     assert document["diagnostics"] == [
-        {"code": "literature.review.handoff_failed.v1", "context": {}}
+        {"code": "literature.review.review_state_invalid.v1", "context": {}}
     ]
-    assert document["result"] == _expected_review_result(
-        template,
-        decision_disposition="unchanged",
-        handoff_action="accept",
-        handoff_id=handoff_id,
-        handoff_status="pending",
-        import_status="pending",
-        revision=1,
-        status="accepted",
-    )
+    assert document["result"] is None
 
 
 def test_relevant_candidate_materialization_tamper_is_integrity_lost(
@@ -2381,13 +2642,16 @@ def test_resume_observes_a_completed_rejected_no_action_decision(
 
 
 @pytest.mark.parametrize("launcher_index", [0, 1])
-def test_resume_reports_committed_accept_as_import_backlog_without_t18(
+def test_resume_reports_unavailable_knowledge_root_for_accept_backlog(
     review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
     launcher_index: int,
 ) -> None:
     literature_root, template = review_candidate_root
-    accepted = _run_review(
+    missing_knowledge_root = literature_root.parent / "missing-knowledge"
+    assert not missing_knowledge_root.exists()
+    accepted = _run_review_with_knowledge(
         literature_root,
+        missing_knowledge_root,
         template.candidate_id,
         "--accept",
         launcher_index=1 - launcher_index,
@@ -2396,8 +2660,9 @@ def test_resume_reports_committed_accept_as_import_backlog_without_t18(
     accepted_document = json.loads(accepted.stdout)
     handoff_id = accepted_document["result"]["handoff_id"]
 
-    resumed = _run_resume(
+    resumed = _run_resume_with_knowledge(
         literature_root,
+        missing_knowledge_root,
         template.work_id,
         launcher_index=launcher_index,
     )
@@ -2409,11 +2674,8 @@ def test_resume_reports_committed_accept_as_import_backlog_without_t18(
         "command": "literature.resume",
         "diagnostics": [
             {
-                "code": "literature.resume.stage_blocked.v1",
-                "context": {
-                    "reason": "import_blocked",
-                    "stage": "knowledge_import",
-                },
+                "code": "literature.resume.data_root_unavailable.v1",
+                "context": {"data_root": "knowledge"},
             }
         ],
         "outcome": "blocked",
@@ -2432,7 +2694,7 @@ def test_resume_reports_committed_accept_as_import_backlog_without_t18(
     reviews = (
         literature_root / "works" / template.work_id / "reviews" / template.candidate_id
     )
-    assert not (reviews / "import_attempts").exists()
+    assert (reviews / "import_attempts" / "1.json").is_file()
     assert not (reviews / "imports").exists()
     assert (
         literature_root
@@ -2490,7 +2752,7 @@ def test_resume_repairs_a_missing_no_action_receipt_without_a_new_decision(
     assert {path.name for path in candidate_reviews.glob("[0-9]*.json")} == {"1.json"}
 
 
-def test_resume_repairs_a_missing_accept_handoff_then_stops_at_import(
+def test_resume_repairs_a_missing_accept_handoff_then_reports_knowledge_root(
     review_candidate_root: tuple[Path, _ReviewCandidateTemplateV1],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2513,16 +2775,25 @@ def test_resume_repairs_a_missing_accept_handoff_then_stops_at_import(
     assert stopped.progress is not None
     assert stopped.progress.handoff_status == "pending"
 
-    resumed = _run_resume(literature_root, template.work_id, launcher_index=0)
+    missing_knowledge_root = literature_root.parent / "missing-knowledge"
+    assert not missing_knowledge_root.exists()
+    resumed = _run_resume_with_knowledge(
+        literature_root,
+        missing_knowledge_root,
+        template.work_id,
+        launcher_index=0,
+    )
 
     assert resumed.returncode == 2, (resumed.stdout + resumed.stderr).decode(
         errors="replace"
     )
     document = json.loads(resumed.stdout)
-    assert document["diagnostics"][0]["context"] == {
-        "reason": "import_blocked",
-        "stage": "knowledge_import",
-    }
+    assert document["diagnostics"] == [
+        {
+            "code": "literature.resume.data_root_unavailable.v1",
+            "context": {"data_root": "knowledge"},
+        }
+    ]
     assert document["result"] == {
         "active_source_id": template.source_id,
         "advanced_stages": ["handoff"],
@@ -2535,6 +2806,8 @@ def test_resume_repairs_a_missing_accept_handoff_then_stops_at_import(
     }
     handoffs = literature_root / "works" / template.work_id / "handoffs"
     assert len([path for path in handoffs.iterdir() if path.name != ".staging"]) == 1
+    reviews = handoffs.parent / "reviews" / template.candidate_id
+    assert (reviews / "import_attempts" / "1.json").is_file()
 
 
 def test_resume_reports_work_busy_without_observing_partial_state(
@@ -2779,14 +3052,23 @@ def test_resume_repairs_every_historical_no_action_before_current_import(
     assert accepted.progress is not None
     assert accepted.progress.review_revision == 2
 
-    resumed = _run_resume(literature_root, template.work_id, launcher_index=1)
+    missing_knowledge_root = literature_root.parent / "missing-knowledge"
+    assert not missing_knowledge_root.exists()
+    resumed = _run_resume_with_knowledge(
+        literature_root,
+        missing_knowledge_root,
+        template.work_id,
+        launcher_index=1,
+    )
 
     assert resumed.returncode == 2
     document = json.loads(resumed.stdout)
-    assert document["diagnostics"][0]["context"] == {
-        "reason": "import_blocked",
-        "stage": "knowledge_import",
-    }
+    assert document["diagnostics"] == [
+        {
+            "code": "literature.resume.data_root_unavailable.v1",
+            "context": {"data_root": "knowledge"},
+        }
+    ]
     assert document["result"]["start_stage"] == "handoff"
     assert document["result"]["advanced_stages"] == ["handoff"]
     candidate_reviews = (
@@ -2797,6 +3079,7 @@ def test_resume_repairs_every_historical_no_action_before_current_import(
         "1.json",
         "2.json",
     }
+    assert (candidate_reviews / "import_attempts" / "2.json").is_file()
 
 
 def test_resume_commits_but_does_not_import_a_superseded_accept_handoff(
