@@ -310,6 +310,17 @@ class ValidatedFileV1:
         yield from _read_handle_chunks(handle, self.size)
         self._revalidate(handle)
 
+    def revalidate_identity_v1(self) -> None:
+        """Prove that a held mutable file still names the same local object."""
+
+        handle = self.borrowed_handle()
+        facts = _handle_facts(handle, directory=False)
+        if (
+            facts.identity != self.identity
+            or _key(facts.canonical_path) != _key(self.canonical_path)
+        ):
+            raise DataRootOpenErrorV1("unavailable")
+
     def _revalidate(self, handle: int) -> None:
         facts = _handle_facts(handle, directory=False)
         if (
@@ -825,9 +836,12 @@ def _open_relative_handle(
     component: str,
     *,
     directory: bool,
+    share_writes: bool = False,
 ) -> int:
     share = (
-        _FILE_SHARE_READ | _FILE_SHARE_WRITE if directory else _FILE_SHARE_READ
+        _FILE_SHARE_READ | _FILE_SHARE_WRITE
+        if directory or share_writes
+        else _FILE_SHARE_READ
     )
     base_options = _FILE_SYNCHRONOUS_IO_NONALERT | _FILE_OPEN_REPARSE_POINT
     probe = _nt_open_relative(
@@ -1143,8 +1157,11 @@ def open_validated_data_root_v1(value: str) -> ValidatedDataRootV1:
         raise
 
 
-def open_validated_local_file_v1(value: str) -> ValidatedFileV1:
-    """Open one local ordinary file through a held no-follow ancestor chain."""
+def _open_validated_local_file_v1(
+    value: str,
+    *,
+    share_writes: bool,
+) -> ValidatedFileV1:
 
     path = _normal_path(value)
     if path is None:
@@ -1171,6 +1188,7 @@ def open_validated_local_file_v1(value: str) -> ValidatedFileV1:
                     parent,
                     component,
                     directory=directory,
+                    share_writes=share_writes and not directory,
                 )
             handles.append(handle)
             facts = _handle_facts(handle, directory=directory)
@@ -1215,6 +1233,18 @@ def open_validated_local_file_v1(value: str) -> ValidatedFileV1:
         except Exception as close_error:
             raise close_error from error
         raise
+
+
+def open_validated_local_file_v1(value: str) -> ValidatedFileV1:
+    """Open one stable local file through a held no-follow ancestor chain."""
+
+    return _open_validated_local_file_v1(value, share_writes=False)
+
+
+def open_validated_mutable_local_file_v1(value: str) -> ValidatedFileV1:
+    """Hold one no-follow local file while a cooperating writer mutates it."""
+
+    return _open_validated_local_file_v1(value, share_writes=True)
 
 
 def inspect_data_root_v1(value: str) -> DataRootInspectionV1:

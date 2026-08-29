@@ -877,6 +877,7 @@ def run_resume(
                 data_root="literature",
             )
         else:
+            from gezhi._knowledge_intake import KnowledgeIntakeAdapterV1
             from gezhi._literature_resume import ResumeStoppedV1, resume_work
 
             with root:
@@ -885,6 +886,9 @@ def run_resume(
                         work_id,
                         root=root,
                         source_environment=os.environ.copy(),
+                        knowledge_intake=KnowledgeIntakeAdapterV1(
+                            configuration.knowledge_data_root
+                        ),
                     )
                 except ResumeStoppedV1 as error:
                     receipt = _resume_stopped_receipt(
@@ -1325,6 +1329,7 @@ def run_review(
                 },
             )
         else:
+            from gezhi._knowledge_intake import KnowledgeIntakeAdapterV1
             from gezhi._literature_review import (
                 ReviewBlockedV1,
                 ReviewCandidateCommandV1,
@@ -1343,7 +1348,9 @@ def run_review(
                         ),
                     ),
                     root=root,
-                    knowledge_intake=None,
+                    knowledge_intake=KnowledgeIntakeAdapterV1(
+                        configuration.knowledge_data_root
+                    ),
                 )
             if type(verdict) is ReviewSucceededV1:
                 receipt = ReviewReceiptV1(
