@@ -42,6 +42,11 @@ from gezhi._codex_runtime import (
     FrozenCodexRuntimeV1,
     resolve_codex_runtime_v1,
 )
+from gezhi._knowledge_attempt_events import (
+    KNOWLEDGE_ATTEMPT_EVENTS_CAP_V1,
+    parse_knowledge_attempt_events_v1,
+    project_knowledge_attempt_usage_v1,
+)
 from gezhi._knowledge_registry import canonical_json_bytes_v1
 from gezhi._knowledge_retrieval import NonZeroCandidatesV1
 from gezhi._windows_data_root import (
@@ -55,9 +60,8 @@ _FINAL_SEMANTIC_MAX_BYTES = 65_536
 _MARKDOWN_MAX_BYTES = 524_288
 _PROMPT_MAX_BYTES = 262_144
 _SCHEMA_MAX_BYTES = 262_144
-_EVENTS_CAPTURE_CAP = 16_777_216
+_EVENTS_CAPTURE_CAP = KNOWLEDGE_ATTEMPT_EVENTS_CAP_V1
 _FINAL_CAPTURE_CAP = 1_048_576
-_INT64_MAX = 9_223_372_036_854_775_807
 _CANDIDATE_ID = re.compile(r"^cand_[0-9a-f]{24}$", re.ASCII)
 _SOURCE_ID = re.compile(r"^src_[0-9a-f]{24}$", re.ASCII)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
@@ -272,17 +276,6 @@ def _reject_duplicate_pairs_v1(
 
 def _reject_float_v1(_value: str) -> NoReturn:
     raise ValueError("JSON number must not be a float or non-standard constant")
-
-
-class _JsonFloatTokenV1:
-    __slots__ = ()
-
-
-_JSON_FLOAT_TOKEN_V1 = _JsonFloatTokenV1()
-
-
-def _mark_json_float_v1(_value: str) -> _JsonFloatTokenV1:
-    return _JSON_FLOAT_TOKEN_V1
 
 
 def _decode_single_json_object_v1(payload: bytes) -> dict[str, object]:
@@ -542,84 +535,6 @@ def _utc_now_milliseconds_v1() -> str:
     )
 
 
-def _event_records_v1(
-    payload: bytes,
-) -> tuple[tuple[dict[str, object], ...], bool]:
-    if payload.startswith(b"\xef\xbb\xbf"):
-        return (), False
-    try:
-        payload.decode("utf-8", errors="strict")
-    except UnicodeDecodeError:
-        return (), False
-    if not payload:
-        return (), True
-    raw_records: list[bytes] = []
-    start = 0
-    while True:
-        boundary = payload.find(b"\n", start)
-        if boundary < 0:
-            if start < len(payload):
-                raw_records.append(payload[start:])
-            break
-        raw_records.append(payload[start:boundary])
-        start = boundary + 1
-        if start == len(payload):
-            break
-    records: list[dict[str, object]] = []
-    completed_count = 0
-    try:
-        for raw_record in raw_records:
-            if not raw_record:
-                raise ValueError("Codex event record is empty")
-            text = raw_record.decode("utf-8", errors="strict")
-            value = json.loads(
-                text,
-                strict=True,
-                object_pairs_hook=_reject_duplicate_pairs_v1,
-                parse_float=_mark_json_float_v1,
-                parse_constant=_reject_float_v1,
-            )
-            if type(value) is not dict:
-                raise ValueError("Codex event root is not an object")
-            if value.get("type") == "turn.completed":
-                completed_count += 1
-                if completed_count > 1:
-                    raise ValueError("Codex events contain duplicate completion")
-            records.append(value)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-        return (), False
-    return tuple(records), True
-
-
-def _usage_from_events_v1(
-    events: bytes,
-    records: tuple[dict[str, object], ...],
-    *,
-    events_valid: bool,
-) -> tuple[int | None, int | None, int | None, int | None]:
-    if len(events) == _EVENTS_CAPTURE_CAP or not events_valid:
-        return None, None, None, None
-    completed = next(
-        (record for record in records if record.get("type") == "turn.completed"),
-        None,
-    )
-    usage = None if completed is None else completed.get("usage")
-    if type(usage) is not dict:
-        return None, None, None, None
-    projected: list[int | None] = []
-    for name in (
-        "input_tokens",
-        "cached_input_tokens",
-        "output_tokens",
-        "reasoning_output_tokens",
-    ):
-        value = usage.get(name)
-        projected.append(
-            value if type(value) is int and 0 <= value <= _INT64_MAX else None
-        )
-    return projected[0], projected[1], projected[2], projected[3]
-
-
 def _attempt_from_evidence_v1(
     evidence: AttemptTerminalEvidenceV1,
     *,
@@ -661,9 +576,11 @@ def _attempt_from_evidence_v1(
         if overflow
     )
     records, events_valid = (
-        ((), True) if evidence.events.overflow else _event_records_v1(events)
+        ((), True)
+        if evidence.events.overflow
+        else parse_knowledge_attempt_events_v1(events)
     )
-    usage = _usage_from_events_v1(
+    usage = project_knowledge_attempt_usage_v1(
         events,
         records,
         events_valid=events_valid,

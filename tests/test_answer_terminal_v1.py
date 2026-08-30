@@ -108,7 +108,12 @@ def _request_with_terminal_matrix(
         record = dict(prototype.record)
         record["failure_class"] = failure_class
         record["exit_code"] = 0 if failure_class is None else 0x475A0001
-        attempts.append(replace(prototype, record=record))
+        events_bytes = (
+            _canonical_json_file({"type": "turn.completed"})
+            if failure_class is None
+            else prototype.events_bytes
+        )
+        attempts.append(replace(prototype, record=record, events_bytes=events_bytes))
     succeeded = status == "succeeded"
     return replace(
         base,
@@ -155,12 +160,446 @@ def _zero_candidate_request(
     )
 
 
+def _request_at_root_prefix(
+    request: terminal.AnswerPublishRequestV1,
+    prefix: int,
+) -> terminal.AnswerPublishRequestV1:
+    field_names = (
+        "effective_config_bytes",
+        "question_bytes",
+        "retrieval_query_bytes",
+        "retrieval_audit_bytes",
+        "retrieval_view_bytes",
+    )
+    changes = {name: None for name in field_names[prefix + 1 :]}
+    if prefix < 4:
+        changes.update(prompt_bytes=None, schema_bytes=None)
+    return replace(request, **changes)
+
+
+def _request_with_candidate_count(
+    request: terminal.AnswerPublishRequestV1,
+    candidate_count: int,
+) -> terminal.AnswerPublishRequestV1:
+    retrieval_view_bytes = _canonical_json_file(
+        {
+            "candidate_count": candidate_count,
+            "schema_version": "gezhi.retrieval_view.v1",
+        }
+    )
+    retrieval_audit_bytes = _canonical_json_file(
+        {
+            "retrieval_view_measurement": {
+                "byte_length": len(retrieval_view_bytes),
+                "limit_bytes": 262_144,
+                "sha256": hashlib.sha256(retrieval_view_bytes).hexdigest(),
+                "status": "within_limit",
+            },
+            "schema_version": "gezhi.retrieval_audit.v1",
+        }
+    )
+    return replace(
+        request,
+        retrieval_audit_bytes=retrieval_audit_bytes,
+        retrieval_view_bytes=retrieval_view_bytes,
+    )
+
+
+def _too_large_retrieval_audit_bytes() -> bytes:
+    return _canonical_json_file(
+        {
+            "retrieval_view_measurement": {
+                "byte_length": 262_145,
+                "limit_bytes": 262_144,
+                "sha256": "0" * 64,
+                "status": "too_large",
+            },
+            "schema_version": "gezhi.retrieval_audit.v1",
+        }
+    )
+
+
 def test_terminal_writer_rejects_success_with_a_timeout_attempt() -> None:
     request = _succeeded_request_with_timeout_attempt()
 
     with pytest.raises(
         terminal.AnswerTerminalRequestInvalidV1,
         match="terminal matrix",
+    ):
+        terminal._validate_request(request)
+
+
+def test_terminal_writer_rejects_runtime_unavailable_before_synthesis_package() -> None:
+    request = _request_at_root_prefix(
+        _request_with_terminal_matrix(
+            status="blocked",
+            error={"code": "codex_runtime_unavailable", "stage": "synthesis"},
+            failure_classes=(),
+        ),
+        0,
+    )
+
+    with pytest.raises(
+        terminal.AnswerTerminalRequestInvalidV1,
+        match="root terminal matrix",
+    ):
+        terminal._validate_request(request)
+
+
+def test_terminal_writer_rejects_retrieval_query_failure_before_query_asset() -> None:
+    request = _request_at_root_prefix(
+        _request_with_terminal_matrix(
+            status="failed",
+            error={"code": "retrieval_query_failed", "stage": "retrieval"},
+            failure_classes=(),
+        ),
+        1,
+    )
+
+    with pytest.raises(
+        terminal.AnswerTerminalRequestInvalidV1,
+        match="root terminal matrix",
+    ):
+        terminal._validate_request(request)
+
+
+def test_terminal_writer_rejects_fts_failure_after_retrieval_view() -> None:
+    request = _request_with_terminal_matrix(
+        status="blocked",
+        error={"code": "fts5_unavailable", "stage": "retrieval"},
+        failure_classes=(),
+    )
+
+    with pytest.raises(
+        terminal.AnswerTerminalRequestInvalidV1,
+        match="root terminal matrix",
+    ):
+        terminal._validate_request(request)
+
+
+def test_terminal_writer_rejects_synthesis_input_failure_before_view() -> None:
+    request = _request_at_root_prefix(
+        _request_with_terminal_matrix(
+            status="failed",
+            error={"code": "synthesis_input_invalid", "stage": "synthesis"},
+            failure_classes=(),
+        ),
+        0,
+    )
+
+    with pytest.raises(
+        terminal.AnswerTerminalRequestInvalidV1,
+        match="root terminal matrix",
+    ):
+        terminal._validate_request(request)
+
+
+def test_terminal_writer_rejects_materialization_failure_after_view() -> None:
+    request = _request_with_terminal_matrix(
+        status="failed",
+        error={
+            "code": "retrieval_materialization_failed",
+            "stage": "retrieval",
+        },
+        failure_classes=(),
+    )
+
+    with pytest.raises(
+        terminal.AnswerTerminalRequestInvalidV1,
+        match="root terminal matrix",
+    ):
+        terminal._validate_request(request)
+
+
+def test_terminal_writer_accepts_materialization_failure_after_audit() -> None:
+    request = _request_at_root_prefix(
+        _request_with_terminal_matrix(
+            status="failed",
+            error={
+                "code": "retrieval_materialization_failed",
+                "stage": "retrieval",
+            },
+            failure_classes=(),
+        ),
+        3,
+    )
+
+    terminal._validate_request(request)
+
+
+def test_terminal_writer_rejects_materialization_failure_for_over_limit_view() -> None:
+    request = _request_at_root_prefix(
+        _request_with_terminal_matrix(
+            status="failed",
+            error={
+                "code": "retrieval_materialization_failed",
+                "stage": "retrieval",
+            },
+            failure_classes=(),
+        ),
+        3,
+    )
+    request = replace(
+        request,
+        retrieval_audit_bytes=_too_large_retrieval_audit_bytes(),
+    )
+
+    with pytest.raises(
+        terminal.AnswerTerminalRequestInvalidV1,
+        match="Missing Retrieval View",
+    ):
+        terminal._validate_request(request)
+
+
+def test_terminal_writer_rejects_success_with_negative_candidate_count() -> None:
+    request = _request_with_candidate_count(
+        replace(
+            _request_with_terminal_matrix(
+                status="succeeded",
+                error=None,
+                failure_classes=(),
+            ),
+            prompt_bytes=None,
+            schema_bytes=None,
+        ),
+        -1,
+    )
+
+    with pytest.raises(
+        terminal.AnswerTerminalRequestInvalidV1,
+        match="root terminal matrix",
+    ):
+        terminal._validate_request(request)
+
+
+def test_terminal_writer_rejects_interrupt_with_out_of_range_candidates() -> None:
+    request = _request_with_candidate_count(
+        replace(
+            _request_with_terminal_matrix(
+                status="interrupted",
+                error=None,
+                failure_classes=(),
+            ),
+            prompt_bytes=None,
+            schema_bytes=None,
+        ),
+        13,
+    )
+
+    with pytest.raises(
+        terminal.AnswerTerminalRequestInvalidV1,
+        match="root terminal matrix",
+    ):
+        terminal._validate_request(request)
+
+
+@pytest.mark.parametrize(
+    ("error", "prefix"),
+    (
+        ({"code": "fts5_unavailable", "stage": "retrieval"}, 2),
+        ({"code": "retrieval_query_failed", "stage": "retrieval"}, 2),
+        (
+            {"code": "retrieval_materialization_failed", "stage": "retrieval"},
+            0,
+        ),
+        (
+            {"code": "retrieval_materialization_failed", "stage": "retrieval"},
+            1,
+        ),
+        (
+            {"code": "retrieval_materialization_failed", "stage": "retrieval"},
+            2,
+        ),
+        (
+            {"code": "retrieval_materialization_failed", "stage": "retrieval"},
+            3,
+        ),
+    ),
+    ids=("fts-p2", "query-p2", "materialization-p0", "p1", "p2", "p3"),
+)
+def test_terminal_writer_accepts_retrieval_terminal_prefixes(
+    error: dict[str, object],
+    prefix: int,
+) -> None:
+    status = "blocked" if error["code"] == "fts5_unavailable" else "failed"
+    request = _request_at_root_prefix(
+        _request_with_terminal_matrix(
+            status=status,
+            error=error,
+            failure_classes=(),
+        ),
+        prefix,
+    )
+
+    terminal._validate_request(request)
+
+
+def test_terminal_writer_accepts_synthesis_input_failure_without_call_pair() -> None:
+    request = replace(
+        _request_with_terminal_matrix(
+            status="failed",
+            error={"code": "synthesis_input_invalid", "stage": "synthesis"},
+            failure_classes=(),
+        ),
+        prompt_bytes=None,
+        schema_bytes=None,
+    )
+
+    terminal._validate_request(request)
+
+
+def test_terminal_writer_accepts_runtime_failure_before_first_commitment() -> None:
+    request = _request_with_terminal_matrix(
+        status="blocked",
+        error={"code": "codex_runtime_unavailable", "stage": "synthesis"},
+        failure_classes=(),
+    )
+
+    terminal._validate_request(request)
+
+
+def test_terminal_writer_accepts_over_limit_view_at_audit_prefix() -> None:
+    request = _request_at_root_prefix(
+        _request_with_terminal_matrix(
+            status="blocked",
+            error={"code": "retrieval_view_too_large", "stage": "retrieval"},
+            failure_classes=(),
+        ),
+        3,
+    )
+    request = replace(
+        request,
+        retrieval_audit_bytes=_too_large_retrieval_audit_bytes(),
+    )
+
+    terminal._validate_request(request)
+
+
+def test_terminal_writer_rejects_usage_not_derived_from_attempt_events() -> None:
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+    attempt = request.attempts[0]
+    record = dict(attempt.record)
+    record["input_tokens"] = 7
+    request = replace(
+        request,
+        attempts=(replace(attempt, record=record),),
+    )
+
+    with pytest.raises(
+        terminal.AnswerTerminalRequestInvalidV1,
+        match="attempt usage differs",
+    ):
+        terminal._validate_request(request)
+
+
+def test_terminal_writer_rejects_invalid_events_as_retryable_timeout() -> None:
+    request = _request_with_terminal_matrix(
+        status="blocked",
+        error={"code": "codex_timeout_exhausted", "stage": "synthesis"},
+        failure_classes=("timeout",),
+    )
+    attempt = request.attempts[0]
+    request = replace(
+        request,
+        attempts=(replace(attempt, events_bytes=b"not-json\n"),),
+    )
+
+    with pytest.raises(
+        terminal.AnswerTerminalRequestInvalidV1,
+        match="attempt events differ",
+    ):
+        terminal._validate_request(request)
+
+
+def test_terminal_writer_rejects_clean_exit_without_completed_event() -> None:
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+    attempt = request.attempts[0]
+    request = replace(
+        request,
+        attempts=(replace(attempt, events_bytes=b""),),
+    )
+
+    with pytest.raises(
+        terminal.AnswerTerminalRequestInvalidV1,
+        match="attempt events differ",
+    ):
+        terminal._validate_request(request)
+
+
+def test_terminal_writer_accepts_usage_recomputed_from_completed_event() -> None:
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+    attempt = request.attempts[0]
+    record = dict(attempt.record)
+    record.update(
+        input_tokens=11,
+        cached_input_tokens=7,
+        output_tokens=5,
+        reasoning_output_tokens=3,
+        usage_unavailable=False,
+    )
+    events_bytes = _canonical_json_file(
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 11,
+                "cached_input_tokens": 7,
+                "output_tokens": 5,
+                "reasoning_output_tokens": 3,
+            },
+        }
+    )
+    request = replace(
+        request,
+        attempts=(replace(attempt, record=record, events_bytes=events_bytes),),
+    )
+
+    terminal._validate_request(request)
+
+
+def test_terminal_writer_accepts_invalid_events_as_process_error() -> None:
+    request = _request_with_terminal_matrix(
+        status="failed",
+        error={"code": "codex_process_failed", "stage": "synthesis"},
+        failure_classes=("process_error",),
+    )
+    attempt = request.attempts[0]
+    request = replace(
+        request,
+        attempts=(replace(attempt, events_bytes=b"not-json\n"),),
+    )
+
+    terminal._validate_request(request)
+
+
+def test_terminal_writer_rejects_invalid_exact_cap_events_as_timeout() -> None:
+    request = _request_with_terminal_matrix(
+        status="blocked",
+        error={"code": "codex_timeout_exhausted", "stage": "synthesis"},
+        failure_classes=("timeout",),
+    )
+    attempt = request.attempts[0]
+    invalid_prefix = b"not-json\n"
+    events_bytes = invalid_prefix + b" " * (16_777_216 - len(invalid_prefix))
+    request = replace(
+        request,
+        attempts=(replace(attempt, events_bytes=events_bytes),),
+    )
+
+    with pytest.raises(
+        terminal.AnswerTerminalRequestInvalidV1,
+        match="attempt events differ",
     ):
         terminal._validate_request(request)
 

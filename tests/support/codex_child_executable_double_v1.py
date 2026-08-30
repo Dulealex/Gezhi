@@ -109,8 +109,10 @@ def _events_then_hang() -> None:
 
 def _mark_and_hang(marker_path: Path) -> None:
     sys.stdin.buffer.read()
-    marker_path.write_text(str(os.getpid()), encoding="ascii")
     _write_all(1, b'{"type":"double.started"}\n')
+    marker_staging = marker_path.with_name(marker_path.name + ".tmp")
+    marker_staging.write_text(str(os.getpid()), encoding="ascii")
+    os.replace(marker_staging, marker_path)
     threading.Event().wait()
 
 
