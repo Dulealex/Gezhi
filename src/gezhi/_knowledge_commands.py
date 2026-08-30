@@ -4,6 +4,11 @@ import json
 import os
 from dataclasses import dataclass
 
+from gezhi._knowledge_ask import (
+    KnowledgeAskReportV1,
+    KnowledgeAsksV1,
+    validate_knowledge_ask_report_v1,
+)
 from gezhi._knowledge_read import (
     KnowledgeReadReportV1,
     KnowledgeReadsV1,
@@ -16,7 +21,101 @@ from gezhi._presentation import (
 )
 
 _OUTPUT_CAP = 1_048_576
+_ASK_JSON_OUTPUT_CAP = 65_536
+_ASK_HUMAN_OUTPUT_CAP = 532_480
 _WRITE_CHUNK = 65_536
+_ASK_PRIMARY = {
+    "invalid_question": (
+        "knowledge.ask.invalid_question.v1",
+        "问题为空、语义不足或包含不支持的控制字符",
+        "输入一个单轮、自包含且可读的问题后重试",
+    ),
+    "question_too_large": (
+        "knowledge.ask.question_too_large.v1",
+        "问题超过 2000 个 Unicode code point 或 8192 个 UTF-8 字节",
+        "缩短问题后重试",
+    ),
+    "question_too_complex": (
+        "knowledge.ask.question_too_complex.v1",
+        "问题产生的安全检索原子超过上限",
+        "减少并列术语或拆成更具体的单轮问题后重试",
+    ),
+    "configuration_invalid": (
+        "knowledge.ask.configuration_invalid.v1",
+        "格致配置的格式、版本或字段无效",
+        "运行 gezhi doctor 检查配置能力，并在外部修正版本化配置后重试",
+    ),
+    "configuration_incompatible": (
+        "knowledge.ask.configuration_incompatible.v1",
+        "格致配置与冻结的运行角色不兼容",
+        "恢复与当前版本匹配的冻结配置后重试",
+    ),
+    "provenance_unavailable": (
+        "knowledge.ask.provenance_unavailable.v1",
+        "无法形成本次运行所需的仓库 provenance",
+        "在外部恢复可验证的 Git provenance 后重试",
+    ),
+    "data_root_unavailable": (
+        "knowledge.ask.data_root_unavailable.v1",
+        "Knowledge 数据目录不存在、不可访问或不是普通本机目录",
+        "运行 gezhi doctor 检查 Knowledge Data Root 能力，并在外部恢复已配置目录后重试",
+    ),
+    "data_root_unsafe": (
+        "knowledge.ask.data_root_unsafe.v1",
+        "Knowledge 数据目录违反本机路径或隔离安全边界",
+        "运行 gezhi doctor 检查 Knowledge Data Root 能力，并在外部改用安全且隔离的本机目录",
+    ),
+    "data_root_identity_unavailable": (
+        "knowledge.ask.data_root_identity_unavailable.v1",
+        "无法取得 Knowledge 数据目录的稳定物理身份",
+        "运行 gezhi doctor 检查 Knowledge Data Root 能力，并改用支持稳定文件身份的本机文件系统",
+    ),
+    "answer_writer_busy": (
+        "knowledge.ask.answer_writer_busy.v1",
+        "另一个 knowledge ask 正在写入同一 Knowledge 数据目录",
+        "等待另一个回答完成后重试",
+    ),
+    "answer_writer_coordination_unavailable": (
+        "knowledge.ask.answer_writer_coordination_unavailable.v1",
+        "无法建立 Knowledge Answer 单写者协调",
+        "运行 gezhi status 观察 Knowledge 状态（status 不会修复），在外部恢复 Windows 单写者协调后重试",
+    ),
+    "pre_answer_formation_failed": (
+        "knowledge.ask.pre_answer_formation_failed.v1",
+        "Answer 身份建立前的本地审计对象形成失败",
+        "运行 gezhi status 观察整体状态（status 不会修复），保留现场并检查本地对象形成",
+    ),
+    "data_root_integrity_lost": (
+        "knowledge.ask.data_root_integrity_lost.v1",
+        "Knowledge 数据目录身份在执行中失去可信性",
+        "停止写入并运行 gezhi status 观察完整性风险（status 不会修复）；必要时运行 gezhi doctor 检查当前 Data Root 能力",
+    ),
+    "orphan_scan_failed": (
+        "knowledge.ask.orphan_scan_failed.v1",
+        "历史 Answer staging 无法安全完成扫描",
+        "运行 gezhi status 观察 staging 风险（status 不会修复）；不要手动移动、删除或修补 staging",
+    ),
+    "answer_staging_failed": (
+        "knowledge.ask.answer_staging_failed.v1",
+        "本次 Answer staging 或非终态资产形成失败",
+        "运行 gezhi status 观察 staging 风险（status 不会修复），保留现场后检查存储与权限",
+    ),
+    "answer_manifest_failed": (
+        "knowledge.ask.answer_manifest_failed.v1",
+        "本次 Answer terminal manifest 形成或复验失败",
+        "保留 staging 并运行 gezhi status 观察 staging 与 Answer 整体状态（status 不会复验或修复 manifest）；不要手动补写 manifest",
+    ),
+    "answer_target_conflict": (
+        "knowledge.ask.answer_target_conflict.v1",
+        "本次 Answer 的同身份正式 target 已存在",
+        "运行 gezhi status 观察 Knowledge 与 Answer 整体状态（status 不会判定或修复该冲突）；不要覆盖、删除或合并现有 Answer",
+    ),
+    "answer_commit_failed": (
+        "knowledge.ask.answer_commit_failed.v1",
+        "本次 Answer 的原子目录提交确定失败",
+        "保留 staging 并运行 gezhi status 观察 staging 与 Answer 整体状态（status 不会判定或修复该提交），再在外部检查存储",
+    ),
+}
 _DISCLOSURE = (
     "治理说明：以下结果仅为已审核但尚未晋升的 Candidate Knowledge，"
     "不代表已晋升知识、已验证事实或自动蕴含证明。"
@@ -275,9 +374,7 @@ def _prepare_knowledge_read_presentation_v1(
     return _PreparedKnowledgeReadPresentationV1(
         report=prepared.report,
         buffer=(
-            prepared.json_buffer
-            if json_output
-            else _human_buffer_v1(prepared.report)
+            prepared.json_buffer if json_output else _human_buffer_v1(prepared.report)
         ),
         json_output=json_output,
     )
@@ -389,8 +486,145 @@ def run_ask(
     json_output: bool,
     cli_patch: tuple[tuple[str, str], ...],
 ) -> int:
-    del question, json_output, cli_patch
-    raise RuntimeError("Knowledge ask is not implemented")
+    prepared_candidate: _PreparedKnowledgeAskPresentationV1 | None = None
+
+    def seal_report(
+        report: KnowledgeAskReportV1,
+        answer_markdown_bytes: bytes | None,
+    ) -> KnowledgeAskReportV1:
+        nonlocal prepared_candidate
+        try:
+            prepared_candidate = _prepare_knowledge_ask_presentation_v1(
+                report,
+                json_output=json_output,
+                answer_markdown_bytes=answer_markdown_bytes,
+            )
+        except Exception as error:
+            raise _KnowledgeAskPresentationSealFailedV1 from error
+        return prepared_candidate.report
+
+    try:
+        report = KnowledgeAsksV1.ask(
+            question,
+            cli_patch=cli_patch,
+            report_sealer=seal_report,
+        )
+    except _KnowledgeAskPresentationSealFailedV1:
+        os._exit(1)
+    try:
+        candidate = (
+            _prepare_knowledge_ask_presentation_v1(
+                report,
+                json_output=json_output,
+                answer_markdown_bytes=None,
+            )
+            if prepared_candidate is None
+            else prepared_candidate
+        )
+        if prepared_candidate is not None and (
+            candidate.report != report or candidate.json_output is not json_output
+        ):
+            raise ValueError("Knowledge ask presentation candidate differs")
+    except Exception:  # noqa: BLE001 - the contract hard-stops seal failures.
+        os._exit(1)
+    write_binary_buffer_v1(candidate.buffer, fd=1, max_chunk_size=_WRITE_CHUNK)
+    return {"succeeded": 0, "blocked": 2, "failed": 1, "interrupted": 130}[
+        report.outcome
+    ]
+
+
+def _knowledge_ask_json_buffer_v1(report: KnowledgeAskReportV1) -> bytes:
+    validate_knowledge_ask_report_v1(report)
+    diagnostics = (
+        []
+        if report.reason is None
+        else [
+            {
+                "code": _ASK_PRIMARY[report.reason][0],
+                "context": {},
+            }
+        ]
+    )
+    return cli_json_buffer_v1(
+        command="knowledge.ask",
+        outcome=report.outcome,
+        result=report.result,
+        diagnostics=diagnostics,
+        output_cap=_ASK_JSON_OUTPUT_CAP,
+    )
+
+
+def _knowledge_ask_human_buffer_v1(
+    report: KnowledgeAskReportV1,
+    *,
+    answer_markdown_bytes: bytes | None,
+) -> bytes:
+    validate_knowledge_ask_report_v1(report)
+    if report.outcome == "succeeded":
+        if (
+            type(report.result) is not dict
+            or type(answer_markdown_bytes) is not bytes
+            or answer_markdown_bytes.startswith(b"\xef\xbb\xbf")
+            or b"\r" in answer_markdown_bytes
+            or b"\x00" in answer_markdown_bytes
+            or not answer_markdown_bytes.endswith(b"\n")
+        ):
+            raise ValueError("Knowledge ask committed Markdown is invalid")
+        answer_id = report.result["answer_id"]
+        if type(answer_id) is not str:
+            raise TypeError("Knowledge ask Human Answer ID is invalid")
+        payload = (
+            f"Knowledge ask：完成\nAnswer ID：{answer_id}\n下一步：无需操作\n\n"
+        ).encode() + answer_markdown_bytes
+    else:
+        if answer_markdown_bytes is not None or report.reason not in _ASK_PRIMARY:
+            raise ValueError("Knowledge ask Human diagnostic is invalid")
+        _code, reason, next_step = _ASK_PRIMARY[report.reason]
+        heading = {
+            "blocked": "Knowledge ask：已阻塞",
+            "failed": "Knowledge ask：失败",
+            "interrupted": "Knowledge ask：已中断",
+        }[report.outcome]
+        payload = (f"{heading}\n原因：{reason}\n下一步：{next_step}\n").encode()
+    if len(payload) > _ASK_HUMAN_OUTPUT_CAP:
+        raise ValueError("Knowledge ask Human output exceeds its byte limit")
+    return payload
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedKnowledgeAskPresentationV1:
+    report: KnowledgeAskReportV1
+    buffer: bytes
+    json_output: bool
+
+
+class _KnowledgeAskPresentationSealFailedV1(RuntimeError):
+    pass
+
+
+def _prepare_knowledge_ask_presentation_v1(
+    report: KnowledgeAskReportV1,
+    *,
+    json_output: bool,
+    answer_markdown_bytes: bytes | None,
+) -> _PreparedKnowledgeAskPresentationV1:
+    validate_knowledge_ask_report_v1(report)
+    if type(json_output) is not bool:
+        raise TypeError("Knowledge ask presentation mode is invalid")
+    if report.outcome != "succeeded" and answer_markdown_bytes is not None:
+        raise ValueError("Knowledge ask non-success has committed Markdown")
+    return _PreparedKnowledgeAskPresentationV1(
+        report=report,
+        buffer=(
+            _knowledge_ask_json_buffer_v1(report)
+            if json_output
+            else _knowledge_ask_human_buffer_v1(
+                report,
+                answer_markdown_bytes=answer_markdown_bytes,
+            )
+        ),
+        json_output=json_output,
+    )
 
 
 __all__ = [

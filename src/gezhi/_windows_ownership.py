@@ -36,6 +36,7 @@ WriterScope: TypeAlias = Literal[
     "work",
     "catalog_projection",
     "knowledge_registry",
+    "knowledge_answer",
 ]
 _registry_guard = threading.Lock()
 _process_leases: dict[str, int] = {}
@@ -90,6 +91,33 @@ class WriterOwnershipV1:
                     "Work writer ownership proof is invalid"
                 )
 
+    def assert_knowledge_answer_ownership_v1(
+        self,
+        root_identity: FileIdentity,
+    ) -> None:
+        """Prove this live token owns one Knowledge Answer root."""
+
+        identity = _validated_answer_root_identity(root_identity)
+        expected_name = _mutex_name(
+            identity,
+            scope="knowledge_answer",
+            work_id=None,
+        )
+        thread_id = threading.get_ident()
+        with _registry_guard:
+            if (
+                self._closed
+                or self.scope != "knowledge_answer"
+                or self.work_id is not None
+                or self._name != expected_name
+                or self._handle == 0
+                or self._thread_id != thread_id
+                or _process_leases.get(expected_name) != thread_id
+            ):
+                raise WriterOwnershipLifecycleErrorV1(
+                    "Knowledge Answer writer ownership proof is invalid"
+                )
+
     def close(self) -> None:
         if self._closed:
             return
@@ -136,19 +164,41 @@ def _validated_root_identity(value: object) -> FileIdentity:
     return value
 
 
+def _validated_answer_root_identity(value: object) -> FileIdentity:
+    if (
+        type(value) is not tuple
+        or len(value) != 2
+        or type(value[0]) is not int
+        or not 0 <= value[0] <= 0xFFFFFFFFFFFFFFFF
+        or type(value[1]) is not int
+        or not 1 <= value[1] <= (1 << 128) - 1
+    ):
+        raise ValueError("Knowledge Answer Data Root identity is invalid")
+    return value
+
+
 def _mutex_name(
     root_identity: FileIdentity,
     *,
     scope: WriterScope,
     work_id: str | None,
 ) -> str:
+    if scope == "knowledge_answer":
+        identity = _validated_answer_root_identity(root_identity)
+        material = (
+            b"gezhi.knowledge_answer_writer.v1\x00"
+            + identity[0].to_bytes(8, "little", signed=False)
+            + identity[1].to_bytes(16, "little", signed=False)
+        )
+        return (
+            "Global\\Gezhi.KnowledgeAnswerWriter.v1."
+            + hashlib.sha256(material).hexdigest()
+        )
     material = (
         f"{root_identity[0]}:{root_identity[1]}:{scope}:{work_id or '-'}"
     ).encode("ascii")
     context = "Knowledge" if scope == "knowledge_registry" else "Literature"
-    return (
-        f"Global\\Gezhi.{context}.Writer." + hashlib.sha256(material).hexdigest()
-    )
+    return f"Global\\Gezhi.{context}.Writer." + hashlib.sha256(material).hexdigest()
 
 
 def _try_acquire(
@@ -157,7 +207,11 @@ def _try_acquire(
     scope: WriterScope,
     work_id: str | None,
 ) -> WriterOwnershipV1 | None:
-    identity = _validated_root_identity(root_identity)
+    identity = (
+        _validated_answer_root_identity(root_identity)
+        if scope == "knowledge_answer"
+        else _validated_root_identity(root_identity)
+    )
     name = _mutex_name(identity, scope=scope, work_id=work_id)
     thread_id = threading.get_ident()
     with _registry_guard:
@@ -182,9 +236,7 @@ def _try_acquire(
         if verdict not in {_WAIT_OBJECT_0, _WAIT_ABANDONED}:
             _CLOSE_HANDLE(numeric_handle)
             if verdict == _WAIT_FAILED:
-                raise WriterOwnershipLifecycleErrorV1(
-                    "WaitForSingleObject failed"
-                )
+                raise WriterOwnershipLifecycleErrorV1("WaitForSingleObject failed")
             raise WriterOwnershipLifecycleErrorV1(
                 "WaitForSingleObject returned an invalid verdict"
             )
@@ -239,5 +291,15 @@ def try_acquire_knowledge_registry_writer_v1(
     return _try_acquire(
         root_identity,
         scope="knowledge_registry",
+        work_id=None,
+    )
+
+
+def try_acquire_knowledge_answer_writer_v1(
+    root_identity: FileIdentity,
+) -> WriterOwnershipV1 | None:
+    return _try_acquire(
+        root_identity,
+        scope="knowledge_answer",
         work_id=None,
     )
