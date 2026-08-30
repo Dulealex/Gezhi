@@ -373,3 +373,184 @@ def test_attempt_workspace_formation_failure_is_input_invalid(
             question_bytes=b"{}\n",
             knowledge_root=tmp_path,
         )
+
+
+def test_retry_workspace_failure_preserves_the_completed_timeout_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    retrieval = _patch_answerer_pre_attempt_inputs_v1(monkeypatch, tmp_path)
+    package_root = tmp_path / "g1234567"
+    attempt_root = package_root / "attempt"
+    attempt_root.mkdir(parents=True)
+    package = answerer._AttemptPackageV1(
+        root=package_root,
+        attempt_root=attempt_root,
+        schema_path=package_root / "schema.json",
+    )
+    capture = CaptureEvidenceV1(
+        path=attempt_root / "unused-capture",
+        byte_length=0,
+        sha256="0" * 64,
+        overflow=False,
+    )
+    evidence = AttemptTerminalEvidenceV1(
+        role="knowledge_answerer_v1",
+        attempt_ordinal=1,
+        commit_wall_time="2026-08-30T20:00:00.000Z",
+        commit_monotonic_ns=1,
+        provider_started_monotonic_ns=2,
+        attempt_deadline_monotonic_ns=50,
+        shared_deadline_monotonic_ns=10**30,
+        capture_ready_monotonic_ns=51,
+        exit_code=0x475A0001,
+        mechanical_outcome="timeout",
+        events=capture,
+        final_message=capture,
+        create_process_calls=1,
+        stop_calls=1,
+        resource_ledger_count=0,
+        lifecycle_facts=(),
+    )
+    frozen_attempt = answerer.KnowledgeAnswerAttemptV1({}, b"events", b"final")
+    preparation_calls = 0
+
+    def prepare_attempt(_root: Path) -> answerer._AttemptPackageV1:
+        nonlocal preparation_calls
+        preparation_calls += 1
+        if preparation_calls == 1:
+            return package
+        raise answerer.KnowledgeAnswererInputInvalidV1("retry workspace rejected")
+
+    monkeypatch.setattr(answerer, "_create_attempt_package_v1", prepare_attempt)
+    monkeypatch.setattr(answerer, "_remove_attempt_package_v1", lambda *_args: None)
+    monkeypatch.setattr(answerer, "_run_role_attempt_v1", lambda _request: evidence)
+    monkeypatch.setattr(
+        answerer,
+        "_attempt_from_evidence_v1",
+        lambda _evidence, **_kwargs: (frozen_attempt, "timeout", ()),
+    )
+    monkeypatch.setattr(
+        answerer,
+        "_wait_retry_backoff_v1",
+        lambda **_kwargs: "ready",
+    )
+
+    verdict = answerer.answer_nonzero_v1(
+        retrieval,  # type: ignore[arg-type]
+        question_bytes=b"{}\n",
+        knowledge_root=tmp_path,
+    )
+
+    assert verdict.status == "blocked"
+    assert verdict.error == {
+        "code": "codex_runtime_unavailable",
+        "stage": "synthesis",
+    }
+    assert verdict.attempts == (frozen_attempt,)
+    assert preparation_calls == 2
+
+
+def test_third_attempt_schema_failure_preserves_both_completed_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    retrieval = _patch_answerer_pre_attempt_inputs_v1(monkeypatch, tmp_path)
+    preparation_calls = 0
+    run_ordinals: list[int] = []
+    removed_packages: list[Path] = []
+    frozen_attempts: list[answerer.KnowledgeAnswerAttemptV1] = []
+
+    def prepare_attempt(_root: Path) -> answerer._AttemptPackageV1:
+        nonlocal preparation_calls
+        preparation_calls += 1
+        package_root = tmp_path / f"g{preparation_calls:07d}"
+        attempt_root = package_root / "attempt"
+        attempt_root.mkdir(parents=True)
+        schema_path = package_root / "schema.json"
+        if preparation_calls == 3:
+            schema_path.write_bytes(b"occupied")
+        return answerer._AttemptPackageV1(
+            root=package_root,
+            attempt_root=attempt_root,
+            schema_path=schema_path,
+        )
+
+    def run_attempt(
+        request: answerer.KnowledgeAnswerAttemptRequestV1,
+    ) -> AttemptTerminalEvidenceV1:
+        ordinal = request.attempt_ordinal
+        run_ordinals.append(ordinal)
+        capture = CaptureEvidenceV1(
+            path=request.attempt_root / "unused-capture",
+            byte_length=0,
+            sha256="0" * 64,
+            overflow=False,
+        )
+        return AttemptTerminalEvidenceV1(
+            role="knowledge_answerer_v1",
+            attempt_ordinal=ordinal,
+            commit_wall_time="2026-08-30T20:00:00.000Z",
+            commit_monotonic_ns=ordinal,
+            provider_started_monotonic_ns=ordinal + 1,
+            attempt_deadline_monotonic_ns=50 + ordinal,
+            shared_deadline_monotonic_ns=10**30,
+            capture_ready_monotonic_ns=51 + ordinal,
+            exit_code=0x475A0001,
+            mechanical_outcome="timeout",
+            events=capture,
+            final_message=capture,
+            create_process_calls=1,
+            stop_calls=1,
+            resource_ledger_count=0,
+            lifecycle_facts=(),
+        )
+
+    def project_attempt(
+        evidence: AttemptTerminalEvidenceV1,
+        **_kwargs: object,
+    ) -> tuple[answerer.KnowledgeAnswerAttemptV1, str, tuple[object, ...]]:
+        item = answerer.KnowledgeAnswerAttemptV1(
+            {"ordinal": evidence.attempt_ordinal},
+            f"events-{evidence.attempt_ordinal}".encode(),
+            f"final-{evidence.attempt_ordinal}".encode(),
+        )
+        frozen_attempts.append(item)
+        return item, "timeout", ()
+
+    monkeypatch.setattr(answerer, "_create_attempt_package_v1", prepare_attempt)
+    monkeypatch.setattr(
+        answerer,
+        "_remove_attempt_package_v1",
+        lambda package_root, _temporary_root: removed_packages.append(package_root),
+    )
+    monkeypatch.setattr(answerer, "_run_role_attempt_v1", run_attempt)
+    monkeypatch.setattr(answerer, "_attempt_from_evidence_v1", project_attempt)
+    monkeypatch.setattr(
+        answerer,
+        "_wait_retry_backoff_v1",
+        lambda **_kwargs: "ready",
+    )
+
+    verdict = answerer.answer_nonzero_v1(
+        retrieval,  # type: ignore[arg-type]
+        question_bytes=b"{}\n",
+        knowledge_root=tmp_path,
+    )
+
+    assert verdict.status == "blocked"
+    assert verdict.error == {
+        "code": "codex_runtime_unavailable",
+        "stage": "synthesis",
+    }
+    assert verdict.attempts == tuple(frozen_attempts)
+    assert [attempt.events_bytes for attempt in verdict.attempts] == [
+        b"events-1",
+        b"events-2",
+    ]
+    assert run_ordinals == [1, 2]
+    assert removed_packages == [
+        tmp_path / "g0000001",
+        tmp_path / "g0000002",
+        tmp_path / "g0000003",
+    ]

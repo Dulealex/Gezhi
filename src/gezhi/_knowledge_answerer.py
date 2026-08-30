@@ -694,7 +694,6 @@ def _attempt_from_evidence_v1(
     process_error_won = (
         bool(overflow_channels)
         or not events_valid
-        or has_provider_terminal_failure
         or evidence.resource_ledger_count != 0
         or evidence.mechanical_outcome == "process_error"
     )
@@ -714,7 +713,7 @@ def _attempt_from_evidence_v1(
         failure_class = "interrupted"
     elif evidence.mechanical_outcome == "timeout":
         failure_class = "timeout"
-    elif (
+    elif has_provider_terminal_failure or (
         evidence.mechanical_outcome != "clean"
         or evidence.exit_code != 0
         or not has_completed
@@ -1158,6 +1157,17 @@ def answer_nonzero_v1(
                 return _stopped_answerer_v1(
                     status="interrupted",
                     error=None,
+                    prompt_bytes=prompt_bytes,
+                    schema_bytes=schema_bytes,
+                    attempts=tuple(attempts),
+                )
+            if attempts:
+                return _stopped_answerer_v1(
+                    status="blocked",
+                    error={
+                        "code": "codex_runtime_unavailable",
+                        "stage": "synthesis",
+                    },
                     prompt_bytes=prompt_bytes,
                     schema_bytes=schema_bytes,
                     attempts=tuple(attempts),

@@ -271,6 +271,36 @@ def test_provider_terminal_cannot_be_hidden_by_a_completed_record(
     assert attempt.record["failure_class"] == "process_error"
 
 
+@pytest.mark.parametrize(
+    ("classification_ready_ns", "cancel_observed_ns", "expected_failure_class"),
+    (
+        (1_700_000_000, 1_600_000_000, "interrupted"),
+        (1_810_000_000, 1_810_000_000, "interrupted"),
+        (1_810_000_000, None, "timeout"),
+    ),
+)
+def test_local_signal_precedes_provider_terminal_classification(
+    tmp_path: Path,
+    classification_ready_ns: int,
+    cancel_observed_ns: int | None,
+    expected_failure_class: str,
+) -> None:
+    evidence = _evidence(
+        tmp_path,
+        events=_json_line({"type": "turn.failed", "error": {"message": "failed"}}),
+    )
+
+    attempt, failure_class, overflow_channels = _project_attempt_v1(
+        evidence,
+        classification_ready_monotonic_ns=classification_ready_ns,
+        cancellation=_FixedCancellationV1(cancel_observed_ns),
+    )
+
+    assert failure_class == expected_failure_class
+    assert overflow_channels == ()
+    assert attempt.record["failure_class"] == expected_failure_class
+
+
 def test_exact_cap_skips_usage_projection_without_decoding(tmp_path: Path) -> None:
     completed = (
         b'{"type":"turn.completed","usage":'

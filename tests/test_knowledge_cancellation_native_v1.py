@@ -5,6 +5,7 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
 from launcher_support import (
     PYTHON_EXE,
     REPOSITORY_ROOT,
@@ -128,6 +129,50 @@ def test_test_hooks_require_an_explicit_nonproduction_output_path() -> None:
 
     assert completed.returncode != 0
     assert b"explicit OutputPath" in completed.stderr
+    assert hashlib.sha256(production.read_bytes()).hexdigest() == before
+
+
+@pytest.mark.parametrize(
+    "output_path",
+    (
+        str(REPOSITORY_ROOT / "src" / "gezhi" / "_native" / "gezhi_cancel_v1.dll"),
+        str(
+            REPOSITORY_ROOT / "src" / "gezhi" / "_native" / "gezhi_cancel_v1.dll"
+        ).swapcase(),
+        r"src\gezhi\_native\..\_native\gezhi_cancel_v1.dll",
+    ),
+    ids=("absolute", "case-alias", "relative-dotdot-alias"),
+)
+def test_test_hooks_reject_production_output_aliases_before_tool_discovery(
+    output_path: str,
+) -> None:
+    production = REPOSITORY_ROOT / "src" / "gezhi" / "_native" / "gezhi_cancel_v1.dll"
+    before = hashlib.sha256(production.read_bytes()).hexdigest()
+
+    completed = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            str(REPOSITORY_ROOT / "tools" / "build-knowledge-cancellation.ps1"),
+            "-OutputPath",
+            output_path,
+            "-TestHooks",
+        ],
+        check=False,
+        capture_output=True,
+        cwd=REPOSITORY_ROOT,
+        env=subprocess_environment(
+            updates={
+                "ProgramFiles(x86)": str(REPOSITORY_ROOT / "missing-program-files-x86")
+            }
+        ),
+        timeout=15,
+    )
+
+    assert completed.returncode != 0
+    assert b"refuses the production DLL OutputPath" in completed.stderr
+    assert b"vswhere" not in completed.stderr
     assert hashlib.sha256(production.read_bytes()).hexdigest() == before
 
 
