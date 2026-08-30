@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import sqlite3
+import subprocess
 import uuid
 from collections.abc import Iterator
 from contextlib import closing
@@ -12,7 +13,13 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
-from launcher_support import SOURCE_ROOT, run_both_launchers
+from launcher_support import (
+    PYTHON_EXE,
+    REPOSITORY_ROOT,
+    SOURCE_ROOT,
+    run_both_launchers,
+    subprocess_environment,
+)
 from support.reviewed_handoff_witness_v1 import (
     ACCEPT_CANDIDATES_V1,
     ACCEPT_MANIFEST_V1,
@@ -448,25 +455,53 @@ def test_ask_stops_when_the_knowledge_root_is_unavailable(
 def test_ask_does_not_wait_when_the_answer_writer_is_busy(
     empty_knowledge_ask_root: Path,
 ) -> None:
-    from gezhi._windows_data_root import open_validated_data_root_v1
-    from gezhi._windows_ownership import try_acquire_knowledge_answer_writer_v1
-
-    with open_validated_data_root_v1(str(empty_knowledge_ask_root)) as root:
-        identity = root.inspection.identity
-        assert identity is not None
-        owner = try_acquire_knowledge_answer_writer_v1(identity)
-        assert owner is not None
-        with owner:
-            results = run_both_launchers(
-                (
-                    "--knowledge-data-root",
-                    str(empty_knowledge_ask_root),
-                    "knowledge",
-                    "ask",
-                    "Which evidence supports this conclusion?",
-                    "--json",
-                )
+    source = (
+        "import sys\n"
+        "from gezhi._windows_data_root import open_validated_data_root_v1\n"
+        "from gezhi._windows_ownership import "
+        "try_acquire_knowledge_answer_writer_v1\n"
+        f"root = open_validated_data_root_v1({str(empty_knowledge_ask_root)!r})\n"
+        "with root:\n"
+        "    identity = root.inspection.identity\n"
+        "    assert identity is not None\n"
+        "    owner = try_acquire_knowledge_answer_writer_v1(identity)\n"
+        "    assert owner is not None\n"
+        "    with owner:\n"
+        "        print('ready', flush=True)\n"
+        "        sys.stdin.buffer.read(1)\n"
+    )
+    writer = subprocess.Popen(
+        [str(PYTHON_EXE), "-c", source],
+        cwd=REPOSITORY_ROOT,
+        env=subprocess_environment(),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+    try:
+        assert writer.stdout is not None
+        assert writer.stdout.readline() in {b"ready\n", b"ready\r\n"}
+        results = run_both_launchers(
+            (
+                "--knowledge-data-root",
+                str(empty_knowledge_ask_root),
+                "knowledge",
+                "ask",
+                "Which evidence supports this conclusion?",
+                "--json",
             )
+        )
+        assert writer.stdin is not None
+        writer.stdin.write(b"x")
+        writer.stdin.close()
+        assert writer.wait(timeout=5) == 0
+        assert writer.stderr is not None
+        assert writer.stderr.read() == b""
+    finally:
+        if writer.poll() is None:
+            writer.kill()
+            writer.wait(timeout=5)
 
     for result in results:
         assert result.returncode == 2
