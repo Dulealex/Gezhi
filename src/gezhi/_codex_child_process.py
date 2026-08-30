@@ -687,6 +687,18 @@ class _FinalCapture:
     private_capture_path: Path | None
 
 
+@dataclass(slots=True)
+class _ExternalBaseExceptionLatch:
+    error: BaseException | None = None
+
+    def observe(self, error: BaseException) -> bool:
+        if isinstance(error, Exception):
+            return False
+        if self.error is None:
+            self.error = error
+        return True
+
+
 def _win32_error(message: str) -> CodexChildWin32ErrorV1:
     return CodexChildWin32ErrorV1(
         f"{message} (Win32 {ctypes.get_last_error()})"
@@ -720,24 +732,26 @@ def _observe_cancellation_v1(
 def _observe_cancellation_after_commit(
     cancellation: CancellationObservationV1,
     structural_failures: list[str],
+    external_exceptions: _ExternalBaseExceptionLatch,
 ) -> tuple[int | None, bool]:
     try:
         return _observe_cancellation_v1(cancellation), False
     except BaseException as error:  # noqa: BLE001 - committed boundary must settle.
-        structural_failures.append(
-            f"cancellation_observation:{type(error).__name__}"
-        )
+        external_exceptions.observe(error)
+        structural_failures.append(f"cancellation_observation:{type(error).__name__}")
         return None, True
 
 
 def _monotonic_after_commit(
     structural_failures: list[str],
+    external_exceptions: _ExternalBaseExceptionLatch,
     *,
     fallback_ns: int,
 ) -> tuple[int, bool]:
     try:
         return _monotonic_now_ns_v1(), False
     except BaseException as error:  # noqa: BLE001 - committed boundary must settle.
+        external_exceptions.observe(error)
         structural_failures.append(f"monotonic_clock:{type(error).__name__}")
         return fallback_ns, True
 
@@ -2124,6 +2138,7 @@ def _run_codex_child_core_v1(
     contain_suspended_root_directly = False
     assignment_succeeded = False
     structural_failures = _StructuralFailures()
+    external_exceptions = _ExternalBaseExceptionLatch()
     committed_unsafe_error: CodexChildUnsafeHoldErrorV1 | None = None
     create_process_calls = 1
     stop_calls = 0
@@ -2150,8 +2165,10 @@ def _run_codex_child_core_v1(
         commit_wall_time = _utc_now()
         cancel_before_commit = _observe_cancellation_v1(cancellation)
         commit_monotonic_ns = _monotonic_now_ns_v1()
-    except BaseException as error:  # noqa: BLE001 - precommit gate is closed.
+    except BaseException as error:
         _cleanup_precommit(prepared, plan)
+        if not isinstance(error, Exception):
+            raise
         return PreAttemptRejectedV1(
             reason=f"commit_gate_failed:{type(error).__name__}",
             resource_ledger_count=prepared.ledger.count(),
@@ -2189,6 +2206,7 @@ def _run_codex_child_core_v1(
             )
         )
     except BaseException as error:  # noqa: BLE001 - committed syscall adapter.
+        external_exceptions.observe(error)
         structural_failures.append(
             f"create_process_exception:{type(error).__name__}"
         )
@@ -2200,12 +2218,17 @@ def _run_codex_child_core_v1(
         except CodexChildUnsafeHoldErrorV1 as error:
             latch_committed_unsafe("attribute_list_delete", error)
         except BaseException as error:  # noqa: BLE001 - committed settlement.
-            latch_committed_unsafe(
-                "attribute_list_delete",
-                CodexChildUnsafeHoldErrorV1(
-                    f"attribute list deletion raised {type(error).__name__}"
-                ),
-            )
+            if external_exceptions.observe(error):
+                structural_failures.append(
+                    f"attribute_list_delete:{type(error).__name__}"
+                )
+            else:
+                latch_committed_unsafe(
+                    "attribute_list_delete",
+                    CodexChildUnsafeHoldErrorV1(
+                        f"attribute list deletion raised {type(error).__name__}"
+                    ),
+                )
         prepared.worker_activation.set()
         for label in ("environment-block", "command-line-buffer"):
             if prepared.ledger.contains(label):
@@ -2243,6 +2266,7 @@ def _run_codex_child_core_v1(
             process.activate(raw_process)
             primary_thread.activate(raw_thread)
         except BaseException as error:  # noqa: BLE001 - committed adoption.
+            external_exceptions.observe(error)
             adoption_failed = True
             structural_failures.append(
                 f"process_handle_adoption:{type(error).__name__}"
@@ -2272,6 +2296,7 @@ def _run_codex_child_core_v1(
                     )
                 )
             except BaseException as error:  # noqa: BLE001 - committed syscall.
+                external_exceptions.observe(error)
                 structural_failures.append(
                     f"assign_process_to_job_exception:{type(error).__name__}"
                 )
@@ -2315,9 +2340,11 @@ def _run_codex_child_core_v1(
         gate_cancel, gate_cancel_fault = _observe_cancellation_after_commit(
             cancellation,
             structural_failures,
+            external_exceptions,
         )
         gate_now_ns, gate_clock_fault = _monotonic_after_commit(
             structural_failures,
+            external_exceptions,
             fallback_ns=commit_monotonic_ns,
         )
         gate_deadline_ns = plan.existing_shared_deadline_monotonic_ns
@@ -2334,6 +2361,7 @@ def _run_codex_child_core_v1(
             try:
                 previous = int(_RESUME_THREAD(primary_thread.value))
             except BaseException as error:  # noqa: BLE001 - committed syscall.
+                external_exceptions.observe(error)
                 structural_failures.append(
                     f"resume_thread_exception:{type(error).__name__}"
                 )
@@ -2344,6 +2372,7 @@ def _run_codex_child_core_v1(
                     started_observation_ns, started_clock_fault = (
                         _monotonic_after_commit(
                             structural_failures,
+                            external_exceptions,
                             fallback_ns=gate_now_ns,
                         )
                     )
@@ -2404,10 +2433,12 @@ def _run_codex_child_core_v1(
             _observe_cancellation_after_commit(
                 cancellation,
                 structural_failures,
+                external_exceptions,
             )
         )
         now_ns, _clock_fault = _monotonic_after_commit(
             structural_failures,
+            external_exceptions,
             fallback_ns=last_now_ns,
         )
         last_now_ns = now_ns
@@ -2529,8 +2560,9 @@ def _run_codex_child_core_v1(
         _close_prepared_non_job(prepared)
         capture_ready_observation_ns, capture_clock_fault = (
             _monotonic_after_commit(
-            structural_failures,
-            fallback_ns=last_now_ns,
+                structural_failures,
+                external_exceptions,
+                fallback_ns=last_now_ns,
             )
         )
         capture_ready_ns = (
@@ -2542,6 +2574,7 @@ def _run_codex_child_core_v1(
             _observe_cancellation_after_commit(
                 cancellation,
                 structural_failures,
+                external_exceptions,
             )
         )
         outcome = _classify_mechanical_outcome_v1(
@@ -2565,8 +2598,16 @@ def _run_codex_child_core_v1(
             raise CodexChildUnsafeHoldErrorV1(
                 "terminal failure ledger is not zero"
             ) from terminal_error
+        if external_exceptions.error is not None:
+            raise external_exceptions.error
         raise
     prepared.job.close()
+    if external_exceptions.error is not None:
+        if prepared.ledger.count() != 0:
+            raise CodexChildUnsafeHoldErrorV1(
+                "external interruption ledger is not zero"
+            ) from external_exceptions.error
+        raise external_exceptions.error
     if committed_unsafe_error is not None:
         raise CodexChildUnsafeHoldErrorV1(
             "committed attempt settled but resource ownership is uncertain"

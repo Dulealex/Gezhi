@@ -100,6 +100,17 @@ class _FaultOnCancellationObservation:
             raise RuntimeError("injected cancellation observation fault")
 
 
+class _KeyboardInterruptOnCancellationObservation:
+    def __init__(self, call: int) -> None:
+        self._interrupt_call = call
+        self.calls = 0
+
+    def observed_at_monotonic_ns(self) -> None:
+        self.calls += 1
+        if self.calls == self._interrupt_call:
+            raise KeyboardInterrupt
+
+
 class _FaultAfterCaptureInstall:
     def __init__(self, capture: Path) -> None:
         self._capture = capture
@@ -810,6 +821,133 @@ def test_final_precommit_gate_fault_rolls_back_without_an_attempt(
     assert result.resource_ledger_count == 0
     assert not Path(plan.capture_directory).exists()
     assert not Path(plan.staging_directory).exists()
+
+
+@pytest.mark.parametrize("boundary", ["utc", "monotonic", "cancellation"])
+def test_final_precommit_keyboard_interrupt_rolls_back_and_reraises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    plan = _plan(tmp_path, "success")
+    cancellation: object = NeverCancelledV1()
+    ledger_counts: list[int] = []
+    real_count = child_process._ResourceLedger.count
+
+    def interrupt(*_args: object) -> None:
+        raise KeyboardInterrupt
+
+    def observe_count(ledger):  # type: ignore[no-untyped-def]
+        count = real_count(ledger)
+        ledger_counts.append(count)
+        return count
+
+    monkeypatch.setattr(child_process._ResourceLedger, "count", observe_count)
+    if boundary == "utc":
+        monkeypatch.setattr(child_process, "_utc_now", interrupt)
+    elif boundary == "monotonic":
+        monkeypatch.setattr(child_process, "_monotonic_now_ns_v1", interrupt)
+    else:
+        cancellation = _KeyboardInterruptOnCancellationObservation(1)
+
+    with pytest.raises(KeyboardInterrupt):
+        run_codex_child_v1(plan, cancellation)  # type: ignore[arg-type]
+
+    assert ledger_counts[-1] == 0
+    assert not Path(plan.capture_directory).exists()
+    assert not Path(plan.staging_directory).exists()
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    (
+        "cancellation",
+        "monotonic",
+        "create",
+        "attribute-delete",
+        "adoption",
+        "assignment",
+        "resume",
+    ),
+)
+def test_committed_keyboard_interrupt_settles_and_reraises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    plan = _plan(tmp_path, "success", timeout_seconds=10)
+    cancellation: object = NeverCancelledV1()
+    ledger_counts: list[int] = []
+    real_count = child_process._ResourceLedger.count
+
+    def interrupt(*_args: object) -> None:
+        raise KeyboardInterrupt
+
+    def observe_count(ledger):  # type: ignore[no-untyped-def]
+        count = real_count(ledger)
+        ledger_counts.append(count)
+        return count
+
+    monkeypatch.setattr(child_process._ResourceLedger, "count", observe_count)
+    if boundary == "cancellation":
+        cancellation = _KeyboardInterruptOnCancellationObservation(2)
+    elif boundary == "monotonic":
+        real_clock = child_process._monotonic_now_ns_v1
+        clock_calls = 0
+
+        def interrupt_second_clock() -> int:
+            nonlocal clock_calls
+            clock_calls += 1
+            if clock_calls == 2:
+                raise KeyboardInterrupt
+            return real_clock()
+
+        monkeypatch.setattr(
+            child_process,
+            "_monotonic_now_ns_v1",
+            interrupt_second_clock,
+        )
+    elif boundary == "create":
+        monkeypatch.setattr(child_process, "_CREATE_PROCESS", interrupt)
+    elif boundary == "attribute-delete":
+        real_delete = child_process._AttributeList.delete
+        interrupted = False
+
+        def delete_then_interrupt(attribute_list):  # type: ignore[no-untyped-def]
+            nonlocal interrupted
+            real_delete(attribute_list)
+            if not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr(
+            child_process._AttributeList,
+            "delete",
+            delete_then_interrupt,
+        )
+    elif boundary == "adoption":
+        monkeypatch.setattr(child_process._OwnedHandle, "activate", interrupt)
+    elif boundary == "assignment":
+        monkeypatch.setattr(
+            child_process,
+            "_ASSIGN_PROCESS_TO_JOB_OBJECT",
+            interrupt,
+        )
+    else:
+        monkeypatch.setattr(child_process, "_RESUME_THREAD", interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        run_codex_child_v1(plan, cancellation)  # type: ignore[arg-type]
+
+    assert ledger_counts[-1] == 0
+    worker_names = {
+        f"gezhi-codex-stdin-{plan.attempt_ordinal}",
+        f"gezhi-codex-stdout-{plan.attempt_ordinal}",
+    }
+    assert not any(
+        worker.is_alive() and worker.name in worker_names
+        for worker in threading.enumerate()
+    )
 
 
 @pytest.mark.parametrize("fault_call", [2, 3])
