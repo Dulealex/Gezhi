@@ -28,6 +28,10 @@ CliOutcome: TypeAlias = Literal[
 ]
 
 
+class CliJsonOutputTooLargeV1(ValueError):
+    pass
+
+
 def _canonical_json_bytes(value: object) -> bytes:
     return json.dumps(
         value,
@@ -38,17 +42,20 @@ def _canonical_json_bytes(value: object) -> bytes:
     ).encode("utf-8")
 
 
-def operations_json_buffer(
+def cli_json_buffer_v1(
     *,
     command: str,
     outcome: CliOutcome,
     result: Mapping[str, object] | None,
     diagnostics: Sequence[Mapping[str, object]],
+    output_cap: int,
 ) -> bytes:
     if type(command) is not str or command not in _COMMANDS:
         raise ValueError("CLI command is not registered")
     if outcome not in {"succeeded", "blocked", "failed", "interrupted"}:
         raise ValueError("CLI outcome is invalid")
+    if type(output_cap) is not int or output_cap < 1:
+        raise ValueError("CLI output cap is invalid")
     if result is not None and type(result) is not dict:
         raise TypeError("CLI result must be an object or null")
     if type(diagnostics) not in {list, tuple} or len(diagnostics) > 16:
@@ -71,12 +78,29 @@ def operations_json_buffer(
         "result": result,
         "diagnostics": diagnostics,
     }
-    payload = (
-        _canonical_json_bytes(envelope) + b"\n"
-    )
-    if len(payload) > _OPERATIONS_OUTPUT_CAP:
-        raise ValueError("Operations output exceeds its byte limit")
+    payload = _canonical_json_bytes(envelope) + b"\n"
+    if len(payload) > output_cap:
+        raise CliJsonOutputTooLargeV1("CLI output exceeds its byte limit")
     return payload
+
+
+def operations_json_buffer(
+    *,
+    command: str,
+    outcome: CliOutcome,
+    result: Mapping[str, object] | None,
+    diagnostics: Sequence[Mapping[str, object]],
+) -> bytes:
+    try:
+        return cli_json_buffer_v1(
+            command=command,
+            outcome=outcome,
+            result=result,
+            diagnostics=diagnostics,
+            output_cap=_OPERATIONS_OUTPUT_CAP,
+        )
+    except CliJsonOutputTooLargeV1 as error:
+        raise ValueError("Operations output exceeds its byte limit") from error
 
 
 def operations_human_buffer(value: str) -> bytes:
@@ -114,8 +138,25 @@ def present_operations_human(value: str) -> None:
 
 
 def write_operations_stdout(buffer: bytes) -> None:
+    write_binary_buffer_v1(buffer, fd=1, max_chunk_size=None)
+
+
+def write_binary_buffer_v1(
+    buffer: bytes,
+    *,
+    fd: int,
+    max_chunk_size: int | None,
+) -> None:
+    if type(buffer) is not bytes:
+        raise TypeError("CLI write buffer must be immutable bytes")
+    if type(fd) is not int or fd < 0:
+        raise ValueError("CLI write descriptor is invalid")
+    if max_chunk_size is not None and (
+        type(max_chunk_size) is not int or max_chunk_size < 1
+    ):
+        raise ValueError("CLI write chunk limit is invalid")
     try:
-        msvcrt.setmode(1, os.O_BINARY)
+        msvcrt.setmode(fd, os.O_BINARY)
     except OSError:
         os._exit(1)
 
@@ -123,13 +164,20 @@ def write_operations_stdout(buffer: bytes) -> None:
     offset = 0
     while offset < len(buffer):
         remaining = len(buffer) - offset
-        current = view[offset:]
-        if current.obj is not buffer or current.nbytes != remaining:
-            raise RuntimeError("stdout view invariant failed")
+        requested = (
+            remaining if max_chunk_size is None else min(max_chunk_size, remaining)
+        )
+        current = view[offset : offset + requested]
+        if (
+            current.obj is not buffer
+            or current.nbytes != requested
+            or not 1 <= requested <= remaining
+        ):
+            raise RuntimeError("CLI write view invariant failed")
         try:
-            count = os.write(1, current)
+            count = os.write(fd, current)
         except OSError:
             os._exit(1)
-        if type(count) is not int or not 1 <= count <= remaining:
+        if type(count) is not int or not 1 <= count <= requested:
             os._exit(1)
         offset += count

@@ -12,7 +12,7 @@
 ## 关系
 
 - **Literature → Knowledge**：Literature 只通过 [Reviewed Handoff v1](./docs/contracts/reviewed-handoff-v1.md) 交付符合 [Candidate Knowledge v1](./docs/contracts/candidate-knowledge-v1.md) 的已审核候选、来源身份、Evidence Pointer、风险与审核状态。
-- **Knowledge Intake 写入边界**：[Knowledge Intake v1](./docs/contracts/knowledge-intake-v1.md) 冻结 Reviewed Handoff bytes 的独立验证、不可变 import evidence、Candidate Registry migration/transaction、revision 与 typed verdict；导入只改变 Intake Status，不产生 Promoted Knowledge。
+- **Knowledge Intake 写入边界**：[Knowledge Intake v1](./docs/contracts/knowledge-intake-v1.md) 冻结 Reviewed Handoff bytes 的独立验证、不可变 import evidence、Candidate Registry migration/transaction、revision 与 typed verdict；[ADR 0138](./docs/adr/0138-own-the-rebuildable-candidate-search-projection-in-knowledge-intake.md) 让同一 writer 原子维护无治理权威的可重建搜索投影。导入只改变 Intake Status，不产生 Promoted Knowledge。
 - **Literature 阅读边界**：[Canonical Reading Asset v1](./docs/contracts/canonical-reading-asset-v1.md) 冻结 Active Source 经 OCR success 生成 `document.md`、Evidence Block、内容寻址图片、Canonical 内容身份与 Evidence Pointer 的确定性合同；Reader 和后续 Bot 只消费该边界，不读取 MinerU 私有输出。
 - **Knowledge → Literature**：Knowledge 可以报告合同、证据或冲突问题，但不回写 Literature 的全文、阅读资产或 Active Source 决策。
 - **未来上下文 ↔ 现有上下文**：通过显式、版本化的交接合同协作；一个上下文不得直接拥有或改写另一个上下文的内部状态。

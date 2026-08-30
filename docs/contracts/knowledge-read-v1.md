@@ -2,7 +2,7 @@
 
 状态：已冻结。本合同为 [Parent Spec #1](https://github.com/Dulealex/Gezhi/issues/1) 与 [T05 / Issue #6](https://github.com/Dulealex/Gezhi/issues/6) 绑定 `knowledge search`、`knowledge show` 的 V1 可观察语义；后续实现票据不得以 SQLite 表结构、旧 PaperBot 行为或临时 CLI 输出覆盖这里的约定。
 
-相关权威边界包括 [Candidate Knowledge v1](./candidate-knowledge-v1.md)、[Knowledge Answerer v1](./knowledge-answerer-v1.md)、[CLI Command v1](./cli-command-v1.md)、[CLI JSON v1](./cli-json-v1.md)、[CLI Diagnostics v1](./cli-diagnostics-v1.md)、[Configuration v1](./configuration-v1.md)、[ADR 0010](../adr/0010-use-one-authoritative-store-per-context.md)、[ADR 0021](../adr/0021-use-deterministic-sqlite-retrieval-before-codex-synthesis.md)、[ADR 0022](../adr/0022-defer-promotion-and-label-candidate-backed-answers.md)、[ADR 0025](../adr/0025-propagate-candidate-review-revisions-as-accept-or-withdraw.md)、[ADR 0031](../adr/0031-use-a-flat-auditable-knowledge-asset-tree.md)、[ADR 0032](../adr/0032-use-static-composition-and-context-deep-modules.md) 与 [ADR 0044](../adr/0044-separate-semantic-retrieval-view-from-ranking-audit.md)。Concrete diagnostic、Human 中文、process exit 与 executable acceptance 由 [Knowledge Read Diagnostics v1](./knowledge-read-diagnostics-v1.md) 闭合。
+相关权威边界包括 [Candidate Knowledge v1](./candidate-knowledge-v1.md)、[Knowledge Answerer v1](./knowledge-answerer-v1.md)、[CLI Command v1](./cli-command-v1.md)、[CLI JSON v1](./cli-json-v1.md)、[CLI Diagnostics v1](./cli-diagnostics-v1.md)、[Configuration v1](./configuration-v1.md)、[ADR 0010](../adr/0010-use-one-authoritative-store-per-context.md)、[ADR 0021](../adr/0021-use-deterministic-sqlite-retrieval-before-codex-synthesis.md)、[ADR 0022](../adr/0022-defer-promotion-and-label-candidate-backed-answers.md)、[ADR 0025](../adr/0025-propagate-candidate-review-revisions-as-accept-or-withdraw.md)、[ADR 0031](../adr/0031-use-a-flat-auditable-knowledge-asset-tree.md)、[ADR 0032](../adr/0032-use-static-composition-and-context-deep-modules.md)、[ADR 0044](../adr/0044-separate-semantic-retrieval-view-from-ranking-audit.md) 与 [ADR 0138](../adr/0138-own-the-rebuildable-candidate-search-projection-in-knowledge-intake.md)。Concrete diagnostic、Human 中文、process exit 与 executable acceptance 由 [Knowledge Read Diagnostics v1](./knowledge-read-diagnostics-v1.md) 闭合。
 
 ## 1. 职责与深模块边界
 
@@ -58,6 +58,8 @@ Parser 已冻结为 `knowledge show CANDIDATE_ID [--json]`。V1 selector 必须�
 `registry.sqlite3` 是 Knowledge 治理事实源，已校验的 `imports/<handoff_id>/` 是不可变跨 Context 导入证据。读取必须使用只读 SQLite connection、`query_only` 约束与单一 read transaction；临时查询状态只可在内存中形成。实现不得自动创建缺失 Data Root/Registry，不得迁移未知 Schema，不得用空数据库、旧 PaperBot 数据库、内存数据库、JSON 扫描或单路 FTS 作为 fallback。
 
 一次 command 的所有 status、rank、Candidate bytes 与 import provenance 必须来自同一 logical Registry snapshot。`show` 对 content/status import 的实际 bytes 使用 Registry 中已经绑定的 Handoff ID 与文件 SHA-256，从同一 root anchor safe-open 并重新核验；核验期间 identity、hash 或 root proof 漂移必须失败，不能返回混合 revision。数据库内部表名、索引拆分和 row shape 仍由 Knowledge module 隐藏，不进入公共 result。
+
+按 ADR 0138，search 所需两路 FTS 是与 Registry generation 绑定、可重建但不具治理权威的独立版本化投影。`search` 遇到缺失或未知投影版本必须返回 `registry_incompatible`，投影 membership/generation 漂移必须 fail closed；不得退回 JSON 扫描或单路 FTS。`show` 不消费搜索投影，因此完整合法的四表治理基线仍可执行 show。两个只读命令都不得补建、升级或修复投影。
 
 两个命令都不得：
 
