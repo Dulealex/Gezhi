@@ -1,6 +1,6 @@
 # Knowledge Intake v1 合同
 
-状态：已冻结。本合同为 [T18 / Issue #19](https://github.com/Dulealex/Gezhi/issues/19) 冻结 Reviewed Handoff 到 Knowledge Candidate Registry 的 owned write seam、SQLite migration baseline、revision 规则、不可变 import evidence 与 typed verdict。它实现 [ADR 0010](../adr/0010-use-one-authoritative-store-per-context.md)、[ADR 0025](../adr/0025-propagate-candidate-review-revisions-as-accept-or-withdraw.md)、[ADR 0031](../adr/0031-use-a-flat-auditable-knowledge-asset-tree.md)、[ADR 0121](../adr/0121-classify-continuation-failures-by-recoverability-and-certainty.md) 与 [ADR 0137](../adr/0137-commit-knowledge-import-evidence-before-registry-state.md)，输入 bytes 必须逐项满足 [Reviewed Handoff v1](./reviewed-handoff-v1.md)。
+状态：已冻结。本合同为 [T18 / Issue #19](https://github.com/Dulealex/Gezhi/issues/19) 冻结 Reviewed Handoff 到 Knowledge Candidate Registry 的 owned write seam、SQLite migration baseline、revision 规则、不可变 import evidence 与 typed verdict。它实现 [ADR 0010](../adr/0010-use-one-authoritative-store-per-context.md)、[ADR 0025](../adr/0025-propagate-candidate-review-revisions-as-accept-or-withdraw.md)、[ADR 0031](../adr/0031-use-a-flat-auditable-knowledge-asset-tree.md)、[ADR 0121](../adr/0121-classify-continuation-failures-by-recoverability-and-certainty.md)、[ADR 0137](../adr/0137-commit-knowledge-import-evidence-before-registry-state.md) 与 [ADR 0138](../adr/0138-own-the-rebuildable-candidate-search-projection-in-knowledge-intake.md)，输入 bytes 必须逐项满足 [Reviewed Handoff v1](./reviewed-handoff-v1.md)。
 
 ## 1. 唯一写入 seam
 
@@ -66,6 +66,10 @@ V1 的逻辑表恰为：
 
 数据库内部表名、列名与索引不是 CLI 或跨 Context interface；T19 及以后必须通过 Knowledge deep module 读取，不让调用方拼 SQL。
 
+T19 依据 ADR 0138 在同一 SQLite 文件内增加独立版本化的搜索派生投影；FTS virtual/shadow table 与 `registry_search_meta` 不增加第五张治理逻辑表，也不成为新的事实源。首次 applied accept/withdraw 必须在同一 transaction 更新该投影并绑定新的 Registry generation。只有已知、完整且通过验证的 T18 四表基线可在 exact Handoff replay 时补建投影；该补建保持治理 generation 与 `unchanged` disposition 不变。未知或损坏 schema 继续 fail closed，读取命令不得承担迁移。
+
+`candidate_content` 的 Candidate、Citation、Descriptor 与 Evidence canonical bytes 在同一 Candidate ID 下仍不可变；其中 content import provenance 是由 revision history 重建的读取投影，必须指向最近合法 accepted revision。较新的 withdraw 只改变 status binding；较新的 re-accept 同时成为 content/status binding。历史 exact replay 不得把任一 binding 回退到较早 revision。
+
 ## 4. Revision、重复与冲突
 
 - 新 Candidate 的首个 Knowledge action 只能是 `accept`；其 review revision 可以大于 1，因为较早 non-accepted Decision 可能只在 Literature 形成 no-action receipt。
@@ -96,6 +100,6 @@ Specific reason 优先于 generic reason。SQLite commit、directory rename 或 
 
 ## 6. 非目标与验收
 
-T18 不实现 FTS、`knowledge search/show/ask`、Retrieval View、Answer、Promotion Gate、Promoted Knowledge、batch import、dynamic plugin、旧数据库迁移或 repair command。它不得创建任何 promoted table、row 或 status。
+T18 原始验收不实现 FTS、`knowledge search/show/ask`、Retrieval View、Answer、Promotion Gate、Promoted Knowledge、batch import、dynamic plugin、旧数据库迁移或 repair command。T19 只按 ADR 0138 把搜索投影的原子维护加入现有 Intake writer；它不改变 T18 的治理事实、typed verdict 或 Promotion 禁令。
 
 最低验收覆盖：两个真实 launcher 的 accept/withdraw/import receipt；相同 Handoff 重放；accept→withdraw→re-accept；revision skip、倒序和同 revision冲突；Candidate/content/snapshot冲突；Registry migration/schema/integrity/busy；evidence orphan恢复、正式 evidence冲突、transaction rollback与commit-uncertain重放；current projection重建；withdrawn不再是active；任何路径均不创建 Promoted Knowledge。

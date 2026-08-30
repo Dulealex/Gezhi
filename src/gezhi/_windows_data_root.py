@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Literal, Self, TypeAlias
 
 DataRootStatus: TypeAlias = Literal["ready", "unsafe", "unavailable"]
+DataRootOpenCause: TypeAlias = Literal["identity_unavailable"]
 FileIdentity: TypeAlias = tuple[int, int]
 
 _DRIVE_ABSOLUTE = re.compile(r"^[A-Za-z]:[\\/]")
@@ -246,9 +247,20 @@ class _DirectoryEntryV1:
 
 
 class DataRootOpenErrorV1(OSError):
-    def __init__(self, status: DataRootStatus) -> None:
-        super().__init__(f"Data Root is {status}")
+    def __init__(
+        self,
+        status: DataRootStatus,
+        *,
+        cause: DataRootOpenCause | None = None,
+    ) -> None:
+        if cause is not None and (
+            status != "unavailable" or cause != "identity_unavailable"
+        ):
+            raise ValueError("Data Root open cause is invalid")
+        detail = f" ({cause})" if cause is not None else ""
+        super().__init__(f"Data Root is {status}{detail}")
         self.status = status
+        self.cause = cause
 
 
 class DataRootLifecycleErrorV1(RuntimeError):
@@ -896,7 +908,10 @@ def _open_relative_handle(
 def _identity_from_file_id_info(value: _FILE_ID_INFO) -> FileIdentity:
     identifier = int.from_bytes(bytes(value.FileId.Identifier), "little")
     if identifier == 0:
-        raise DataRootOpenErrorV1("unavailable")
+        raise DataRootOpenErrorV1(
+            "unavailable",
+            cause="identity_unavailable",
+        )
     return int(value.VolumeSerialNumber), identifier
 
 
@@ -933,7 +948,10 @@ def _handle_facts(handle: int, *, directory: bool) -> _HandleFacts:
         ctypes.byref(file_id),
         ctypes.sizeof(file_id),
     ):
-        raise DataRootOpenErrorV1("unavailable")
+        raise DataRootOpenErrorV1(
+            "unavailable",
+            cause="identity_unavailable",
+        )
     return _HandleFacts(
         canonical_path=_handle_final_path(handle),
         identity=_identity_from_file_id_info(file_id),

@@ -205,18 +205,33 @@ def test_accept_witness_is_applied_to_an_empty_candidate_registry(
             "SELECT review_revision, review_status, intake_status, "
             "status_handoff_id FROM candidate_current"
         ).fetchone() == (1, "accepted", "active", HANDOFF_ID_ACCEPT_V1)
-        assert {
+        physical_tables = {
             row[0]
             for row in registry.execute(
                 "SELECT name FROM sqlite_schema "
                 "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
             )
+        }
+        assert {
+            name
+            for name in physical_tables
+            if not name.startswith("candidate_search_")
+            and name != "registry_search_meta"
         } == {
             "candidate_content",
             "candidate_current",
             "handoff_revisions",
             "registry_meta",
         }
+        assert {
+            "candidate_search_unicode",
+            "candidate_search_trigram",
+            "registry_search_meta",
+        } <= physical_tables
+        assert registry.execute(
+            "SELECT schema_version, registry_generation "
+            "FROM registry_search_meta"
+        ).fetchone() == ("gezhi.candidate_search_projection.v1", 1)
 
 
 def test_exact_accept_replay_is_unchanged_without_duplicate_candidate(

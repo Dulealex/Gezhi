@@ -12,6 +12,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
+from gezhi._knowledge_registry import (
+    SEARCH_PROJECTION_SCHEMA_STATEMENTS,
+    SEARCH_PROJECTION_SCHEMA_VERSION,
+    bind_search_projection_generation_v1,
+    decode_canonical_json_blob_v1,
+    remove_search_document_v1,
+    replace_active_search_document_v1,
+)
 from gezhi._literature_review import (
     IntakeAppliedV1,
     IntakeBlockedV1,
@@ -1064,7 +1072,7 @@ def _commit_or_reuse_evidence(
     _root_checkpoint(root)
 
 
-_SCHEMA_STATEMENTS = (
+_BASE_SCHEMA_STATEMENTS = (
     """
     CREATE TABLE registry_meta (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -1132,6 +1140,7 @@ _SCHEMA_STATEMENTS = (
     ) STRICT
     """,
 )
+_SCHEMA_STATEMENTS = (*_BASE_SCHEMA_STATEMENTS, *SEARCH_PROJECTION_SCHEMA_STATEMENTS)
 
 
 def _schema_rows(connection: sqlite3.Connection) -> tuple[tuple[object, ...], ...]:
@@ -1147,18 +1156,46 @@ def _schema_rows(connection: sqlite3.Connection) -> tuple[tuple[object, ...], ..
     )
 
 
-def _expected_schema_rows() -> tuple[tuple[object, ...], ...]:
+def _expected_schema_rows_for(
+    statements: tuple[str, ...],
+) -> tuple[tuple[object, ...], ...]:
     expected = sqlite3.connect(":memory:", isolation_level=None)
     try:
         expected.execute("PRAGMA foreign_keys = ON")
-        for statement in _SCHEMA_STATEMENTS:
+        for statement in statements:
             expected.execute(statement)
         return _schema_rows(expected)
     finally:
         expected.close()
 
 
+def _expected_base_schema_rows() -> tuple[tuple[object, ...], ...]:
+    return _expected_schema_rows_for(_BASE_SCHEMA_STATEMENTS)
+
+
+def _expected_schema_rows() -> tuple[tuple[object, ...], ...]:
+    return _expected_schema_rows_for(_SCHEMA_STATEMENTS)
+
+
 def _validate_registry_schema(connection: sqlite3.Connection) -> None:
+    _validate_registry_schema_generation(
+        connection,
+        expected_schema_rows=_expected_schema_rows(),
+    )
+
+
+def _validate_base_registry_schema(connection: sqlite3.Connection) -> None:
+    _validate_registry_schema_generation(
+        connection,
+        expected_schema_rows=_expected_base_schema_rows(),
+    )
+
+
+def _validate_registry_schema_generation(
+    connection: sqlite3.Connection,
+    *,
+    expected_schema_rows: tuple[tuple[object, ...], ...],
+) -> None:
     try:
         if (
             connection.execute("PRAGMA application_id").fetchone()
@@ -1166,7 +1203,7 @@ def _validate_registry_schema(connection: sqlite3.Connection) -> None:
             or connection.execute("PRAGMA user_version").fetchone()
             != (_USER_VERSION,)
             or connection.execute("PRAGMA foreign_keys").fetchone() != (1,)
-            or _schema_rows(connection) != _expected_schema_rows()
+            or _schema_rows(connection) != expected_schema_rows
             or connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]
             or connection.execute("PRAGMA foreign_key_check").fetchall()
         ):
@@ -1193,6 +1230,78 @@ def _validate_registry_schema(connection: sqlite3.Connection) -> None:
         if _sqlite_is_busy(error):
             raise _RegistryBusyV1("Candidate Registry is busy") from error
         raise _RegistryConflictV1("Candidate Registry cannot be validated") from error
+
+
+def _rebuild_search_projection_v1(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        """
+        SELECT content.candidate_id, content.payload_sha256,
+               content.candidate_json, content.citation_json,
+               content.descriptor_snapshots_json,
+               content.evidence_snapshots_json,
+               content.work_id, content.source_id, content.source_sha256,
+               content.canonical_content_sha256,
+               content.content_manifest_sha256,
+               content.content_candidates_sha256,
+               content.promotion_status, current.review_status,
+               current.intake_status
+        FROM candidate_content AS content
+        JOIN candidate_current AS current USING(candidate_id)
+        WHERE current.intake_status = 'active'
+        ORDER BY content.candidate_id COLLATE BINARY ASC
+        """
+    ).fetchall()
+    for row in rows:
+        try:
+            candidate = decode_canonical_json_blob_v1(row[2])
+            citation = decode_canonical_json_blob_v1(row[3])
+            descriptor_snapshots = decode_canonical_json_blob_v1(row[4])
+            evidence_snapshots = decode_canonical_json_blob_v1(row[5])
+        except ValueError as error:
+            raise _RegistryConflictV1(
+                "Candidate search projection source is invalid"
+            ) from error
+        if (
+            type(candidate) is not dict
+            or type(citation) is not dict
+            or type(descriptor_snapshots) is not list
+            or type(evidence_snapshots) is not list
+        ):
+            raise _RegistryConflictV1("Candidate search projection source is invalid")
+        synthetic_record: dict[str, object] = {
+            "action": "accept",
+            "candidate": candidate,
+            "citation": citation,
+            "descriptor_snapshots": descriptor_snapshots,
+            "evidence_snapshots": evidence_snapshots,
+            "review_receipt": {},
+            "schema_version": "gezhi.reviewed_candidate_action.v1",
+        }
+        exact_witness = (row[10], row[11]) in _WITNESS_FILE_HASH_PAIRS
+        candidate_id, payload_sha256 = _validate_accept_record(
+            synthetic_record,
+            exact_witness=exact_witness,
+        )
+        payload = cast(dict[str, object], candidate["payload"])
+        if (
+            candidate_id != row[0]
+            or payload_sha256 != row[1]
+            or payload.get("work_id") != row[6]
+            or payload.get("source_id") != row[7]
+            or payload.get("source_sha256") != row[8]
+            or payload.get("canonical_content_sha256") != row[9]
+            or row[12:] != ("not_promoted", "accepted", "active")
+        ):
+            raise _RegistryConflictV1(
+                "Candidate search projection source differs"
+            )
+        replace_active_search_document_v1(
+            connection,
+            candidate_id=candidate_id,
+            candidate=candidate,
+            citation=citation,
+            descriptor_snapshots=descriptor_snapshots,
+        )
 
 
 def _open_registry(path: Path) -> tuple[sqlite3.Connection, ValidatedFileV1]:
@@ -1276,6 +1385,51 @@ def _bootstrap_registry(connection: sqlite3.Connection) -> None:
             "Candidate Registry header is invalid"
         ) from error
     if user_version == 1 and application_id == _APPLICATION_ID:
+        observed_schema = _schema_rows(connection)
+        if observed_schema == _expected_schema_rows():
+            _validate_registry_schema(connection)
+            return
+        if observed_schema != _expected_base_schema_rows():
+            raise _RegistryConflictV1("Candidate Registry schema is invalid")
+        _validate_base_registry_schema(connection)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            _validate_base_registry_schema(connection)
+            for statement in SEARCH_PROJECTION_SCHEMA_STATEMENTS:
+                connection.execute(statement)
+            generation = connection.execute(
+                "SELECT generation FROM registry_meta WHERE singleton = 1"
+            ).fetchone()
+            if (
+                generation is None
+                or len(generation) != 1
+                or type(generation[0]) is not int
+            ):
+                raise _RegistryConflictV1(
+                    "Candidate Registry generation is invalid"
+                )
+            connection.execute(
+                "INSERT INTO registry_search_meta("
+                "singleton, schema_version, registry_generation"
+                ") VALUES (1, ?, ?)",
+                (SEARCH_PROJECTION_SCHEMA_VERSION, generation[0]),
+            )
+            _rebuild_search_projection_v1(connection)
+            _commit_registry_transaction(connection)
+        except (_HandoffInvalidV1, _RegistryConflictV1):
+            _rollback_registry_transaction(connection)
+            raise
+        except sqlite3.Error as error:
+            _rollback_registry_transaction(connection)
+            if _sqlite_is_busy(error):
+                raise _RegistryBusyV1("Candidate Registry is busy") from error
+            if _sqlite_is_unavailable(error):
+                raise _RegistryUnavailableV1(
+                    "Candidate Registry projection migration is unavailable"
+                ) from error
+            raise _CommitFailedV1(
+                "Candidate Registry projection migration failed"
+            ) from error
         _validate_registry_schema(connection)
         return
     if user_version != 0 or application_id not in {0, _APPLICATION_ID} or user_objects:
@@ -1288,6 +1442,12 @@ def _bootstrap_registry(connection: sqlite3.Connection) -> None:
             "INSERT INTO registry_meta(singleton, schema_version, generation) "
             "VALUES (1, ?, 0)",
             (_SCHEMA_VERSION,),
+        )
+        connection.execute(
+            "INSERT INTO registry_search_meta("
+            "singleton, schema_version, registry_generation"
+            ") VALUES (1, ?, 0)",
+            (SEARCH_PROJECTION_SCHEMA_VERSION,),
         )
         connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
         connection.execute(f"PRAGMA user_version = {_USER_VERSION}")
@@ -1360,6 +1520,35 @@ def _rebuild_current_projection(
             handoff_id,
         ),
     )
+
+
+def _rebuild_content_import_projection(
+    connection: sqlite3.Connection,
+    candidate_id: str,
+) -> None:
+    latest_accept = connection.execute(
+        """
+        SELECT handoff_id, manifest_sha256, candidates_sha256
+        FROM handoff_revisions
+        WHERE candidate_id = ? AND action = 'accept'
+        ORDER BY review_revision DESC
+        LIMIT 1
+        """,
+        (candidate_id,),
+    ).fetchone()
+    if latest_accept is None:
+        raise _RegistryConflictV1("Candidate has no accepted content import")
+    cursor = connection.execute(
+        """
+        UPDATE candidate_content
+        SET content_handoff_id = ?, content_manifest_sha256 = ?,
+            content_candidates_sha256 = ?
+        WHERE candidate_id = ?
+        """,
+        (*latest_accept, candidate_id),
+    )
+    if cursor.rowcount != 1:
+        raise _RegistryConflictV1("Candidate content projection is missing")
 
 
 def _commit_registry_transaction(connection: sqlite3.Connection) -> None:
@@ -1446,6 +1635,7 @@ def _verify_candidate_import_history(
         (candidate_id,),
     ).fetchone()
     immutable_content: tuple[object, ...] | None = None
+    latest_content_projection: tuple[object, ...] | None = None
     for row in rows:
         handoff_id = row[0]
         if type(handoff_id) is not str or _HANDOFF_ID.fullmatch(handoff_id) is None:
@@ -1500,14 +1690,11 @@ def _verify_candidate_import_history(
             observed_content = _accepted_content_values(observed)
             if immutable_content is None:
                 immutable_content = observed_content
-                if stored_content != _stored_content_values(observed):
-                    raise _RegistryConflictV1(
-                        "Candidate content and first accept evidence differ"
-                    )
             elif observed_content != immutable_content:
                 raise _RegistryConflictV1(
                     "Accepted Candidate snapshots changed across revisions"
                 )
+            latest_content_projection = _stored_content_values(observed)
         elif immutable_content is None or (
             observed.payload_sha256,
             observed.work_id,
@@ -1528,6 +1715,10 @@ def _verify_candidate_import_history(
         raise _RegistryConflictV1("Candidate content has no Handoff history")
     if rows and immutable_content is None:
         raise _RegistryConflictV1("Candidate history has no accepted Handoff")
+    if stored_content is not None and stored_content != latest_content_projection:
+        raise _RegistryConflictV1(
+            "Candidate content and latest accept evidence differ"
+        )
 
 
 def _apply_accept_transaction(
@@ -1590,6 +1781,7 @@ def _apply_accept_transaction(
             if existing_content != expected_content:
                 raise _RegistryConflictV1("Recorded Candidate content conflicts")
             _rebuild_current_projection(connection, validated.candidate_id)
+            _rebuild_content_import_projection(connection, validated.candidate_id)
             _commit_registry_transaction(connection)
             return "unchanged"
         if connection.execute(
@@ -1700,9 +1892,18 @@ def _apply_accept_transaction(
                     validated.candidate_id,
                 ),
             )
+        _rebuild_content_import_projection(connection, validated.candidate_id)
+        replace_active_search_document_v1(
+            connection,
+            candidate_id=validated.candidate_id,
+            candidate=candidate,
+            citation=citation,
+            descriptor_snapshots=descriptor_snapshots,
+        )
         connection.execute(
             "UPDATE registry_meta SET generation = generation + 1 WHERE singleton = 1"
         )
+        bind_search_projection_generation_v1(connection)
     except sqlite3.IntegrityError as error:
         _rollback_registry_transaction(connection)
         raise _RegistryConflictV1("Candidate Registry content conflicts") from error
@@ -1760,6 +1961,7 @@ def _apply_withdraw_transaction(
             if existing_revision != expected_revision:
                 raise _RevisionConflictV1("Recorded Handoff identity conflicts")
             _rebuild_current_projection(connection, validated.candidate_id)
+            _rebuild_content_import_projection(connection, validated.candidate_id)
             _commit_registry_transaction(connection)
             return "unchanged"
 
@@ -1831,9 +2033,15 @@ def _apply_withdraw_transaction(
                 validated.candidate_id,
             ),
         )
+        _rebuild_content_import_projection(connection, validated.candidate_id)
         connection.execute(
             "UPDATE registry_meta SET generation = generation + 1 WHERE singleton = 1"
         )
+        remove_search_document_v1(
+            connection,
+            candidate_id=validated.candidate_id,
+        )
+        bind_search_projection_generation_v1(connection)
     except sqlite3.IntegrityError as error:
         _rollback_registry_transaction(connection)
         raise _RegistryConflictV1("Candidate Registry content conflicts") from error
