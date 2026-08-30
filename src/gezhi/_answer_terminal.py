@@ -180,9 +180,9 @@ class AnswerPublishRequestV1:
     started_monotonic_ns: int
     provenance: Mapping[str, object]
     effective_config_bytes: bytes
-    question_bytes: bytes
-    retrieval_query_bytes: bytes
-    retrieval_audit_bytes: bytes
+    question_bytes: bytes | None
+    retrieval_query_bytes: bytes | None
+    retrieval_audit_bytes: bytes | None
     retrieval_view_bytes: bytes | None
     status: Literal["succeeded", "blocked", "failed", "interrupted"] = "succeeded"
     error: Mapping[str, object] | None = None
@@ -514,6 +514,25 @@ def _request_assets(
         request.answer_markdown_bytes is None
     ):
         raise AnswerTerminalRequestInvalidV1("Answer result pair is partial")
+    stage_prefix = (
+        request.effective_config_bytes,
+        request.question_bytes,
+        request.retrieval_query_bytes,
+        request.retrieval_audit_bytes,
+        request.retrieval_view_bytes,
+    )
+    if type(stage_prefix[0]) is not bytes:
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer effective configuration is absent"
+        )
+    missing_seen = False
+    for payload in stage_prefix:
+        if payload is None:
+            missing_seen = True
+        elif missing_seen:
+            raise AnswerTerminalRequestInvalidV1(
+                "Answer root asset stage prefix is discontinuous"
+            )
     payload_by_path: dict[str, bytes | None] = {
         "effective_config.json": request.effective_config_bytes,
         "question.json": request.question_bytes,
@@ -560,12 +579,17 @@ def _request_assets(
             _validate_utf8_text_asset_v1(payload, label=path)
         assets.append((path, payload, identity_key, identity_value, cap))
 
-    audit = decoded["retrieval_audit.json"]
-    measurement = audit.get("retrieval_view_measurement")
-    if type(measurement) is not dict:
-        raise AnswerTerminalRequestInvalidV1(
-            "Answer Retrieval View measurement is invalid"
-        )
+    audit = decoded.get("retrieval_audit.json")
+    measurement: dict[str, object] | None
+    if audit is None:
+        measurement = None
+    else:
+        raw_measurement = audit.get("retrieval_view_measurement")
+        if type(raw_measurement) is not dict:
+            raise AnswerTerminalRequestInvalidV1(
+                "Answer Retrieval View measurement is invalid"
+            )
+        measurement = raw_measurement
     view = decoded.get("retrieval_view.json")
     candidate_count: int | None = None
     if request.retrieval_view_bytes is not None:
@@ -581,13 +605,19 @@ def _request_assets(
             raise AnswerTerminalRequestInvalidV1(
                 "Answer Retrieval View measurement differs"
             )
-    elif measurement.get("status") != "too_large":
+    elif measurement is not None and (
+        request.status != "interrupted" and measurement.get("status") != "too_large"
+    ):
         raise AnswerTerminalRequestInvalidV1(
             "Missing Retrieval View is not an over-limit branch"
         )
 
     if request.status == "succeeded":
-        if request.error is not None or request.answer_output_bytes is None:
+        if (
+            request.error is not None
+            or request.answer_output_bytes is None
+            or candidate_count is None
+        ):
             raise AnswerTerminalRequestInvalidV1(
                 "Succeeded Answer terminal presence is invalid"
             )
@@ -645,6 +675,7 @@ def _request_assets(
             request.retrieval_view_bytes is not None
             or has_call_pair
             or request.attempts
+            or type(measurement) is not dict
             or measurement.get("status") != "too_large"
         )
     ):

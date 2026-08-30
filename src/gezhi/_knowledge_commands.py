@@ -9,6 +9,11 @@ from gezhi._knowledge_ask import (
     KnowledgeAsksV1,
     validate_knowledge_ask_report_v1,
 )
+from gezhi._knowledge_cancellation import (
+    CancellationSnapshotV1,
+    KnowledgeCancellationBridgeErrorV1,
+    activate_knowledge_ask_cancellation_v1,
+)
 from gezhi._knowledge_read import (
     KnowledgeReadReportV1,
     KnowledgeReadsV1,
@@ -90,6 +95,11 @@ _ASK_PRIMARY = {
         "冻结的 Codex CLI 运行能力不可用",
         "运行 gezhi doctor 检查项目 Codex CLI 与登录能力，恢复后重新提问",
     ),
+    "codex_timeout_exhausted": (
+        "knowledge.ask.codex_timeout_exhausted.v1",
+        "Codex 回答尝试已耗尽超时预算",
+        "稍后重新提问；若持续发生，运行 gezhi doctor 检查 Codex 环境能力",
+    ),
     "synthesis_input_invalid": (
         "knowledge.ask.synthesis_input_invalid.v1",
         "Codex 回答输入包未通过本地验证",
@@ -149,6 +159,16 @@ _ASK_PRIMARY = {
         "knowledge.ask.answer_commit_failed.v1",
         "本次 Answer 的原子目录提交确定失败",
         "保留 staging 并运行 gezhi status 观察 staging 与 Answer 整体状态（status 不会判定或修复该提交），再在外部检查存储",
+    ),
+    "user_interrupted": (
+        "knowledge.ask.user_interrupted.v1",
+        "用户中断了已经建立身份的本次回答",
+        "如仍需要答案，请重新运行 knowledge ask",
+    ),
+    "user_interrupted_before_answer": (
+        "knowledge.ask.user_interrupted_before_answer.v1",
+        "用户在 Answer 身份建立前中断了本次请求",
+        "如仍需要答案，请重新运行 knowledge ask",
     ),
 }
 _DISCLOSURE = (
@@ -522,43 +542,97 @@ def run_ask(
     cli_patch: tuple[tuple[str, str], ...],
 ) -> int:
     prepared_candidate: _PreparedKnowledgeAskPresentationV1 | None = None
+    candidate_token = 0
+    try:
+        cancellation = activate_knowledge_ask_cancellation_v1()
+    except KnowledgeCancellationBridgeErrorV1:
+        os._exit(1)
+
+    def next_candidate_token_v1() -> int:
+        nonlocal candidate_token
+        if candidate_token >= 0xFFFFFFFF:
+            raise _KnowledgeAskPresentationSealFailedV1(
+                "Knowledge ask candidate token space is exhausted"
+            )
+        candidate_token += 1
+        return candidate_token
+
+    def cancellation_adjusted_report_v1(
+        report: KnowledgeAskReportV1,
+        snapshot: CancellationSnapshotV1,
+    ) -> KnowledgeAskReportV1:
+        if (
+            snapshot.observed_monotonic_ns is not None
+            and report.outcome == "blocked"
+            and report.result is None
+        ):
+            return KnowledgeAskReportV1(
+                outcome="interrupted",
+                result=None,
+                reason="user_interrupted_before_answer",
+            )
+        return report
+
+    def seal_no_output_failure_v1() -> None:
+        while True:
+            snapshot = cancellation.snapshot_v1()
+            token = next_candidate_token_v1()
+            if cancellation.conditional_seal_v1(
+                expected_generation=snapshot.generation,
+                candidate_token=token,
+            ):
+                cancellation.release_v1()
+                return
 
     def seal_report(
         report: KnowledgeAskReportV1,
         answer_markdown_bytes: bytes | None,
     ) -> KnowledgeAskReportV1:
         nonlocal prepared_candidate
-        try:
-            prepared_candidate = _prepare_knowledge_ask_presentation_v1(
-                report,
-                json_output=json_output,
-                answer_markdown_bytes=answer_markdown_bytes,
-            )
-        except Exception as error:
-            raise _KnowledgeAskPresentationSealFailedV1 from error
-        return prepared_candidate.report
+        while True:
+            snapshot = cancellation.snapshot_v1()
+            sealed_report = cancellation_adjusted_report_v1(report, snapshot)
+            try:
+                pending = _prepare_knowledge_ask_presentation_v1(
+                    sealed_report,
+                    json_output=json_output,
+                    answer_markdown_bytes=answer_markdown_bytes,
+                )
+            except Exception as error:
+                try:
+                    seal_no_output_failure_v1()
+                except Exception as release_error:
+                    raise _KnowledgeAskPresentationSealFailedV1 from release_error
+                raise _KnowledgeAskPresentationSealFailedV1 from error
+            token = next_candidate_token_v1()
+            if not cancellation.conditional_seal_v1(
+                expected_generation=snapshot.generation,
+                candidate_token=token,
+            ):
+                continue
+            cancellation.release_v1()
+            prepared_candidate = pending
+            return pending.report
 
     try:
         report = KnowledgeAsksV1.ask(
             question,
             cli_patch=cli_patch,
             report_sealer=seal_report,
+            cancellation=cancellation,
         )
-    except _KnowledgeAskPresentationSealFailedV1:
+        if prepared_candidate is None:
+            report = seal_report(report, None)
+    except (
+        _KnowledgeAskPresentationSealFailedV1,
+        KnowledgeCancellationBridgeErrorV1,
+    ):
         os._exit(1)
     try:
-        candidate = (
-            _prepare_knowledge_ask_presentation_v1(
-                report,
-                json_output=json_output,
-                answer_markdown_bytes=None,
-            )
-            if prepared_candidate is None
-            else prepared_candidate
-        )
-        if prepared_candidate is not None and (
-            candidate.report != report or candidate.json_output is not json_output
-        ):
+        if prepared_candidate is None:
+            raise ValueError("Knowledge ask presentation candidate is absent")
+        candidate = prepared_candidate
+        if candidate.report != report or candidate.json_output is not json_output:
             raise ValueError("Knowledge ask presentation candidate differs")
     except Exception:  # noqa: BLE001 - the contract hard-stops seal failures.
         os._exit(1)
@@ -570,7 +644,7 @@ def run_ask(
 
 def _knowledge_ask_json_buffer_v1(report: KnowledgeAskReportV1) -> bytes:
     validate_knowledge_ask_report_v1(report)
-    diagnostics = (
+    diagnostics: list[dict[str, object]] = (
         []
         if report.reason is None
         else [
@@ -580,6 +654,13 @@ def _knowledge_ask_json_buffer_v1(report: KnowledgeAskReportV1) -> bytes:
             }
         ]
     )
+    if report.capture_overflow_channels:
+        diagnostics.append(
+            {
+                "code": "knowledge.ask.capture_overflow.v1",
+                "context": {"channels": list(report.capture_overflow_channels)},
+            }
+        )
     return cli_json_buffer_v1(
         command="knowledge.ask",
         outcome=report.outcome,
@@ -629,6 +710,15 @@ def _knowledge_ask_human_buffer_v1(
         payload = (
             f"{heading}\n{answer_line}原因：{reason}\n下一步：{next_step}\n"
         ).encode()
+        if report.capture_overflow_channels:
+            channels = report.capture_overflow_channels
+            if channels == ("events",):
+                hint = "Codex 事件捕获超过 16777216 字节上限，已保留精确上限前缀"
+            elif channels == ("final_message",):
+                hint = "Codex 最终消息捕获超过 1048576 字节上限，已保留精确上限前缀"
+            else:
+                hint = "Codex 事件与最终消息捕获均超过各自上限，已保留精确上限前缀"
+            payload += f"提示：{hint}\n".encode()
     if len(payload) > _ASK_HUMAN_OUTPUT_CAP:
         raise ValueError("Knowledge ask Human output exceeds its byte limit")
     return payload

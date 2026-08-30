@@ -27,6 +27,7 @@ from gezhi._answer_terminal import (
     scan_answer_staging_v1,
 )
 from gezhi._configuration import ConfigurationError, resolve_configuration_v1
+from gezhi._knowledge_cancellation import KnowledgeCancellationBridgeV1
 from gezhi._knowledge_registry import (
     SearchQueryInvalidV1,
     SearchQueryTooComplexV1,
@@ -45,10 +46,12 @@ from gezhi._knowledge_retrieval import (
 )
 from gezhi._windows_data_root import (
     DataRootOpenErrorV1,
+    ValidatedDataRootV1,
     open_validated_data_root_v1,
 )
 from gezhi._windows_ownership import (
     WriterOwnershipLifecycleErrorV1,
+    WriterOwnershipV1,
     try_acquire_knowledge_answer_writer_v1,
 )
 
@@ -84,6 +87,27 @@ _GOVERNANCE_DISCLOSURE = (
 
 class _ProvenanceUnavailableV1(RuntimeError):
     pass
+
+
+class _UnmanagedNoCancellationV1:
+    """Compatibility profile for direct domain calls outside the public CLI."""
+
+    def observed_at_monotonic_ns(self) -> None:
+        return None
+
+    def try_begin_work_v1(self) -> bool:
+        return True
+
+    def try_answer_id_cutover_v1(self) -> bool:
+        return True
+
+
+def _pre_id_interrupted_report_v1() -> KnowledgeAskReportV1:
+    return KnowledgeAskReportV1(
+        outcome="interrupted",
+        result=None,
+        reason="user_interrupted_before_answer",
+    )
 
 
 def _canonical_json_file_v1(value: object) -> bytes:
@@ -188,6 +212,7 @@ class KnowledgeAskReportV1:
     outcome: KnowledgeAskOutcomeV1
     result: dict[str, object] | None
     reason: str | None
+    capture_overflow_channels: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,8 +312,19 @@ def validate_knowledge_ask_report_v1(report: KnowledgeAskReportV1) -> None:
         raise TypeError("Knowledge ask report type is invalid")
     if report.outcome not in {"succeeded", "blocked", "failed", "interrupted"}:
         raise ValueError("Knowledge ask outcome is invalid")
+    if report.capture_overflow_channels not in {
+        (),
+        ("events",),
+        ("events", "final_message"),
+        ("final_message",),
+    }:
+        raise ValueError("Knowledge ask capture overflow facts are invalid")
     if report.outcome == "succeeded":
-        if type(report.result) is not dict or report.reason is not None:
+        if (
+            type(report.result) is not dict
+            or report.reason is not None
+            or report.capture_overflow_channels
+        ):
             raise ValueError("Knowledge ask success presence is invalid")
         if set(report.result) != {"answer_id", "answer_output"}:
             raise ValueError("Knowledge ask success result is not closed")
@@ -310,11 +346,13 @@ def validate_knowledge_ask_report_v1(report: KnowledgeAskReportV1) -> None:
     committed_reasons = {
         ("blocked", "retrieval_view_too_large"),
         ("blocked", "codex_runtime_unavailable"),
+        ("blocked", "codex_timeout_exhausted"),
         ("failed", "codex_process_failed"),
         ("failed", "answer_output_invalid"),
         ("failed", "answer_rendering_failed"),
         ("failed", "citation_link_construction_failed"),
         ("failed", "synthesis_input_invalid"),
+        ("interrupted", "user_interrupted"),
     }
     if report.result is not None:
         if (
@@ -326,7 +364,13 @@ def validate_knowledge_ask_report_v1(report: KnowledgeAskReportV1) -> None:
             or report.result["answer_output"] is not None
         ):
             raise ValueError("Knowledge ask committed stop receipt is invalid")
+        if report.capture_overflow_channels and (
+            report.outcome != "failed" or report.reason != "codex_process_failed"
+        ):
+            raise ValueError("Knowledge ask capture overflow binding is invalid")
         return
+    if report.capture_overflow_channels:
+        raise ValueError("Knowledge ask no-commit report has capture overflow facts")
     if (report.outcome, report.reason) not in {
         ("blocked", "invalid_question"),
         ("blocked", "question_too_large"),
@@ -346,6 +390,7 @@ def validate_knowledge_ask_report_v1(report: KnowledgeAskReportV1) -> None:
         ("failed", "answer_manifest_failed"),
         ("failed", "answer_target_conflict"),
         ("failed", "answer_commit_failed"),
+        ("interrupted", "user_interrupted_before_answer"),
     }:
         raise ValueError("Knowledge ask reason/outcome matrix is invalid")
 
@@ -370,9 +415,71 @@ def _seal_knowledge_ask_report_v1(
         return report
     sealed = report_sealer(report, answer_markdown_bytes)
     validate_knowledge_ask_report_v1(sealed)
-    if sealed != report:
+    if sealed != report and not (
+        report.outcome == "blocked"
+        and report.result is None
+        and sealed == _pre_id_interrupted_report_v1()
+    ):
         raise ValueError("Knowledge ask presentation seal changed command facts")
     return sealed
+
+
+def _publish_answer_report_v1(
+    *,
+    root: ValidatedDataRootV1,
+    owner: WriterOwnershipV1,
+    request: AnswerPublishRequestV1,
+    answer_output: dict[str, object] | None,
+    capture_overflow_channels: tuple[str, ...],
+    report_sealer: KnowledgeAskReportSealerV1 | None,
+) -> KnowledgeAskReportV1:
+    try:
+        committed = publish_answer_v1(root, owner, request)
+    except AnswerRootIntegrityLostV1:
+        return _failed_report_v1("data_root_integrity_lost")
+    except AnswerStagingFailedV1:
+        return _failed_report_v1("answer_staging_failed")
+    except AnswerManifestFailedV1:
+        return _failed_report_v1("answer_manifest_failed")
+    except AnswerTargetConflictV1:
+        return _failed_report_v1("answer_target_conflict")
+    except AnswerCommitFailedV1:
+        return _failed_report_v1("answer_commit_failed")
+    except AnswerCommitIndeterminateV1:
+        raise
+    if (
+        committed.answer_id != request.answer_id
+        or committed.status != request.status
+        or committed.error != request.error
+        or committed.answer_output_bytes != request.answer_output_bytes
+        or committed.answer_markdown_bytes != request.answer_markdown_bytes
+    ):
+        raise RuntimeError("Committed Answer proof differs")
+    if request.status == "succeeded":
+        if answer_output is None:
+            raise RuntimeError("Succeeded Answer output is absent")
+        report_reason: str | None = None
+        report_output: dict[str, object] | None = answer_output
+    else:
+        if request.error is None:
+            report_reason = "user_interrupted"
+        else:
+            report_reason = cast(str, request.error["code"])
+        report_output = None
+    report = KnowledgeAskReportV1(
+        outcome=request.status,
+        result={
+            "answer_id": committed.answer_id,
+            "answer_output": report_output,
+        },
+        reason=report_reason,
+        capture_overflow_channels=capture_overflow_channels,
+    )
+    return _seal_knowledge_ask_report_v1(
+        report,
+        committed.answer_markdown_bytes,
+        report_sealer,
+    )
 
 
 class KnowledgeAsksV1:
@@ -383,9 +490,17 @@ class KnowledgeAsksV1:
         cli_patch: tuple[tuple[str, str], ...],
         environ: Mapping[str, str] | None = None,
         report_sealer: KnowledgeAskReportSealerV1 | None = None,
+        cancellation: KnowledgeCancellationBridgeV1 | None = None,
     ) -> KnowledgeAskReportV1:
         if type(question) is not str or type(cli_patch) is not tuple:
             raise TypeError("Knowledge ask input is invalid")
+        cancellation_bridge = (
+            _UnmanagedNoCancellationV1()
+            if cancellation is None
+            else cancellation
+        )
+        if not cancellation_bridge.try_begin_work_v1():
+            return _pre_id_interrupted_report_v1()
         try:
             normalized = normalize_question_v1(question)
         except SearchQueryInvalidV1:
@@ -406,6 +521,8 @@ class KnowledgeAsksV1:
                 result=None,
                 reason="question_too_complex",
             )
+        if not cancellation_bridge.try_begin_work_v1():
+            return _pre_id_interrupted_report_v1()
         try:
             configuration = resolve_configuration_v1(
                 trusted_project_root=_PROJECT_ROOT,
@@ -418,12 +535,16 @@ class KnowledgeAsksV1:
                 result=None,
                 reason=error.cause,
             )
+        if not cancellation_bridge.try_begin_work_v1():
+            return _pre_id_interrupted_report_v1()
         try:
             effective_config_bytes, question_bytes, retrieval_query_bytes = (
                 _question_assets_v1(normalized)
             )
         except (TypeError, ValueError, UnicodeError):
             return _failed_report_v1("pre_answer_formation_failed")
+        if not cancellation_bridge.try_begin_work_v1():
+            return _pre_id_interrupted_report_v1()
         try:
             provenance = _git_provenance_v1()
         except _ProvenanceUnavailableV1:
@@ -432,10 +553,14 @@ class KnowledgeAsksV1:
                 result=None,
                 reason="provenance_unavailable",
             )
+        if not cancellation_bridge.try_begin_work_v1():
+            return _pre_id_interrupted_report_v1()
         try:
             _canonical_json_file_v1(provenance)
         except (TypeError, ValueError, UnicodeError):
             return _failed_report_v1("pre_answer_formation_failed")
+        if not cancellation_bridge.try_begin_work_v1():
+            return _pre_id_interrupted_report_v1()
         try:
             root = open_validated_data_root_v1(configuration.knowledge_data_root)
         except DataRootOpenErrorV1 as error:
@@ -451,6 +576,8 @@ class KnowledgeAsksV1:
                 reason=reason,
             )
         with root:
+            if not cancellation_bridge.try_begin_work_v1():
+                return _pre_id_interrupted_report_v1()
             identity = root.inspection.identity
             if identity is None:
                 return KnowledgeAskReportV1(
@@ -458,6 +585,8 @@ class KnowledgeAsksV1:
                     result=None,
                     reason="data_root_identity_unavailable",
                 )
+            if not cancellation_bridge.try_begin_work_v1():
+                return _pre_id_interrupted_report_v1()
             try:
                 owner = try_acquire_knowledge_answer_writer_v1(identity)
             except WriterOwnershipLifecycleErrorV1:
@@ -473,6 +602,8 @@ class KnowledgeAsksV1:
                     reason="answer_writer_busy",
                 )
             with owner:
+                if not cancellation_bridge.try_begin_work_v1():
+                    return _pre_id_interrupted_report_v1()
                 try:
                     staging_scan = scan_answer_staging_v1(root, owner)
                 except AnswerRootIntegrityLostV1:
@@ -484,9 +615,34 @@ class KnowledgeAsksV1:
                     # Until then, an existing staging entry cannot be bypassed safely.
                     return _failed_report_v1("orphan_scan_failed")
 
-                answer_id = _new_answer_id_v1()
+                answer_id_candidate = _new_answer_id_v1()
+                if not cancellation_bridge.try_answer_id_cutover_v1():
+                    return _pre_id_interrupted_report_v1()
+                answer_id = answer_id_candidate
                 started_monotonic_ns = time.monotonic_ns()
                 started_at = _utc_now_milliseconds_v1()
+                capture_overflow_channels: tuple[str, ...] = ()
+                if cancellation_bridge.observed_at_monotonic_ns() is not None:
+                    interrupted_request = AnswerPublishRequestV1(
+                        answer_id=answer_id,
+                        started_at=started_at,
+                        started_monotonic_ns=started_monotonic_ns,
+                        provenance=provenance,
+                        effective_config_bytes=effective_config_bytes,
+                        question_bytes=question_bytes,
+                        retrieval_query_bytes=retrieval_query_bytes,
+                        retrieval_audit_bytes=None,
+                        retrieval_view_bytes=None,
+                        status="interrupted",
+                    )
+                    return _publish_answer_report_v1(
+                        root=root,
+                        owner=owner,
+                        request=interrupted_request,
+                        answer_output=None,
+                        capture_overflow_channels=(),
+                        report_sealer=report_sealer,
+                    )
                 try:
                     retrieval = KnowledgeRetrievalV1.retrieve(
                         root,
@@ -498,17 +654,41 @@ class KnowledgeAsksV1:
                     )
                 except RetrievalDataRootIntegrityLostV1:
                     return _failed_report_v1("data_root_integrity_lost")
+                terminal_status: KnowledgeAskOutcomeV1
+                terminal_error: dict[str, object] | None
+                prompt_bytes: bytes | None
+                schema_bytes: bytes | None
+                attempts: tuple[AnswerAttemptPublishV1, ...]
+                answer_output: dict[str, object] | None
+                answer_output_bytes: bytes | None
+                answer_markdown_bytes: bytes | None
+                retrieval_audit_bytes: bytes
+                retrieval_view_bytes: bytes | None
                 if isinstance(retrieval, NonZeroCandidatesV1):
                     retrieval_audit_bytes = retrieval.retrieval_audit_bytes
-                    if retrieval.measured_retrieval_view.status == "too_large":
-                        terminal_status: KnowledgeAskOutcomeV1 = "blocked"
-                        terminal_error: dict[str, object] | None = {
+                    if cancellation_bridge.observed_at_monotonic_ns() is not None:
+                        terminal_status = "interrupted"
+                        terminal_error = None
+                        prompt_bytes = None
+                        schema_bytes = None
+                        attempts = ()
+                        answer_output = None
+                        answer_output_bytes = None
+                        answer_markdown_bytes = None
+                        retrieval_view_bytes = (
+                            None
+                            if retrieval.measured_retrieval_view.status == "too_large"
+                            else retrieval.measured_retrieval_view.buffer
+                        )
+                    elif retrieval.measured_retrieval_view.status == "too_large":
+                        terminal_status = "blocked"
+                        terminal_error = {
                             "code": "retrieval_view_too_large",
                             "stage": "retrieval",
                         }
                         prompt_bytes = None
                         schema_bytes = None
-                        attempts: tuple[AnswerAttemptPublishV1, ...] = ()
+                        attempts = ()
                         answer_output = None
                         answer_output_bytes = None
                         answer_markdown_bytes = None
@@ -531,6 +711,7 @@ class KnowledgeAsksV1:
                                 environ=(
                                     os.environ.copy() if environ is None else environ
                                 ),
+                                cancellation=cancellation_bridge,
                             )
                         except KnowledgeAnswererInputInvalidV1:
                             terminal_status = "failed"
@@ -560,20 +741,38 @@ class KnowledgeAsksV1:
                             answer_output = answerer.answer_output
                             answer_output_bytes = answerer.answer_output_bytes
                             answer_markdown_bytes = answerer.answer_markdown_bytes
+                            capture_overflow_channels = (
+                                answerer.capture_overflow_channels
+                            )
                         retrieval_view_bytes = retrieval.measured_retrieval_view.buffer
                 elif type(retrieval) is ZeroCandidateRetrievalV1:
-                    terminal_status = "succeeded"
-                    terminal_error = None
+                    retrieval_view_bytes = retrieval.measured_retrieval_view.buffer
+                    retrieval_audit_bytes = retrieval.retrieval_audit_bytes
                     prompt_bytes = None
                     schema_bytes = None
                     attempts = ()
-                    answer_output = _zero_candidate_answer_output_v1()
-                    answer_output_bytes = _canonical_json_file_v1(answer_output)
-                    answer_markdown_bytes = _zero_candidate_answer_markdown_v1(
-                        normalized.question
-                    )
-                    retrieval_view_bytes = retrieval.measured_retrieval_view.buffer
-                    retrieval_audit_bytes = retrieval.retrieval_audit_bytes
+                    if cancellation_bridge.observed_at_monotonic_ns() is not None:
+                        terminal_status = "interrupted"
+                        terminal_error = None
+                        answer_output = None
+                        answer_output_bytes = None
+                        answer_markdown_bytes = None
+                    else:
+                        terminal_status = "succeeded"
+                        terminal_error = None
+                        answer_output = _zero_candidate_answer_output_v1()
+                        answer_output_bytes = _canonical_json_file_v1(answer_output)
+                        answer_markdown_bytes = _zero_candidate_answer_markdown_v1(
+                            normalized.question
+                        )
+                        if (
+                            cancellation_bridge.observed_at_monotonic_ns()
+                            is not None
+                        ):
+                            terminal_status = "interrupted"
+                            answer_output = None
+                            answer_output_bytes = None
+                            answer_markdown_bytes = None
                 else:
                     raise TypeError("Knowledge retrieval verdict type is invalid")
                 request = AnswerPublishRequestV1(
@@ -594,51 +793,13 @@ class KnowledgeAsksV1:
                     answer_output_bytes=answer_output_bytes,
                     answer_markdown_bytes=answer_markdown_bytes,
                 )
-                try:
-                    committed = publish_answer_v1(root, owner, request)
-                except AnswerRootIntegrityLostV1:
-                    return _failed_report_v1("data_root_integrity_lost")
-                except AnswerStagingFailedV1:
-                    return _failed_report_v1("answer_staging_failed")
-                except AnswerManifestFailedV1:
-                    return _failed_report_v1("answer_manifest_failed")
-                except AnswerTargetConflictV1:
-                    return _failed_report_v1("answer_target_conflict")
-                except AnswerCommitFailedV1:
-                    return _failed_report_v1("answer_commit_failed")
-                except AnswerCommitIndeterminateV1:
-                    raise
-                if (
-                    committed.answer_id != answer_id
-                    or committed.status != terminal_status
-                    or committed.error != terminal_error
-                    or committed.answer_output_bytes != answer_output_bytes
-                    or committed.answer_markdown_bytes != answer_markdown_bytes
-                ):
-                    raise RuntimeError("Committed Answer proof differs")
-                if terminal_status == "succeeded":
-                    if answer_output is None:
-                        raise RuntimeError("Succeeded Answer output is absent")
-                    report_reason: str | None = None
-                    report_output: dict[str, object] | None = answer_output
-                else:
-                    if terminal_error is None:
-                        report_reason = "user_interrupted"
-                    else:
-                        report_reason = cast(str, terminal_error["code"])
-                    report_output = None
-                report = KnowledgeAskReportV1(
-                    outcome=terminal_status,
-                    result={
-                        "answer_id": committed.answer_id,
-                        "answer_output": report_output,
-                    },
-                    reason=report_reason,
-                )
-                return _seal_knowledge_ask_report_v1(
-                    report,
-                    committed.answer_markdown_bytes,
-                    report_sealer,
+                return _publish_answer_report_v1(
+                    root=root,
+                    owner=owner,
+                    request=request,
+                    answer_output=answer_output,
+                    capture_overflow_channels=capture_overflow_channels,
+                    report_sealer=report_sealer,
                 )
 
 

@@ -93,6 +93,6 @@ SQLite、JSON、TOML、日志、哈希、路径、子进程和原子文件操作
 3. CUDA：PyTorch CUDA 构建为 `13.0`，`torch.cuda.is_available()` 为真，并识别 `NVIDIA GeForce RTX 4090`。
 4. MinerU：在完全离线模型模式下，使用 GPU pipeline 解析真实的 6 页论文 PDF；生成 22 个文件、Markdown、4 个可解析 JSON、标注 PDF 和 14 张图片。
 5. Codex：项目入口报告 `codex-cli 0.146.0`，登录状态为 ChatGPT；以只读、无工具、非交互方式调用 `gpt-5.6-sol`，返回精确标记 `GEZHI_CODEX_OK`。
-6. Native build-only 工具：`vswhere.exe` 能定位完整且可启动的 VS Build Tools 2022 `17.14.13`；x64 `cl/link` 实际报告 `19.44.35215.0/14.44.35215.0`，Windows SDK `10.0.26100.0` 的 console header 与 x64 `kernel32.lib` 已验证存在。Bridge source/ABI 尚未实现，因此这里不声称 DLL runtime smoke test 已通过。
+6. Native build-only 工具：`vswhere.exe` 能定位完整且可启动的 VS Build Tools 2022 `17.14.13`；x64 `cl/link` 实际报告 `19.44.35215.0/14.44.35215.0`，Windows SDK `10.0.26100.0` 的 console header 与 x64 `kernel32.lib` 已验证存在。`tools/build-knowledge-cancellation.ps1` 已按这些固定 metadata 构建 x64 release `/MT` DLL；运行期按固定 SHA-256 与 PE x64 identity 复验，测试专用 build 另以显式 `-TestHooks` 输出且不覆盖正式 DLL。
 
 至此 Python/npm 依赖图、root packaging metadata、uv build-system requirement 与 native build-only 系统工具基线进入冻结状态。后续业务实现不得改变上述依赖图、package mode、entry-point target 或工具链；确需改变时必须重新开启明确的环境变更窗口。
