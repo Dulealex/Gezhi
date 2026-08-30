@@ -598,7 +598,7 @@ class KnowledgeAsksV1:
                 started_monotonic_ns = time.monotonic_ns()
                 started_at = _utc_now_milliseconds_v1()
                 capture_overflow_channels: tuple[str, ...] = ()
-                if cancellation_bridge.observed_at_monotonic_ns() is not None:
+                if not cancellation_bridge.try_begin_work_v1():
                     interrupted_request = AnswerPublishRequestV1(
                         answer_id=answer_id,
                         started_at=started_at,
@@ -641,7 +641,7 @@ class KnowledgeAsksV1:
                 retrieval_view_bytes: bytes | None
                 if isinstance(retrieval, NonZeroCandidatesV1):
                     retrieval_audit_bytes = retrieval.retrieval_audit_bytes
-                    if cancellation_bridge.observed_at_monotonic_ns() is not None:
+                    if not cancellation_bridge.try_begin_work_v1():
                         terminal_status = "interrupted"
                         terminal_error = None
                         prompt_bytes = None
@@ -726,7 +726,7 @@ class KnowledgeAsksV1:
                     prompt_bytes = None
                     schema_bytes = None
                     attempts = ()
-                    if cancellation_bridge.observed_at_monotonic_ns() is not None:
+                    if not cancellation_bridge.try_begin_work_v1():
                         terminal_status = "interrupted"
                         terminal_error = None
                         answer_output = None

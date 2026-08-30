@@ -2097,7 +2097,7 @@ def _run_codex_child_core_v1(
         prepared = _prepare_attempt(plan, test_hooks)
     except CodexChildUnsafeHoldErrorV1:
         raise
-    except BaseException as error:  # noqa: BLE001 - precommit rejection is closed.
+    except Exception as error:  # noqa: BLE001 - BaseException must cross this boundary.
         return PreAttemptRejectedV1(
             reason=f"preparation_failed:{type(error).__name__}",
             resource_ledger_count=0,

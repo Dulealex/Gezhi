@@ -428,18 +428,27 @@ class ScriptedCancellationV1:
         self.generation = 0
         self.sealed_token = 0
         self.phase = "accepting"
+        self.cutover_complete = False
         ScriptedCancellationV1.active = self
 
     def observed_at_monotonic_ns(self):
         return self.observed
 
     def try_begin_work_v1(self):
+        if (
+            self.mode == "pre-retrieval"
+            and self.cutover_complete
+            and self.observed is None
+        ):
+            self.observed = time.monotonic_ns()
+            self.generation = 1
         return self.observed is None
 
     def try_answer_id_cutover_v1(self):
         if self.mode in {"pre-id", "post-id"}:
             self.observed = time.monotonic_ns()
             self.generation = 1
+        self.cutover_complete = True
         return self.mode != "pre-id"
 
     def snapshot_v1(self):
@@ -1883,6 +1892,46 @@ def test_ask_ctrl_c_after_answer_id_commits_one_interrupted_p2_prefix(
         zero_active_knowledge_ask_root,
         tmp_path,
         cutover="post-id",
+    )
+
+    observed_ids: set[str] = set()
+    for result in results:
+        assert result.returncode == 130, (result.stdout + result.stderr).decode(
+            errors="replace"
+        )
+        envelope = json.loads(result.stdout)
+        assert envelope["outcome"] == "interrupted"
+        assert envelope["diagnostics"] == [
+            {"code": "knowledge.ask.user_interrupted.v1", "context": {}}
+        ]
+        answer_id = envelope["result"]["answer_id"]
+        assert envelope["result"]["answer_output"] is None
+        observed_ids.add(answer_id)
+        committed = zero_active_knowledge_ask_root / "answers" / answer_id
+        manifest = json.loads((committed / "manifest.json").read_bytes())
+        assert manifest["status"] == "interrupted"
+        assert manifest["error"] is None
+        assert manifest["attempts"] == []
+        assert [asset["path"] for asset in manifest["assets"]] == [
+            "effective_config.json",
+            "question.json",
+            "retrieval_query.json",
+        ]
+        assert not (committed / "retrieval_audit.json").exists()
+        assert not (committed / "retrieval_view.json").exists()
+        assert not (committed / "answer_output.json").exists()
+        assert not (committed / "answer.md").exists()
+    assert len(observed_ids) == 2
+
+
+def test_ask_ctrl_c_before_retrieval_commits_one_interrupted_p2_prefix(
+    zero_active_knowledge_ask_root: Path,
+    tmp_path: Path,
+) -> None:
+    results = _run_with_cancellation_cutover_double(
+        zero_active_knowledge_ask_root,
+        tmp_path,
+        cutover="pre-retrieval",
     )
 
     observed_ids: set[str] = set()

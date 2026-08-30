@@ -36,6 +36,7 @@ def _evidence(
     exit_code: int | None = 0,
     events_overflow: bool = False,
     final_overflow: bool = False,
+    resource_ledger_count: int = 0,
 ) -> AttemptTerminalEvidenceV1:
     events_path = tmp_path / "events.jsonl"
     final_path = tmp_path / "final_message.txt"
@@ -70,7 +71,7 @@ def _evidence(
             or events_overflow
             or final_overflow
         ),
-        resource_ledger_count=0,
+        resource_ledger_count=resource_ledger_count,
         lifecycle_facts=(),
     )
 
@@ -96,6 +97,19 @@ def _project_attempt_v1(
         cancellation=cancellation,
         classification_ready_monotonic_ns=ready,
     )
+
+
+def test_attempt_with_live_resources_never_reaches_terminal_projection(
+    tmp_path: Path,
+) -> None:
+    evidence = _evidence(
+        tmp_path,
+        events=_json_line({"type": "turn.completed", "usage": {}}),
+        resource_ledger_count=1,
+    )
+
+    with pytest.raises(OSError, match="resource ledger"):
+        _project_attempt_v1(evidence)
 
 
 def test_attempt_projects_the_one_completed_usage_object(tmp_path: Path) -> None:
@@ -143,7 +157,7 @@ def test_attempt_projects_usage_fields_independently(tmp_path: Path) -> None:
         {
             "type": "turn.completed",
             "usage": {
-                "cached_input_tokens": True,
+                "cached_input_tokens": 1.5,
                 "input_tokens": 0,
                 "output_tokens": -1,
                 "reasoning_output_tokens": 9_223_372_036_854_775_808,

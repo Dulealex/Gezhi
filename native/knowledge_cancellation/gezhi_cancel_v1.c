@@ -25,6 +25,9 @@ static volatile LONG gezhi_accepted_in_flight = 0;
 static volatile LONG gezhi_poisoned = 0;
 static volatile LONG gezhi_registered = 0;
 static LARGE_INTEGER gezhi_qpc_frequency = {0};
+#ifdef GEZHI_CANCEL_TESTING
+static volatile LONG gezhi_test_poison_before_seal_gate = 0;
+#endif
 
 static LONG64 gezhi_load_control(void) {
     return InterlockedCompareExchange64(&gezhi_control, 0, 0);
@@ -357,8 +360,17 @@ __declspec(dllexport) int __stdcall gezhi_cancel_v1_conditional_seal(
         || InterlockedCompareExchange(&gezhi_poisoned, 0, 0) != 0) {
         return -1;
     }
+#ifdef GEZHI_CANCEL_TESTING
+    if (InterlockedExchange(&gezhi_test_poison_before_seal_gate, 0) != 0) {
+        InterlockedExchange(&gezhi_poisoned, 1);
+    }
+#endif
     if (InterlockedCompareExchange(&gezhi_admission_gate, -1, 0) != 0) {
         return 0;
+    }
+    if (InterlockedCompareExchange(&gezhi_poisoned, 0, 0) != 0) {
+        InterlockedExchange(&gezhi_admission_gate, 0);
+        return -1;
     }
     observed = (uint64_t)gezhi_load_control();
     if (!gezhi_phase_is_accepting(gezhi_phase(observed))
@@ -440,5 +452,14 @@ gezhi_cancel_v1_test_finish_poison_publication(void) {
     InterlockedExchange(&gezhi_poisoned, 1);
     gezhi_leave_admission_gate();
     return 1;
+}
+
+__declspec(dllexport) int __stdcall
+gezhi_cancel_v1_test_poison_before_next_seal_gate(void) {
+    if (InterlockedCompareExchange(&gezhi_poisoned, 0, 0) != 0) {
+        return 0;
+    }
+    return InterlockedCompareExchange(
+        &gezhi_test_poison_before_seal_gate, 1, 0) == 0;
 }
 #endif

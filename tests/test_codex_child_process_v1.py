@@ -1894,6 +1894,24 @@ def test_precommit_environment_allocation_fault_returns_no_attempt(
     assert not Path(plan.staging_directory).exists()
 
 
+def test_precommit_keyboard_interrupt_is_never_mapped_to_a_rejection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan(tmp_path, "success")
+
+    def interrupt_environment(_block: str) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(child_process, "_environment_array", interrupt_environment)
+
+    with pytest.raises(KeyboardInterrupt):
+        run_codex_child_v1(plan, NeverCancelledV1())
+
+    assert not Path(plan.capture_directory).exists()
+    assert not Path(plan.staging_directory).exists()
+
+
 def test_precommit_second_pipe_fault_rolls_back_every_owned_resource(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

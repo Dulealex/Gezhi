@@ -274,6 +274,17 @@ def _reject_float_v1(_value: str) -> NoReturn:
     raise ValueError("JSON number must not be a float or non-standard constant")
 
 
+class _JsonFloatTokenV1:
+    __slots__ = ()
+
+
+_JSON_FLOAT_TOKEN_V1 = _JsonFloatTokenV1()
+
+
+def _mark_json_float_v1(_value: str) -> _JsonFloatTokenV1:
+    return _JSON_FLOAT_TOKEN_V1
+
+
 def _decode_single_json_object_v1(payload: bytes) -> dict[str, object]:
     if not payload or payload.startswith(b"\xef\xbb\xbf"):
         raise ValueError("JSON bytes are empty or have a BOM")
@@ -565,7 +576,7 @@ def _event_records_v1(
                 text,
                 strict=True,
                 object_pairs_hook=_reject_duplicate_pairs_v1,
-                parse_float=_reject_float_v1,
+                parse_float=_mark_json_float_v1,
                 parse_constant=_reject_float_v1,
             )
             if type(value) is not dict:
@@ -619,6 +630,11 @@ def _attempt_from_evidence_v1(
     Literal["timeout", "process_error", "interrupted"] | None,
     tuple[OverflowChannelV1, ...],
 ]:
+    if (
+        type(evidence.resource_ledger_count) is not int
+        or evidence.resource_ledger_count != 0
+    ):
+        raise OSError("Attempt resource ledger did not reach zero")
     events = _capture_bytes_v1(evidence.events, required=True)
     final_message = _capture_bytes_v1(evidence.final_message, required=True)
     if not 0 <= len(events) <= _EVENTS_CAPTURE_CAP:
@@ -694,7 +710,6 @@ def _attempt_from_evidence_v1(
     process_error_won = (
         bool(overflow_channels)
         or not events_valid
-        or evidence.resource_ledger_count != 0
         or evidence.mechanical_outcome == "process_error"
     )
     if process_error_won:

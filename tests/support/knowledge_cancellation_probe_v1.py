@@ -40,6 +40,8 @@ def _bind_native_test_dll(path: Path) -> ctypes.WinDLL:
     dll.gezhi_cancel_v1_test_begin_poison_publication.restype = ctypes.c_int
     dll.gezhi_cancel_v1_test_finish_poison_publication.argtypes = []
     dll.gezhi_cancel_v1_test_finish_poison_publication.restype = ctypes.c_int
+    dll.gezhi_cancel_v1_test_poison_before_next_seal_gate.argtypes = []
+    dll.gezhi_cancel_v1_test_poison_before_next_seal_gate.restype = ctypes.c_int
     return dll
 
 
@@ -177,6 +179,14 @@ def _poisoned_publication_v1(path: Path) -> dict[str, object]:
     return {"mode": "poisoned-publication", "proof": "rejected"}
 
 
+def _seal_poison_race_v1(path: Path) -> dict[str, object]:
+    dll = _activate_test_dll_v1(path)
+    assert dll.gezhi_cancel_v1_test_poison_before_next_seal_gate() == 1
+    assert dll.gezhi_cancel_v1_conditional_seal(0, 37) == -1
+    assert dll.gezhi_cancel_v1_try_begin_work() == -1
+    return {"mode": "seal-poison-race", "proof": "rejected"}
+
+
 def _interactive_profile_v1() -> dict[str, object]:
     from gezhi._knowledge_cancellation import (
         WindowsConsoleCancellationBridgeV1,
@@ -218,6 +228,8 @@ def main() -> int:
             receipt = _concurrent_callbacks_v1(path)
         elif mode == "poisoned-publication":
             receipt = _poisoned_publication_v1(path)
+        elif mode == "seal-poison-race":
+            receipt = _seal_poison_race_v1(path)
         else:
             raise SystemExit("unknown probe mode")
     print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
