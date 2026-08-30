@@ -17,15 +17,26 @@ if ([string]::IsNullOrEmpty($OutputPath)) {
     $OutputPath = $productionOutput
 }
 $resolvedOutput = [System.IO.Path]::GetFullPath($OutputPath)
+$comparisonOutput = $resolvedOutput
+if ($comparisonOutput.StartsWith('\\?\UNC\', [System.StringComparison]::OrdinalIgnoreCase)) {
+    $comparisonOutput = '\\' + $comparisonOutput.Substring(8)
+}
+elseif ($comparisonOutput.StartsWith('\\?\', [System.StringComparison]::OrdinalIgnoreCase)) {
+    $comparisonOutput = $comparisonOutput.Substring(4)
+}
+$comparisonOutput = [System.IO.Path]::GetFullPath($comparisonOutput)
 if (
     $TestHooks -and
     [string]::Equals(
-        $resolvedOutput,
+        $comparisonOutput,
         $productionOutput,
         [System.StringComparison]::OrdinalIgnoreCase
     )
 ) {
     throw "TestHooks refuses the production DLL OutputPath"
+}
+if ($TestHooks -and (Test-Path -LiteralPath $resolvedOutput)) {
+    throw "TestHooks requires a new OutputPath"
 }
 $outputDirectory = Split-Path -Parent $resolvedOutput
 New-Item -ItemType Directory -Force -Path $outputDirectory | Out-Null

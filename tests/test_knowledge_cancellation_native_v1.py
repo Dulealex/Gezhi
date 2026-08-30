@@ -140,8 +140,10 @@ def test_test_hooks_require_an_explicit_nonproduction_output_path() -> None:
             REPOSITORY_ROOT / "src" / "gezhi" / "_native" / "gezhi_cancel_v1.dll"
         ).swapcase(),
         r"src\gezhi\_native\..\_native\gezhi_cancel_v1.dll",
+        "\\\\?\\"
+        + str(REPOSITORY_ROOT / "src" / "gezhi" / "_native" / "gezhi_cancel_v1.dll"),
     ),
-    ids=("absolute", "case-alias", "relative-dotdot-alias"),
+    ids=("absolute", "case-alias", "relative-dotdot-alias", "extended-path-alias"),
 )
 def test_test_hooks_reject_production_output_aliases_before_tool_discovery(
     output_path: str,
@@ -174,6 +176,39 @@ def test_test_hooks_reject_production_output_aliases_before_tool_discovery(
     assert b"refuses the production DLL OutputPath" in completed.stderr
     assert b"vswhere" not in completed.stderr
     assert hashlib.sha256(production.read_bytes()).hexdigest() == before
+
+
+def test_test_hooks_never_overwrite_an_existing_output(
+    tmp_path: Path,
+) -> None:
+    existing_output = tmp_path / "existing-test-hook-output.dll"
+    existing_output.write_bytes(b"existing bytes")
+
+    completed = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            str(REPOSITORY_ROOT / "tools" / "build-knowledge-cancellation.ps1"),
+            "-OutputPath",
+            str(existing_output),
+            "-TestHooks",
+        ],
+        check=False,
+        capture_output=True,
+        cwd=REPOSITORY_ROOT,
+        env=subprocess_environment(
+            updates={
+                "ProgramFiles(x86)": str(REPOSITORY_ROOT / "missing-program-files-x86")
+            }
+        ),
+        timeout=15,
+    )
+
+    assert completed.returncode != 0
+    assert b"requires a new OutputPath" in completed.stderr
+    assert b"vswhere" not in completed.stderr
+    assert existing_output.read_bytes() == b"existing bytes"
 
 
 def test_public_ask_uses_no_source_profile_without_a_console() -> None:
