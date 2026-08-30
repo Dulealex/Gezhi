@@ -56,6 +56,7 @@ _MARKDOWN_MAX_BYTES = 524_288
 _PROMPT_MAX_BYTES = 262_144
 _SCHEMA_MAX_BYTES = 262_144
 _EVENTS_CAPTURE_CAP = 16_777_216
+_FINAL_CAPTURE_CAP = 1_048_576
 _INT64_MAX = 9_223_372_036_854_775_807
 _CANDIDATE_ID = re.compile(r"^cand_[0-9a-f]{24}$", re.ASCII)
 _SOURCE_ID = re.compile(r"^src_[0-9a-f]{24}$", re.ASCII)
@@ -603,9 +604,7 @@ def _usage_from_events_v1(
     ):
         value = usage.get(name)
         projected.append(
-            value
-            if type(value) is int and 0 <= value <= _INT64_MAX
-            else None
+            value if type(value) is int and 0 <= value <= _INT64_MAX else None
         )
     return projected[0], projected[1], projected[2], projected[3]
 
@@ -624,30 +623,38 @@ def _attempt_from_evidence_v1(
     final_message = _capture_bytes_v1(evidence.final_message, required=True)
     if not 0 <= len(events) <= _EVENTS_CAPTURE_CAP:
         raise OSError("Attempt events capture length is invalid")
+    if not 0 <= len(final_message) <= _FINAL_CAPTURE_CAP:
+        raise OSError("Attempt final capture length is invalid")
+    if evidence.events.overflow and len(events) != _EVENTS_CAPTURE_CAP:
+        raise OSError("Attempt events overflow prefix length is invalid")
+    if (
+        evidence.final_message is not None
+        and evidence.final_message.overflow
+        and len(final_message) != _FINAL_CAPTURE_CAP
+    ):
+        raise OSError("Attempt final overflow prefix length is invalid")
     overflow_channels = tuple(
         channel
         for channel, overflow in (
             ("events", evidence.events.overflow),
             (
                 "final_message",
-                evidence.final_message is not None
-                and evidence.final_message.overflow,
+                evidence.final_message is not None and evidence.final_message.overflow,
             ),
         )
         if overflow
     )
     records, events_valid = (
-        ((), True)
-        if evidence.events.overflow
-        else _event_records_v1(events)
+        ((), True) if evidence.events.overflow else _event_records_v1(events)
     )
     usage = _usage_from_events_v1(
         events,
         records,
         events_valid=events_valid,
     )
-    has_completed = any(
-        record.get("type") == "turn.completed" for record in records
+    has_completed = any(record.get("type") == "turn.completed" for record in records)
+    has_provider_terminal_failure = any(
+        record.get("type") in {"turn.failed", "error"} for record in records
     )
     ready_ns = (
         time.monotonic_ns()
@@ -687,20 +694,18 @@ def _attempt_from_evidence_v1(
     process_error_won = (
         bool(overflow_channels)
         or not events_valid
+        or has_provider_terminal_failure
         or evidence.resource_ledger_count != 0
         or evidence.mechanical_outcome == "process_error"
     )
     if process_error_won:
-        failure_class: Literal[
-            "timeout", "process_error", "interrupted"
-        ] | None = "process_error"
+        failure_class: Literal["timeout", "process_error", "interrupted"] | None = (
+            "process_error"
+        )
     elif (
         observed_cancel_ns is not None
         and observed_cancel_ns <= ready_ns
-        and (
-            active_deadline_ns is None
-            or observed_cancel_ns <= active_deadline_ns
-        )
+        and (active_deadline_ns is None or observed_cancel_ns <= active_deadline_ns)
     ):
         failure_class = "interrupted"
     elif active_deadline_ns is not None and active_deadline_ns <= ready_ns:
@@ -1004,9 +1009,18 @@ def _cancel_wins_v1(
 ) -> bool:
     observed = cancellation.observed_at_monotonic_ns()
     return observed is not None and (
-        shared_deadline_monotonic_ns is None
-        or observed <= shared_deadline_monotonic_ns
+        shared_deadline_monotonic_ns is None or observed <= shared_deadline_monotonic_ns
     )
+
+
+def _cancel_wins_completion_v1(
+    cancellation: CancellationObservationV1,
+    completion_monotonic_ns: int,
+) -> bool:
+    if type(completion_monotonic_ns) is not int or completion_monotonic_ns < 0:
+        raise TypeError("Knowledge completion boundary is invalid")
+    observed = cancellation.observed_at_monotonic_ns()
+    return observed is not None and observed <= completion_monotonic_ns
 
 
 def _wait_retry_backoff_v1(
@@ -1058,7 +1072,9 @@ def answer_nonzero_v1(
     if len(schema_bytes) > _SCHEMA_MAX_BYTES:
         raise KnowledgeAnswererInputInvalidV1("Answer output Schema is too large")
     source = os.environ.copy() if environ is None else environ
-    cancellation_observation = NeverCancelledV1() if cancellation is None else cancellation
+    cancellation_observation = (
+        NeverCancelledV1() if cancellation is None else cancellation
+    )
     if not hasattr(cancellation_observation, "observed_at_monotonic_ns"):
         raise TypeError("Knowledge cancellation observation is invalid")
     try:
@@ -1125,30 +1141,35 @@ def answer_nonzero_v1(
             attempt_package = _create_attempt_package_v1(temporary_root)
             with attempt_package.schema_path.open("xb") as schema_target:
                 schema_target.write(schema_bytes)
-        except (KnowledgeAnswererInputInvalidV1, OSError, ValueError):
+        except (
+            KnowledgeAnswererInputInvalidV1,
+            OSError,
+            ValueError,
+        ) as error:
             if attempt_package is not None:
                 _remove_attempt_package_v1(
                     attempt_package.root,
                     temporary_root,
                 )
-            cancellation_won = _cancel_wins_v1(
+            if _cancel_wins_v1(
                 cancellation_observation,
                 shared_deadline_monotonic_ns,
+            ):
+                return _stopped_answerer_v1(
+                    status="interrupted",
+                    error=None,
+                    prompt_bytes=prompt_bytes,
+                    schema_bytes=schema_bytes,
+                    attempts=tuple(attempts),
+                )
+            raise KnowledgeAnswererInputInvalidV1(
+                "Attempt workspace or Schema could not be formed"
+            ) from error
+        if attempt_package is None:
+            raise KnowledgeAnswererUnsafeHoldErrorV1(
+                "Attempt package identity was not established"
             )
-            return _stopped_answerer_v1(
-                status="interrupted" if cancellation_won else "blocked",
-                error=(
-                    None
-                    if cancellation_won
-                    else {
-                        "code": "codex_runtime_unavailable",
-                        "stage": "synthesis",
-                    }
-                ),
-                prompt_bytes=prompt_bytes,
-                schema_bytes=schema_bytes,
-                attempts=tuple(attempts),
-            )
+        safe_to_revoke = False
         try:
             result = _run_role_attempt_v1(
                 KnowledgeAnswerAttemptRequestV1(
@@ -1167,8 +1188,12 @@ def answer_nonzero_v1(
                 )
             )
             if isinstance(result, PreAttemptRejectedV1):
-                if result.resource_ledger_count != 0 or result.create_process_calls != 0:
+                if (
+                    result.resource_ledger_count != 0
+                    or result.create_process_calls != 0
+                ):
                     raise OSError("Rejected attempt retained resources")
+                safe_to_revoke = True
                 if result.reason == "cancelled_before_commit":
                     return _stopped_answerer_v1(
                         status="interrupted",
@@ -1205,27 +1230,34 @@ def answer_nonzero_v1(
             observed_shared_deadline = result.shared_deadline_monotonic_ns
             if shared_deadline_monotonic_ns is None:
                 shared_deadline_monotonic_ns = observed_shared_deadline
-            elif (
-                observed_shared_deadline is not None
-                and observed_shared_deadline != shared_deadline_monotonic_ns
-            ):
+            elif observed_shared_deadline != shared_deadline_monotonic_ns:
                 raise ValueError("Knowledge shared deadline changed")
             attempt, failure_class, overflow_channels = _attempt_from_evidence_v1(
                 result,
                 cancellation=cancellation_observation,
             )
+            if (
+                failure_class in {None, "timeout"}
+                and shared_deadline_monotonic_ns is None
+            ):
+                raise ValueError("Knowledge shared deadline is absent")
             attempts.append(attempt)
             last_attempt = attempt
-        except (CodexRuntimeResolutionErrorV1, OSError, TypeError, ValueError) as error:
-            raise KnowledgeAnswererInputInvalidV1(
-                "Knowledge Answerer attempt could not be finalized"
+            safe_to_revoke = True
+        except KnowledgeAnswererUnsafeHoldErrorV1:
+            raise
+        except (
+            CodexRuntimeResolutionErrorV1,
+            OSError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise KnowledgeAnswererUnsafeHoldErrorV1(
+                "Launched Knowledge attempt evidence could not be finalized"
             ) from error
         finally:
-            if attempt_package is None:
-                raise KnowledgeAnswererUnsafeHoldErrorV1(
-                    "Committed attempt package identity was lost"
-                )
-            _remove_attempt_package_v1(attempt_package.root, temporary_root)
+            if safe_to_revoke:
+                _remove_attempt_package_v1(attempt_package.root, temporary_root)
 
         if failure_class == "timeout":
             if ordinal == 3:
@@ -1239,14 +1271,13 @@ def answer_nonzero_v1(
                     schema_bytes=schema_bytes,
                     attempts=tuple(attempts),
                 )
-            if shared_deadline_monotonic_ns is None:
-                raise KnowledgeAnswererInputInvalidV1(
-                    "Timed out Knowledge attempt has no shared deadline"
-                )
             wait_verdict = _wait_retry_backoff_v1(
                 delay_ms=(10_000, 30_000)[ordinal - 1],
                 cancellation=cancellation_observation,
-                shared_deadline_monotonic_ns=shared_deadline_monotonic_ns,
+                shared_deadline_monotonic_ns=cast(
+                    int,
+                    shared_deadline_monotonic_ns,
+                ),
             )
             if wait_verdict == "ready":
                 continue
@@ -1301,7 +1332,11 @@ def answer_nonzero_v1(
             frozenset(candidates),
         )
     except ValueError:
-        if _cancel_wins_v1(cancellation_observation, None):
+        validation_completed_ns = time.monotonic_ns()
+        if _cancel_wins_completion_v1(
+            cancellation_observation,
+            validation_completed_ns,
+        ):
             return _stopped_answerer_v1(
                 status="interrupted",
                 error=None,
@@ -1319,7 +1354,11 @@ def answer_nonzero_v1(
             answer_output_bytes=None,
             answer_markdown_bytes=None,
         )
-    if _cancel_wins_v1(cancellation_observation, None):
+    validation_completed_ns = time.monotonic_ns()
+    if _cancel_wins_completion_v1(
+        cancellation_observation,
+        validation_completed_ns,
+    ):
         return _stopped_answerer_v1(
             status="interrupted",
             error=None,
@@ -1334,7 +1373,11 @@ def answer_nonzero_v1(
             candidates,
         )
     except CitationLinkConstructionFailedV1:
-        if _cancel_wins_v1(cancellation_observation, None):
+        rendering_completed_ns = time.monotonic_ns()
+        if _cancel_wins_completion_v1(
+            cancellation_observation,
+            rendering_completed_ns,
+        ):
             return _stopped_answerer_v1(
                 status="interrupted",
                 error=None,
@@ -1356,7 +1399,11 @@ def answer_nonzero_v1(
             answer_markdown_bytes=None,
         )
     except ValueError:
-        if _cancel_wins_v1(cancellation_observation, None):
+        rendering_completed_ns = time.monotonic_ns()
+        if _cancel_wins_completion_v1(
+            cancellation_observation,
+            rendering_completed_ns,
+        ):
             return _stopped_answerer_v1(
                 status="interrupted",
                 error=None,
@@ -1374,7 +1421,11 @@ def answer_nonzero_v1(
             answer_output_bytes=None,
             answer_markdown_bytes=None,
         )
-    if _cancel_wins_v1(cancellation_observation, None):
+    rendering_completed_ns = time.monotonic_ns()
+    if _cancel_wins_completion_v1(
+        cancellation_observation,
+        rendering_completed_ns,
+    ):
         return _stopped_answerer_v1(
             status="interrupted",
             error=None,

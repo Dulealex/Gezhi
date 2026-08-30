@@ -1,74 +1,33 @@
 from __future__ import annotations
 
-import ctypes
+import hashlib
 import json
 import subprocess
 from pathlib import Path
 
 from launcher_support import (
+    PYTHON_EXE,
     REPOSITORY_ROOT,
     SOURCE_ROOT,
     launcher_commands,
     subprocess_environment,
 )
 
-
-def _bind_native_test_dll(path: Path) -> ctypes.WinDLL:
-    dll = ctypes.WinDLL(str(path), use_last_error=True)
-    dll.gezhi_cancel_v1_arm.argtypes = []
-    dll.gezhi_cancel_v1_arm.restype = ctypes.c_int
-    dll.gezhi_cancel_v1_activate.argtypes = []
-    dll.gezhi_cancel_v1_activate.restype = ctypes.c_int
-    dll.gezhi_cancel_v1_try_begin_work.argtypes = []
-    dll.gezhi_cancel_v1_try_begin_work.restype = ctypes.c_int
-    dll.gezhi_cancel_v1_snapshot.argtypes = [
-        ctypes.POINTER(ctypes.c_uint32),
-        ctypes.POINTER(ctypes.c_uint32),
-        ctypes.POINTER(ctypes.c_int),
-        ctypes.POINTER(ctypes.c_int64),
-        ctypes.POINTER(ctypes.c_uint32),
-        ctypes.POINTER(ctypes.c_int),
-        ctypes.POINTER(ctypes.c_uint32),
-    ]
-    dll.gezhi_cancel_v1_snapshot.restype = ctypes.c_int
-    dll.gezhi_cancel_v1_conditional_seal.argtypes = [
-        ctypes.c_uint32,
-        ctypes.c_uint32,
-    ]
-    dll.gezhi_cancel_v1_conditional_seal.restype = ctypes.c_int
-    dll.gezhi_cancel_v1_release.argtypes = []
-    dll.gezhi_cancel_v1_release.restype = ctypes.c_int
-    dll.gezhi_cancel_v1_test_dispatch.argtypes = [ctypes.c_uint32]
-    dll.gezhi_cancel_v1_test_dispatch.restype = ctypes.c_int
-    return dll
+_CANCELLATION_PROBE = (
+    Path(__file__).parent / "support" / "knowledge_cancellation_probe_v1.py"
+)
 
 
-def _snapshot(dll: ctypes.WinDLL) -> tuple[int, int, int, int, int, int, int]:
-    phase = ctypes.c_uint32()
-    generation = ctypes.c_uint32()
-    latched = ctypes.c_int()
-    observed_ns = ctypes.c_int64()
-    in_flight = ctypes.c_uint32()
-    publication_ready = ctypes.c_int()
-    sealed_token = ctypes.c_uint32()
-    assert dll.gezhi_cancel_v1_snapshot(
-        ctypes.byref(phase),
-        ctypes.byref(generation),
-        ctypes.byref(latched),
-        ctypes.byref(observed_ns),
-        ctypes.byref(in_flight),
-        ctypes.byref(publication_ready),
-        ctypes.byref(sealed_token),
-    ) == 1
-    return (
-        phase.value,
-        generation.value,
-        latched.value,
-        observed_ns.value,
-        in_flight.value,
-        publication_ready.value,
-        sealed_token.value,
+def _run_native_probe_v1(mode: str, dll_path: Path) -> dict[str, object]:
+    completed = subprocess.run(
+        [PYTHON_EXE, str(_CANCELLATION_PROBE), mode, str(dll_path)],
+        check=True,
+        capture_output=True,
+        cwd=REPOSITORY_ROOT,
+        timeout=15,
     )
+    assert completed.stderr == b""
+    return json.loads(completed.stdout)
 
 
 def test_native_handler_and_conditional_seal_share_one_admission_gate(
@@ -94,37 +53,82 @@ def test_native_handler_and_conditional_seal_share_one_admission_gate(
     assert receipt["test_hooks"] is True
     assert receipt["toolset"] == "14.44.35207"
     assert receipt["windows_sdk"] == "10.0.26100.0"
-    dll = _bind_native_test_dll(dll_path)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    set_console_ctrl_handler = kernel32.SetConsoleCtrlHandler
-    set_console_ctrl_handler.argtypes = [ctypes.c_void_p, ctypes.c_int]
-    set_console_ctrl_handler.restype = ctypes.c_int
+    probe = _run_native_probe_v1("dispatch-first", dll_path)
+    assert probe["mode"] == "dispatch-first"
+    assert type(probe["observed_ns"]) is int and probe["observed_ns"] > 0
 
-    assert dll.gezhi_cancel_v1_arm() == 1
-    assert set_console_ctrl_handler(None, False) != 0
-    assert dll.gezhi_cancel_v1_activate() == 1
-    assert _snapshot(dll) == (2, 0, 0, 0, 0, 0, 0)
-    assert dll.gezhi_cancel_v1_try_begin_work() == 1
-    assert dll.gezhi_cancel_v1_test_dispatch(1) == 0
-    assert dll.gezhi_cancel_v1_test_dispatch(0) == 1
-    phase, generation, latched, observed_ns, in_flight, ready, token = _snapshot(
-        dll
+
+def test_native_answer_id_cutover_wins_before_a_later_callback(
+    tmp_path: Path,
+) -> None:
+    dll_path = tmp_path / "gezhi_cancel_cutover_test_v1.dll"
+    subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            str(REPOSITORY_ROOT / "tools" / "build-knowledge-cancellation.ps1"),
+            "-OutputPath",
+            str(dll_path),
+            "-TestHooks",
+        ],
+        check=True,
+        capture_output=True,
+        cwd=REPOSITORY_ROOT,
+        timeout=30,
     )
-    assert (phase, generation, latched, in_flight, ready, token) == (
-        2,
-        1,
-        1,
-        0,
-        1,
-        0,
+    probe = _run_native_probe_v1("cutover-first", dll_path)
+    assert probe["mode"] == "cutover-first"
+    assert type(probe["observed_ns"]) is int and probe["observed_ns"] > 0
+
+
+def test_concurrent_native_callbacks_publish_complete_generations(
+    tmp_path: Path,
+) -> None:
+    dll_path = tmp_path / "gezhi_cancel_concurrent_test_v1.dll"
+    subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            str(REPOSITORY_ROOT / "tools" / "build-knowledge-cancellation.ps1"),
+            "-OutputPath",
+            str(dll_path),
+            "-TestHooks",
+        ],
+        check=True,
+        capture_output=True,
+        cwd=REPOSITORY_ROOT,
+        timeout=30,
     )
-    assert observed_ns > 0
-    assert dll.gezhi_cancel_v1_try_begin_work() == 0
-    assert dll.gezhi_cancel_v1_conditional_seal(0, 8) == 0
-    assert dll.gezhi_cancel_v1_conditional_seal(1, 9) == 1
-    assert dll.gezhi_cancel_v1_test_dispatch(0) == 0
-    assert dll.gezhi_cancel_v1_release() == 1
-    assert _snapshot(dll) == (4, 1, 1, observed_ns, 0, 1, 9)
+
+    assert _run_native_probe_v1("concurrent-callbacks", dll_path) == {
+        "generation": 8,
+        "mode": "concurrent-callbacks",
+    }
+
+
+def test_test_hooks_require_an_explicit_nonproduction_output_path() -> None:
+    production = REPOSITORY_ROOT / "src" / "gezhi" / "_native" / "gezhi_cancel_v1.dll"
+    before = hashlib.sha256(production.read_bytes()).hexdigest()
+
+    completed = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            str(REPOSITORY_ROOT / "tools" / "build-knowledge-cancellation.ps1"),
+            "-TestHooks",
+        ],
+        check=False,
+        capture_output=True,
+        cwd=REPOSITORY_ROOT,
+        timeout=15,
+    )
+
+    assert completed.returncode != 0
+    assert b"explicit OutputPath" in completed.stderr
+    assert hashlib.sha256(production.read_bytes()).hexdigest() == before
 
 
 def test_public_ask_uses_no_source_profile_without_a_console() -> None:
@@ -153,3 +157,27 @@ def test_public_ask_uses_no_source_profile_without_a_console() -> None:
             "result": None,
             "schema_version": "gezhi.cli_result.v1",
         }
+
+
+def test_redirected_stdio_with_a_hidden_console_uses_the_native_profile() -> None:
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 0
+    completed = subprocess.run(
+        [PYTHON_EXE, str(_CANCELLATION_PROBE), "interactive-profile"],
+        cwd=REPOSITORY_ROOT,
+        env=subprocess_environment(pythonpath_roots=(SOURCE_ROOT,)),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=False,
+        timeout=15,
+        creationflags=0x00000010,
+        startupinfo=startupinfo,
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+    assert completed.stderr == b""
+    assert json.loads(completed.stdout) == {
+        "mode": "interactive-profile",
+        "source": "native",
+    }

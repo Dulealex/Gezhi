@@ -31,7 +31,7 @@ _FILE_SHARE_WRITE = 0x00000002
 _OPEN_EXISTING = 3
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 _MAX_CANDIDATE_TOKEN = 0xFFFFFFFF
-_NATIVE_DLL_SHA256 = "57a971311c62702a6aba32a337f788fbdc5a38d17b5f75c5e804d145d9034aa9"
+_NATIVE_DLL_SHA256 = "27d9fad527ea1525f212aad3974ecbd7bc26026713f38583d055525be72c0d8d"
 _NATIVE_DLL_MAX_BYTES = 262_144
 _NATIVE_DLL_PATH = Path(__file__).with_name("_native") / "gezhi_cancel_v1.dll"
 _NATIVE_PHASES: dict[int, CancellationPhaseV1] = {
@@ -40,6 +40,7 @@ _NATIVE_PHASES: dict[int, CancellationPhaseV1] = {
     2: "accepting",
     3: "sealed",
     4: "released",
+    5: "accepting",
 }
 _PINNED_NATIVE_DLL: ctypes.WinDLL | None = None
 
@@ -146,9 +147,7 @@ def _classify_console_cancellation_capability_v1(
                 "Console capability close proof failed"
             )
     if type(succeeded) is not bool or type(mode) is not int or mode < 0:
-        raise KnowledgeCancellationBridgeErrorV1(
-            "Console capability result is invalid"
-        )
+        raise KnowledgeCancellationBridgeErrorV1("Console capability result is invalid")
     return (
         "interactive_candidate"
         if succeeded and mode & _ENABLE_PROCESSED_INPUT
@@ -165,6 +164,7 @@ class NoInteractiveCancellationBridgeV1:
         self._selection_reason = selection_reason
         self._phase: CancellationPhaseV1 = "outside"
         self._sealed_candidate_token = 0
+        self._answer_id_cutover = False
 
     @classmethod
     def activate_v1(
@@ -192,6 +192,11 @@ class NoInteractiveCancellationBridgeV1:
 
     def try_answer_id_cutover_v1(self) -> bool:
         self._require_accepting_v1()
+        if self._answer_id_cutover:
+            raise KnowledgeCancellationBridgeErrorV1(
+                "Answer identity cutover was already completed"
+            )
+        self._answer_id_cutover = True
         return True
 
     def snapshot_v1(self) -> CancellationSnapshotV1:
@@ -248,7 +253,10 @@ def _verified_native_dll_path_v1() -> Path:
         raise KnowledgeCancellationBridgeErrorV1(
             "Native cancellation DLL is unavailable"
         ) from error
-    if len(payload) != size or hashlib.sha256(payload).hexdigest() != _NATIVE_DLL_SHA256:
+    if (
+        len(payload) != size
+        or hashlib.sha256(payload).hexdigest() != _NATIVE_DLL_SHA256
+    ):
         raise KnowledgeCancellationBridgeErrorV1(
             "Native cancellation DLL identity differs"
         )
@@ -293,23 +301,14 @@ def _validated_native_snapshot_v1(
         and 0 <= sealed_candidate_token <= _MAX_CANDIDATE_TOKEN
     )
     observation_is_coherent = (
-        latched == publication_ready == 0
-        and generation == 0
-        and observed_ns == 0
-    ) or (
-        latched == publication_ready == 1
-        and generation > 0
-        and observed_ns >= 0
+        latched == publication_ready == 0 and generation == 0 and observed_ns == 0
+    ) or (latched == publication_ready == 1 and generation > 0 and observed_ns >= 0)
+    phase_is_coherent = (phase not in {"outside", "armed"} or latched == 0) and (
+        phase == "accepting" or accepted_in_flight == 0
     )
-    phase_is_coherent = (
-        phase not in {"outside", "armed"} or latched == 0
-    ) and (phase == "accepting" or accepted_in_flight == 0)
     token_is_coherent = (
         phase in {"sealed", "released"} and sealed_candidate_token > 0
-    ) or (
-        phase in {"outside", "armed", "accepting"}
-        and sealed_candidate_token == 0
-    )
+    ) or (phase in {"outside", "armed", "accepting"} and sealed_candidate_token == 0)
     if not (
         valid_phase
         and scalar_fields_are_valid
@@ -356,6 +355,9 @@ class _NativeCancellationApiV1:
         self._try_begin_work = dll.gezhi_cancel_v1_try_begin_work
         self._try_begin_work.argtypes = []
         self._try_begin_work.restype = ctypes.c_int
+        self._try_answer_id_cutover = dll.gezhi_cancel_v1_try_answer_id_cutover
+        self._try_answer_id_cutover.argtypes = []
+        self._try_answer_id_cutover.restype = ctypes.c_int
         self._snapshot = dll.gezhi_cancel_v1_snapshot
         self._snapshot.argtypes = [
             ctypes.POINTER(ctypes.c_uint32),
@@ -382,6 +384,9 @@ class _NativeCancellationApiV1:
 
     def try_begin_work_v1(self) -> bool:
         return self._try_begin_work() == 1
+
+    def try_answer_id_cutover_v1(self) -> bool:
+        return self._try_answer_id_cutover() == 1
 
     def snapshot_v1(self) -> CancellationSnapshotV1:
         phase = ctypes.c_uint32()
@@ -492,7 +497,7 @@ class WindowsConsoleCancellationBridgeV1:
 
     def try_answer_id_cutover_v1(self) -> bool:
         self._require_owner_thread_v1()
-        return self._api.try_begin_work_v1()
+        return self._api.try_answer_id_cutover_v1()
 
     def snapshot_v1(self) -> CancellationSnapshotV1:
         self._require_owner_thread_v1()

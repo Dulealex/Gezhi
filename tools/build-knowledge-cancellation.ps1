@@ -7,6 +7,9 @@ param(
 $ErrorActionPreference = "Stop"
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $sourcePath = Join-Path $repositoryRoot "native\knowledge_cancellation\gezhi_cancel_v1.c"
+if ($TestHooks -and [string]::IsNullOrEmpty($OutputPath)) {
+    throw "TestHooks requires an explicit OutputPath outside the production package"
+}
 if ([string]::IsNullOrEmpty($OutputPath)) {
     $OutputPath = Join-Path $repositoryRoot "src\gezhi\_native\gezhi_cancel_v1.dll"
 }

@@ -68,10 +68,7 @@ def test_console_capability_refuses_to_hide_a_close_failure() -> None:
 def test_redirected_standard_input_does_not_override_a_valid_conin_proof() -> None:
     api = _CapabilityApiDouble(handle=45, mode_result=(True, 1))
 
-    assert (
-        _classify_console_cancellation_capability_v1(api)
-        == "interactive_candidate"
-    )
+    assert _classify_console_cancellation_capability_v1(api) == "interactive_candidate"
     assert api.close_calls == 1
 
 
@@ -79,7 +76,7 @@ def test_packaged_native_bridge_has_the_frozen_hash_and_x64_pe_identity() -> Non
     verified = _verified_native_dll_path_v1()
 
     assert verified.name == "gezhi_cancel_v1.dll"
-    assert verified.stat().st_size == 105_472
+    assert verified.stat().st_size == 106_496
 
 
 @pytest.mark.parametrize(
@@ -138,15 +135,18 @@ def test_native_snapshot_rejects_every_incoherent_lifecycle_combination(
 def test_native_snapshot_accepts_only_coherent_lifecycle_combinations(
     expected: CancellationSnapshotV1,
 ) -> None:
-    assert _validated_native_snapshot_v1(
-        phase=expected.phase,
-        generation=expected.generation,
-        latched=int(expected.observed_monotonic_ns is not None),
-        observed_ns=expected.observed_monotonic_ns or 0,
-        accepted_in_flight=expected.accepted_in_flight,
-        publication_ready=int(expected.publication_ready),
-        sealed_candidate_token=expected.sealed_candidate_token,
-    ) == expected
+    assert (
+        _validated_native_snapshot_v1(
+            phase=expected.phase,
+            generation=expected.generation,
+            latched=int(expected.observed_monotonic_ns is not None),
+            observed_ns=expected.observed_monotonic_ns or 0,
+            accepted_in_flight=expected.accepted_in_flight,
+            publication_ready=int(expected.publication_ready),
+            sealed_candidate_token=expected.sealed_candidate_token,
+        )
+        == expected
+    )
 
 
 def test_no_source_profile_runs_the_full_seal_and_release_lifecycle() -> None:
@@ -157,6 +157,8 @@ def test_no_source_profile_runs_the_full_seal_and_release_lifecycle() -> None:
     assert bridge.observed_at_monotonic_ns() is None
     assert bridge.try_begin_work_v1() is True
     assert bridge.try_answer_id_cutover_v1() is True
+    with pytest.raises(RuntimeError, match="cutover"):
+        bridge.try_answer_id_cutover_v1()
     assert bridge.snapshot_v1() == CancellationSnapshotV1(
         phase="accepting",
         generation=0,

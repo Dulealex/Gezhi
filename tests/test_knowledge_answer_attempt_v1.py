@@ -250,6 +250,27 @@ def test_human_provider_error_text_never_creates_a_transient_class(
     assert attempt.record["failure_class"] == "process_error"
 
 
+@pytest.mark.parametrize("terminal_type", ("turn.failed", "error"))
+def test_provider_terminal_cannot_be_hidden_by_a_completed_record(
+    tmp_path: Path,
+    terminal_type: str,
+) -> None:
+    events = b"".join(
+        (
+            _json_line({"type": terminal_type, "error": {"message": "failed"}}),
+            _json_line({"type": "turn.completed", "usage": {}}),
+        )
+    )
+
+    attempt, failure_class, overflow_channels = _project_attempt_v1(
+        _evidence(tmp_path, events=events, exit_code=0)
+    )
+
+    assert failure_class == "process_error"
+    assert overflow_channels == ()
+    assert attempt.record["failure_class"] == "process_error"
+
+
 def test_exact_cap_skips_usage_projection_without_decoding(tmp_path: Path) -> None:
     completed = (
         b'{"type":"turn.completed","usage":'
@@ -280,12 +301,21 @@ def test_exact_cap_skips_usage_projection_without_decoding(tmp_path: Path) -> No
 )
 def test_capture_overflow_retains_prefix_and_has_highest_priority(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     events_overflow: bool,
     final_overflow: bool,
     expected_channels: tuple[str, ...],
 ) -> None:
     events = b"events-prefix"
     final = b"final-prefix"
+    monkeypatch.setattr(
+        "gezhi._knowledge_answerer._EVENTS_CAPTURE_CAP",
+        len(events),
+    )
+    monkeypatch.setattr(
+        "gezhi._knowledge_answerer._FINAL_CAPTURE_CAP",
+        len(final),
+    )
     attempt, failure_class, overflow_channels = _project_attempt_v1(
         _evidence(
             tmp_path,

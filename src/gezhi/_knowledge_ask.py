@@ -6,7 +6,7 @@ import subprocess
 import time
 import unicodedata
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -60,9 +60,6 @@ KnowledgeAskOutcomeV1: TypeAlias = Literal[
     "blocked",
     "failed",
     "interrupted",
-]
-KnowledgeAskReportSealerV1: TypeAlias = Callable[
-    ["KnowledgeAskReportV1", bytes | None], "KnowledgeAskReportV1"
 ]
 _PROJECT_ROOT = Path(r"E:\Gezhi")
 _GIT_REVISION = re.compile(rb"^[0-9a-f]{40}\r?\n?$")
@@ -213,6 +210,7 @@ class KnowledgeAskReportV1:
     result: dict[str, object] | None
     reason: str | None
     capture_overflow_channels: tuple[str, ...] = ()
+    answer_markdown_bytes: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,6 +322,7 @@ def validate_knowledge_ask_report_v1(report: KnowledgeAskReportV1) -> None:
             type(report.result) is not dict
             or report.reason is not None
             or report.capture_overflow_channels
+            or type(report.answer_markdown_bytes) is not bytes
         ):
             raise ValueError("Knowledge ask success presence is invalid")
         if set(report.result) != {"answer_id", "answer_output"}:
@@ -369,6 +368,8 @@ def validate_knowledge_ask_report_v1(report: KnowledgeAskReportV1) -> None:
         ):
             raise ValueError("Knowledge ask capture overflow binding is invalid")
         return
+    if report.answer_markdown_bytes is not None:
+        raise ValueError("Knowledge ask non-success Markdown is invalid")
     if report.capture_overflow_channels:
         raise ValueError("Knowledge ask no-commit report has capture overflow facts")
     if (report.outcome, report.reason) not in {
@@ -405,25 +406,6 @@ def _failed_report_v1(reason: str) -> KnowledgeAskReportV1:
     return report
 
 
-def _seal_knowledge_ask_report_v1(
-    report: KnowledgeAskReportV1,
-    answer_markdown_bytes: bytes | None,
-    report_sealer: KnowledgeAskReportSealerV1 | None,
-) -> KnowledgeAskReportV1:
-    validate_knowledge_ask_report_v1(report)
-    if report_sealer is None:
-        return report
-    sealed = report_sealer(report, answer_markdown_bytes)
-    validate_knowledge_ask_report_v1(sealed)
-    if sealed != report and not (
-        report.outcome == "blocked"
-        and report.result is None
-        and sealed == _pre_id_interrupted_report_v1()
-    ):
-        raise ValueError("Knowledge ask presentation seal changed command facts")
-    return sealed
-
-
 def _publish_answer_report_v1(
     *,
     root: ValidatedDataRootV1,
@@ -431,7 +413,6 @@ def _publish_answer_report_v1(
     request: AnswerPublishRequestV1,
     answer_output: dict[str, object] | None,
     capture_overflow_channels: tuple[str, ...],
-    report_sealer: KnowledgeAskReportSealerV1 | None,
 ) -> KnowledgeAskReportV1:
     try:
         committed = publish_answer_v1(root, owner, request)
@@ -474,12 +455,10 @@ def _publish_answer_report_v1(
         },
         reason=report_reason,
         capture_overflow_channels=capture_overflow_channels,
+        answer_markdown_bytes=committed.answer_markdown_bytes,
     )
-    return _seal_knowledge_ask_report_v1(
-        report,
-        committed.answer_markdown_bytes,
-        report_sealer,
-    )
+    validate_knowledge_ask_report_v1(report)
+    return report
 
 
 class KnowledgeAsksV1:
@@ -489,15 +468,12 @@ class KnowledgeAsksV1:
         *,
         cli_patch: tuple[tuple[str, str], ...],
         environ: Mapping[str, str] | None = None,
-        report_sealer: KnowledgeAskReportSealerV1 | None = None,
         cancellation: KnowledgeCancellationBridgeV1 | None = None,
     ) -> KnowledgeAskReportV1:
         if type(question) is not str or type(cli_patch) is not tuple:
             raise TypeError("Knowledge ask input is invalid")
         cancellation_bridge = (
-            _UnmanagedNoCancellationV1()
-            if cancellation is None
-            else cancellation
+            _UnmanagedNoCancellationV1() if cancellation is None else cancellation
         )
         if not cancellation_bridge.try_begin_work_v1():
             return _pre_id_interrupted_report_v1()
@@ -641,7 +617,6 @@ class KnowledgeAsksV1:
                         request=interrupted_request,
                         answer_output=None,
                         capture_overflow_channels=(),
-                        report_sealer=report_sealer,
                     )
                 try:
                     retrieval = KnowledgeRetrievalV1.retrieve(
@@ -765,9 +740,13 @@ class KnowledgeAsksV1:
                         answer_markdown_bytes = _zero_candidate_answer_markdown_v1(
                             normalized.question
                         )
-                        if (
+                        rendering_completed_ns = time.monotonic_ns()
+                        rendering_cancellation_ns = (
                             cancellation_bridge.observed_at_monotonic_ns()
-                            is not None
+                        )
+                        if (
+                            rendering_cancellation_ns is not None
+                            and rendering_cancellation_ns <= rendering_completed_ns
                         ):
                             terminal_status = "interrupted"
                             answer_output = None
@@ -799,12 +778,10 @@ class KnowledgeAsksV1:
                     request=request,
                     answer_output=answer_output,
                     capture_overflow_channels=capture_overflow_channels,
-                    report_sealer=report_sealer,
                 )
 
 
 __all__ = [
-    "KnowledgeAskReportSealerV1",
     "KnowledgeAskReportV1",
     "KnowledgeAsksV1",
     "NormalizedQuestionV1",

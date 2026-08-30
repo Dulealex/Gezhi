@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from typing import cast
 
 from gezhi._knowledge_ask import (
     KnowledgeAskReportV1,
@@ -11,7 +12,6 @@ from gezhi._knowledge_ask import (
 )
 from gezhi._knowledge_cancellation import (
     CancellationSnapshotV1,
-    KnowledgeCancellationBridgeErrorV1,
     activate_knowledge_ask_cancellation_v1,
 )
 from gezhi._knowledge_read import (
@@ -543,17 +543,12 @@ def run_ask(
 ) -> int:
     prepared_candidate: _PreparedKnowledgeAskPresentationV1 | None = None
     candidate_token = 0
-    try:
-        cancellation = activate_knowledge_ask_cancellation_v1()
-    except KnowledgeCancellationBridgeErrorV1:
-        os._exit(1)
+    cancellation = activate_knowledge_ask_cancellation_v1()
 
     def next_candidate_token_v1() -> int:
         nonlocal candidate_token
         if candidate_token >= 0xFFFFFFFF:
-            raise _KnowledgeAskPresentationSealFailedV1(
-                "Knowledge ask candidate token space is exhausted"
-            )
+            raise RuntimeError("Knowledge ask candidate token space is exhausted")
         candidate_token += 1
         return candidate_token
 
@@ -573,86 +568,97 @@ def run_ask(
             )
         return report
 
-    def seal_no_output_failure_v1() -> None:
-        while True:
-            snapshot = cancellation.snapshot_v1()
-            token = next_candidate_token_v1()
-            if cancellation.conditional_seal_v1(
-                expected_generation=snapshot.generation,
-                candidate_token=token,
-            ):
-                cancellation.release_v1()
-                return
-
     def seal_report(
         report: KnowledgeAskReportV1,
-        answer_markdown_bytes: bytes | None,
     ) -> KnowledgeAskReportV1:
         nonlocal prepared_candidate
         while True:
             snapshot = cancellation.snapshot_v1()
             sealed_report = cancellation_adjusted_report_v1(report, snapshot)
-            try:
-                pending = _prepare_knowledge_ask_presentation_v1(
-                    sealed_report,
-                    json_output=json_output,
-                    answer_markdown_bytes=answer_markdown_bytes,
-                )
-            except Exception as error:
-                try:
-                    seal_no_output_failure_v1()
-                except Exception as release_error:
-                    raise _KnowledgeAskPresentationSealFailedV1 from release_error
-                raise _KnowledgeAskPresentationSealFailedV1 from error
+            unbound = _prepare_knowledge_ask_presentation_v1(
+                sealed_report,
+                json_output=json_output,
+                answer_markdown_bytes=sealed_report.answer_markdown_bytes,
+            )
             token = next_candidate_token_v1()
-            if not cancellation.conditional_seal_v1(
+            pending = _bind_knowledge_ask_presentation_v1(
+                unbound,
                 expected_generation=snapshot.generation,
                 candidate_token=token,
+            )
+            if not cancellation.conditional_seal_v1(
+                expected_generation=pending.expected_generation,
+                candidate_token=pending.candidate_token,
             ):
                 continue
             cancellation.release_v1()
             prepared_candidate = pending
             return pending.report
 
-    try:
-        report = KnowledgeAsksV1.ask(
-            question,
-            cli_patch=cli_patch,
-            report_sealer=seal_report,
-            cancellation=cancellation,
-        )
-        if prepared_candidate is None:
-            report = seal_report(report, None)
-    except (
-        _KnowledgeAskPresentationSealFailedV1,
-        KnowledgeCancellationBridgeErrorV1,
+    report = KnowledgeAsksV1.ask(
+        question,
+        cli_patch=cli_patch,
+        cancellation=cancellation,
+    )
+    report = seal_report(report)
+    if prepared_candidate is None:
+        raise RuntimeError("Knowledge ask presentation candidate is absent")
+    candidate = prepared_candidate
+    if (
+        candidate.report != report
+        or candidate.json_output is not json_output
+        or candidate.outcome != report.outcome
+        or candidate.result != _freeze_json_value_v1(report.result)
+        or candidate.diagnostics
+        != _freeze_json_value_v1(_knowledge_ask_diagnostics_v1(report))
     ):
-        os._exit(1)
-    try:
-        if prepared_candidate is None:
-            raise ValueError("Knowledge ask presentation candidate is absent")
-        candidate = prepared_candidate
-        if candidate.report != report or candidate.json_output is not json_output:
-            raise ValueError("Knowledge ask presentation candidate differs")
-    except Exception:  # noqa: BLE001 - the contract hard-stops seal failures.
-        os._exit(1)
+        raise RuntimeError("Knowledge ask presentation candidate differs")
+    if candidate.byte_length != len(candidate.buffer):
+        raise RuntimeError("Knowledge ask presentation buffer proof differs")
     write_binary_buffer_v1(candidate.buffer, fd=1, max_chunk_size=_WRITE_CHUNK)
     return {"succeeded": 0, "blocked": 2, "failed": 1, "interrupted": 130}[
         report.outcome
     ]
 
 
-def _knowledge_ask_json_buffer_v1(report: KnowledgeAskReportV1) -> bytes:
-    validate_knowledge_ask_report_v1(report)
+@dataclass(frozen=True, slots=True)
+class _FrozenJsonObjectV1:
+    items: tuple[tuple[str, object], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenJsonArrayV1:
+    items: tuple[object, ...]
+
+
+def _freeze_json_value_v1(value: object) -> object:
+    if value is None or type(value) in {str, int, bool}:
+        return value
+    if type(value) is dict:
+        object_value = cast(dict[object, object], value)
+        if any(type(key) is not str for key in object_value):
+            raise TypeError("Knowledge ask JSON object key is invalid")
+        keys = tuple(cast(str, key) for key in object_value)
+        return _FrozenJsonObjectV1(
+            tuple(
+                (key, _freeze_json_value_v1(object_value[key])) for key in sorted(keys)
+            )
+        )
+    if type(value) in {list, tuple}:
+        sequence_value = cast(list[object] | tuple[object, ...], value)
+        return _FrozenJsonArrayV1(
+            tuple(_freeze_json_value_v1(item) for item in sequence_value)
+        )
+    raise TypeError("Knowledge ask JSON value is not immutable")
+
+
+def _knowledge_ask_diagnostics_v1(
+    report: KnowledgeAskReportV1,
+) -> list[dict[str, object]]:
     diagnostics: list[dict[str, object]] = (
         []
         if report.reason is None
-        else [
-            {
-                "code": _ASK_PRIMARY[report.reason][0],
-                "context": {},
-            }
-        ]
+        else [{"code": _ASK_PRIMARY[report.reason][0], "context": {}}]
     )
     if report.capture_overflow_channels:
         diagnostics.append(
@@ -661,13 +667,30 @@ def _knowledge_ask_json_buffer_v1(report: KnowledgeAskReportV1) -> bytes:
                 "context": {"channels": list(report.capture_overflow_channels)},
             }
         )
-    return cli_json_buffer_v1(
-        command="knowledge.ask",
-        outcome=report.outcome,
-        result=report.result,
-        diagnostics=diagnostics,
-        output_cap=_ASK_JSON_OUTPUT_CAP,
-    )
+    return diagnostics
+
+
+def _knowledge_ask_envelope_v1(
+    report: KnowledgeAskReportV1,
+    diagnostics: list[dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "schema_version": "gezhi.cli_result.v1",
+        "command": "knowledge.ask",
+        "outcome": report.outcome,
+        "result": report.result,
+        "diagnostics": diagnostics,
+    }
+
+
+def _capture_overflow_hint_v1(channels: tuple[str, ...]) -> str | None:
+    if not channels:
+        return None
+    if channels == ("events",):
+        return "Codex 事件捕获超过 16777216 字节上限，已保留精确上限前缀"
+    if channels == ("final_message",):
+        return "Codex 最终消息捕获超过 1048576 字节上限，已保留精确上限前缀"
+    return "Codex 事件与最终消息捕获均超过各自上限，已保留精确上限前缀"
 
 
 def _knowledge_ask_human_buffer_v1(
@@ -701,38 +724,47 @@ def _knowledge_ask_human_buffer_v1(
             "failed": "Knowledge ask：失败",
             "interrupted": "Knowledge ask：已中断",
         }[report.outcome]
-        answer_line = ""
+        lines = [heading]
         if report.result is not None:
             answer_id = report.result["answer_id"]
             if type(answer_id) is not str:
                 raise TypeError("Knowledge ask Human Answer ID is invalid")
-            answer_line = f"Answer ID：{answer_id}\n"
-        payload = (
-            f"{heading}\n{answer_line}原因：{reason}\n下一步：{next_step}\n"
-        ).encode()
-        if report.capture_overflow_channels:
-            channels = report.capture_overflow_channels
-            if channels == ("events",):
-                hint = "Codex 事件捕获超过 16777216 字节上限，已保留精确上限前缀"
-            elif channels == ("final_message",):
-                hint = "Codex 最终消息捕获超过 1048576 字节上限，已保留精确上限前缀"
-            else:
-                hint = "Codex 事件与最终消息捕获均超过各自上限，已保留精确上限前缀"
-            payload += f"提示：{hint}\n".encode()
+            lines.append(f"Answer ID：{answer_id}")
+        lines.append(f"原因：{reason}")
+        hint = _capture_overflow_hint_v1(report.capture_overflow_channels)
+        if hint is not None:
+            lines.append(f"提示：{hint}")
+        lines.append(f"下一步：{next_step}")
+        payload = ("\n".join(lines) + "\n").encode()
     if len(payload) > _ASK_HUMAN_OUTPUT_CAP:
         raise ValueError("Knowledge ask Human output exceeds its byte limit")
     return payload
 
 
 @dataclass(frozen=True, slots=True)
-class _PreparedKnowledgeAskPresentationV1:
+class _UnboundKnowledgeAskPresentationV1:
     report: KnowledgeAskReportV1
+    outcome: str
+    result: object
+    diagnostics: _FrozenJsonArrayV1
+    envelope: _FrozenJsonObjectV1 | None
     buffer: bytes
+    byte_length: int
     json_output: bool
 
 
-class _KnowledgeAskPresentationSealFailedV1(RuntimeError):
-    pass
+@dataclass(frozen=True, slots=True)
+class _PreparedKnowledgeAskPresentationV1:
+    expected_generation: int
+    candidate_token: int
+    report: KnowledgeAskReportV1
+    outcome: str
+    result: object
+    diagnostics: _FrozenJsonArrayV1
+    envelope: _FrozenJsonObjectV1 | None
+    buffer: bytes
+    byte_length: int
+    json_output: bool
 
 
 def _prepare_knowledge_ask_presentation_v1(
@@ -740,23 +772,75 @@ def _prepare_knowledge_ask_presentation_v1(
     *,
     json_output: bool,
     answer_markdown_bytes: bytes | None,
-) -> _PreparedKnowledgeAskPresentationV1:
+) -> _UnboundKnowledgeAskPresentationV1:
     validate_knowledge_ask_report_v1(report)
     if type(json_output) is not bool:
         raise TypeError("Knowledge ask presentation mode is invalid")
-    if report.outcome != "succeeded" and answer_markdown_bytes is not None:
-        raise ValueError("Knowledge ask non-success has committed Markdown")
-    return _PreparedKnowledgeAskPresentationV1(
+    if answer_markdown_bytes is not report.answer_markdown_bytes:
+        raise ValueError("Knowledge ask committed Markdown identity differs")
+    diagnostics = _knowledge_ask_diagnostics_v1(report)
+    frozen_diagnostics = _freeze_json_value_v1(diagnostics)
+    if type(frozen_diagnostics) is not _FrozenJsonArrayV1:
+        raise RuntimeError("Knowledge ask diagnostics freeze proof differs")
+    frozen_result = _freeze_json_value_v1(report.result)
+    envelope: _FrozenJsonObjectV1 | None = None
+    buffer: bytes
+    if json_output:
+        envelope_value = _knowledge_ask_envelope_v1(report, diagnostics)
+        frozen_envelope = _freeze_json_value_v1(envelope_value)
+        if type(frozen_envelope) is not _FrozenJsonObjectV1:
+            raise RuntimeError("Knowledge ask envelope freeze proof differs")
+        envelope = frozen_envelope
+        buffer = cli_json_buffer_v1(
+            command="knowledge.ask",
+            outcome=report.outcome,
+            result=report.result,
+            diagnostics=diagnostics,
+            output_cap=_ASK_JSON_OUTPUT_CAP,
+        )
+    else:
+        buffer = _knowledge_ask_human_buffer_v1(
+            report,
+            answer_markdown_bytes=answer_markdown_bytes,
+        )
+    return _UnboundKnowledgeAskPresentationV1(
         report=report,
-        buffer=(
-            _knowledge_ask_json_buffer_v1(report)
-            if json_output
-            else _knowledge_ask_human_buffer_v1(
-                report,
-                answer_markdown_bytes=answer_markdown_bytes,
-            )
-        ),
+        outcome=report.outcome,
+        result=frozen_result,
+        diagnostics=frozen_diagnostics,
+        envelope=envelope,
+        buffer=buffer,
+        byte_length=len(buffer),
         json_output=json_output,
+    )
+
+
+def _bind_knowledge_ask_presentation_v1(
+    unbound: _UnboundKnowledgeAskPresentationV1,
+    *,
+    expected_generation: int,
+    candidate_token: int,
+) -> _PreparedKnowledgeAskPresentationV1:
+    if type(unbound) is not _UnboundKnowledgeAskPresentationV1:
+        raise TypeError("Knowledge ask unbound presentation type is invalid")
+    if (
+        type(expected_generation) is not int
+        or not 0 <= expected_generation <= 0x0FFFFFFF
+        or type(candidate_token) is not int
+        or not 1 <= candidate_token <= 0xFFFFFFFF
+    ):
+        raise ValueError("Knowledge ask presentation binding is invalid")
+    return _PreparedKnowledgeAskPresentationV1(
+        expected_generation=expected_generation,
+        candidate_token=candidate_token,
+        report=unbound.report,
+        outcome=unbound.outcome,
+        result=unbound.result,
+        diagnostics=unbound.diagnostics,
+        envelope=unbound.envelope,
+        buffer=unbound.buffer,
+        byte_length=unbound.byte_length,
+        json_output=unbound.json_output,
     )
 
 
