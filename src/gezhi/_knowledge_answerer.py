@@ -1177,16 +1177,9 @@ def answer_nonzero_v1(
                     attempts=tuple(attempts),
                 )
             if attempts:
-                return _stopped_answerer_v1(
-                    status="blocked",
-                    error={
-                        "code": "codex_runtime_unavailable",
-                        "stage": "synthesis",
-                    },
-                    prompt_bytes=prompt_bytes,
-                    schema_bytes=schema_bytes,
-                    attempts=tuple(attempts),
-                )
+                raise KnowledgeAnswererUnsafeHoldErrorV1(
+                    "Retry attempt preparation failed after commitment"
+                ) from error
             raise KnowledgeAnswererInputInvalidV1(
                 "Attempt workspace or Schema could not be formed"
             ) from error
@@ -1242,6 +1235,10 @@ def answer_nonzero_v1(
                     result.reason.startswith("preparation_failed:")
                     and result.reason != "preparation_failed:"
                 ):
+                    if attempts:
+                        raise KnowledgeAnswererUnsafeHoldErrorV1(
+                            "Retry attempt preparation failed after commitment"
+                        )
                     return _stopped_answerer_v1(
                         status="blocked",
                         error={

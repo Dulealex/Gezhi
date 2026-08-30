@@ -27,6 +27,7 @@ static volatile LONG gezhi_registered = 0;
 static LARGE_INTEGER gezhi_qpc_frequency = {0};
 #ifdef GEZHI_CANCEL_TESTING
 static volatile LONG gezhi_test_poison_before_seal_gate = 0;
+static volatile LONG gezhi_test_poison_before_seal_commit = 0;
 #endif
 
 static LONG64 gezhi_load_control(void) {
@@ -383,6 +384,11 @@ __declspec(dllexport) int __stdcall gezhi_cancel_v1_conditional_seal(
         InterlockedExchange(&gezhi_admission_gate, 0);
         return 0;
     }
+#ifdef GEZHI_CANCEL_TESTING
+    if (InterlockedExchange(&gezhi_test_poison_before_seal_commit, 0) != 0) {
+        InterlockedExchange(&gezhi_poisoned, 1);
+    }
+#endif
     desired = (observed & ~GEZHI_PHASE_MASK)
         | GEZHI_PHASE_SEALED
         | ((uint64_t)candidate_token << GEZHI_TOKEN_SHIFT);
@@ -390,6 +396,10 @@ __declspec(dllexport) int __stdcall gezhi_cancel_v1_conditional_seal(
         &gezhi_control,
         (LONG64)desired,
         (LONG64)observed) == observed;
+    if (InterlockedCompareExchange(&gezhi_poisoned, 0, 0) != 0) {
+        InterlockedExchange(&gezhi_admission_gate, 0);
+        return -1;
+    }
     InterlockedExchange(&gezhi_admission_gate, 0);
     return sealed;
 }
@@ -461,5 +471,14 @@ gezhi_cancel_v1_test_poison_before_next_seal_gate(void) {
     }
     return InterlockedCompareExchange(
         &gezhi_test_poison_before_seal_gate, 1, 0) == 0;
+}
+
+__declspec(dllexport) int __stdcall
+gezhi_cancel_v1_test_poison_before_next_seal_commit(void) {
+    if (InterlockedCompareExchange(&gezhi_poisoned, 0, 0) != 0) {
+        return 0;
+    }
+    return InterlockedCompareExchange(
+        &gezhi_test_poison_before_seal_commit, 1, 0) == 0;
 }
 #endif

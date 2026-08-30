@@ -461,7 +461,7 @@ def test_safe_preparation_rejection_remains_runtime_unavailable(
     assert removed_packages == [package_root]
 
 
-def test_retry_workspace_failure_preserves_the_completed_timeout_attempt(
+def test_retry_workspace_failure_after_commitment_stays_outside_outcome_matrix(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -522,22 +522,20 @@ def test_retry_workspace_failure_preserves_the_completed_timeout_attempt(
         lambda **_kwargs: "ready",
     )
 
-    verdict = answerer.answer_nonzero_v1(
-        retrieval,  # type: ignore[arg-type]
-        question_bytes=b"{}\n",
-        knowledge_root=tmp_path,
-    )
+    with pytest.raises(
+        answerer.KnowledgeAnswererUnsafeHoldErrorV1,
+        match="Retry attempt preparation failed after commitment",
+    ):
+        answerer.answer_nonzero_v1(
+            retrieval,  # type: ignore[arg-type]
+            question_bytes=b"{}\n",
+            knowledge_root=tmp_path,
+        )
 
-    assert verdict.status == "blocked"
-    assert verdict.error == {
-        "code": "codex_runtime_unavailable",
-        "stage": "synthesis",
-    }
-    assert verdict.attempts == (frozen_attempt,)
     assert preparation_calls == 2
 
 
-def test_third_attempt_schema_failure_preserves_both_completed_timeouts(
+def test_third_attempt_schema_failure_after_commitment_stays_outside_matrix(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -618,19 +616,17 @@ def test_third_attempt_schema_failure_preserves_both_completed_timeouts(
         lambda **_kwargs: "ready",
     )
 
-    verdict = answerer.answer_nonzero_v1(
-        retrieval,  # type: ignore[arg-type]
-        question_bytes=b"{}\n",
-        knowledge_root=tmp_path,
-    )
+    with pytest.raises(
+        answerer.KnowledgeAnswererUnsafeHoldErrorV1,
+        match="Retry attempt preparation failed after commitment",
+    ):
+        answerer.answer_nonzero_v1(
+            retrieval,  # type: ignore[arg-type]
+            question_bytes=b"{}\n",
+            knowledge_root=tmp_path,
+        )
 
-    assert verdict.status == "blocked"
-    assert verdict.error == {
-        "code": "codex_runtime_unavailable",
-        "stage": "synthesis",
-    }
-    assert verdict.attempts == tuple(frozen_attempts)
-    assert [attempt.events_bytes for attempt in verdict.attempts] == [
+    assert [attempt.events_bytes for attempt in frozen_attempts] == [
         b"events-1",
         b"events-2",
     ]
@@ -640,3 +636,93 @@ def test_third_attempt_schema_failure_preserves_both_completed_timeouts(
         tmp_path / "g0000002",
         tmp_path / "g0000003",
     ]
+
+
+def test_retry_child_preparation_rejection_stays_outside_outcome_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    retrieval = _patch_answerer_pre_attempt_inputs_v1(monkeypatch, tmp_path)
+    packages: list[answerer._AttemptPackageV1] = []
+    removed_packages: list[Path] = []
+    run_ordinals: list[int] = []
+
+    def prepare_attempt(_root: Path) -> answerer._AttemptPackageV1:
+        ordinal = len(packages) + 1
+        package_root = tmp_path / f"g{ordinal:07d}"
+        attempt_root = package_root / "attempt"
+        attempt_root.mkdir(parents=True)
+        package = answerer._AttemptPackageV1(
+            root=package_root,
+            attempt_root=attempt_root,
+            schema_path=package_root / "schema.json",
+        )
+        packages.append(package)
+        return package
+
+    def run_attempt(
+        request: answerer.KnowledgeAnswerAttemptRequestV1,
+    ) -> AttemptTerminalEvidenceV1 | PreAttemptRejectedV1:
+        ordinal = request.attempt_ordinal
+        run_ordinals.append(ordinal)
+        if ordinal == 2:
+            return PreAttemptRejectedV1(
+                reason="preparation_failed:CodexChildWin32ErrorV1",
+                resource_ledger_count=0,
+            )
+        capture = CaptureEvidenceV1(
+            path=request.attempt_root / "unused-capture",
+            byte_length=0,
+            sha256="0" * 64,
+            overflow=False,
+        )
+        return AttemptTerminalEvidenceV1(
+            role="knowledge_answerer_v1",
+            attempt_ordinal=ordinal,
+            commit_wall_time="2026-08-30T20:00:00.000Z",
+            commit_monotonic_ns=1,
+            provider_started_monotonic_ns=2,
+            attempt_deadline_monotonic_ns=50,
+            shared_deadline_monotonic_ns=10**30,
+            capture_ready_monotonic_ns=51,
+            exit_code=0x475A0001,
+            mechanical_outcome="timeout",
+            events=capture,
+            final_message=capture,
+            create_process_calls=1,
+            stop_calls=1,
+            resource_ledger_count=0,
+            lifecycle_facts=(),
+        )
+
+    frozen_attempt = answerer.KnowledgeAnswerAttemptV1({}, b"events", b"final")
+    monkeypatch.setattr(answerer, "_create_attempt_package_v1", prepare_attempt)
+    monkeypatch.setattr(
+        answerer,
+        "_remove_attempt_package_v1",
+        lambda package_root, _temporary_root: removed_packages.append(package_root),
+    )
+    monkeypatch.setattr(answerer, "_run_role_attempt_v1", run_attempt)
+    monkeypatch.setattr(
+        answerer,
+        "_attempt_from_evidence_v1",
+        lambda _evidence, **_kwargs: (frozen_attempt, "timeout", ()),
+    )
+    monkeypatch.setattr(
+        answerer,
+        "_wait_retry_backoff_v1",
+        lambda **_kwargs: "ready",
+    )
+
+    with pytest.raises(
+        answerer.KnowledgeAnswererUnsafeHoldErrorV1,
+        match="Retry attempt preparation failed after commitment",
+    ):
+        answerer.answer_nonzero_v1(
+            retrieval,  # type: ignore[arg-type]
+            question_bytes=b"{}\n",
+            knowledge_root=tmp_path,
+        )
+
+    assert run_ordinals == [1, 2]
+    assert removed_packages == [package.root for package in packages]
