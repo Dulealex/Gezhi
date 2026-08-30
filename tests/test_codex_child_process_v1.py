@@ -950,6 +950,61 @@ def test_committed_keyboard_interrupt_settles_and_reraises(
     )
 
 
+@pytest.mark.parametrize("terminal_failure", [False, True])
+def test_committed_unsafe_hold_wins_over_later_keyboard_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_failure: bool,
+) -> None:
+    plan = _plan(tmp_path, "success", timeout_seconds=10)
+    cancellation = _KeyboardInterruptOnCancellationObservation(2)
+    real_delete = child_process._AttributeList.delete
+    real_count = child_process._ResourceLedger.count
+    ledger_counts: list[int] = []
+    injected = False
+
+    def delete_then_fail(attribute_list):  # type: ignore[no-untyped-def]
+        nonlocal injected
+        real_delete(attribute_list)
+        if not injected:
+            injected = True
+            raise RuntimeError("injected settled attribute teardown failure")
+
+    def observe_count(ledger):  # type: ignore[no-untyped-def]
+        count = real_count(ledger)
+        ledger_counts.append(count)
+        return count
+
+    def fail_terminal_read(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("injected terminal finalization failure")
+
+    monkeypatch.setattr(
+        child_process._AttributeList,
+        "delete",
+        delete_then_fail,
+    )
+    monkeypatch.setattr(child_process._ResourceLedger, "count", observe_count)
+    if terminal_failure:
+        monkeypatch.setattr(child_process, "_read_final_source", fail_terminal_read)
+
+    with pytest.raises(
+        CodexChildUnsafeHoldErrorV1,
+        match="resource ownership is uncertain",
+    ):
+        run_codex_child_v1(plan, cancellation)
+
+    assert injected
+    assert ledger_counts[-1] == 0
+    worker_names = {
+        f"gezhi-codex-stdin-{plan.attempt_ordinal}",
+        f"gezhi-codex-stdout-{plan.attempt_ordinal}",
+    }
+    assert not any(
+        worker.is_alive() and worker.name in worker_names
+        for worker in threading.enumerate()
+    )
+
+
 @pytest.mark.parametrize("fault_call", [2, 3])
 def test_committed_cancellation_observer_fault_stops_and_settles(
     tmp_path: Path,

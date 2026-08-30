@@ -2598,21 +2598,26 @@ def _run_codex_child_core_v1(
             raise CodexChildUnsafeHoldErrorV1(
                 "terminal failure ledger is not zero"
             ) from terminal_error
+        if committed_unsafe_error is not None:
+            raise CodexChildUnsafeHoldErrorV1(
+                "committed attempt settled but resource ownership is uncertain"
+            ) from committed_unsafe_error
         if external_exceptions.error is not None:
             raise external_exceptions.error
         raise
     prepared.job.close()
-    if external_exceptions.error is not None:
-        if prepared.ledger.count() != 0:
-            raise CodexChildUnsafeHoldErrorV1(
-                "external interruption ledger is not zero"
-            ) from external_exceptions.error
-        raise external_exceptions.error
+    terminal_ledger_count = prepared.ledger.count()
     if committed_unsafe_error is not None:
         raise CodexChildUnsafeHoldErrorV1(
             "committed attempt settled but resource ownership is uncertain"
         ) from committed_unsafe_error
-    if prepared.ledger.count() != 0:
+    if external_exceptions.error is not None:
+        if terminal_ledger_count != 0:
+            raise CodexChildUnsafeHoldErrorV1(
+                "external interruption ledger is not zero"
+            ) from external_exceptions.error
+        raise external_exceptions.error
+    if terminal_ledger_count != 0:
         raise CodexChildUnsafeHoldErrorV1("terminal resource ledger is not zero")
     return AttemptTerminalEvidenceV1(
         role=plan.role,
