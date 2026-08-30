@@ -461,9 +461,15 @@ def test_safe_preparation_rejection_remains_runtime_unavailable(
     assert removed_packages == [package_root]
 
 
-def test_retry_workspace_failure_after_commitment_stays_outside_outcome_matrix(
+@pytest.mark.parametrize(
+    "deadline_crossed",
+    (False, True),
+    ids=("proof-failure", "deadline-wins"),
+)
+def test_retry_workspace_failure_after_commitment_arbitrates_deadline(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    deadline_crossed: bool,
 ) -> None:
     retrieval = _patch_answerer_pre_attempt_inputs_v1(monkeypatch, tmp_path)
     package_root = tmp_path / "g1234567"
@@ -487,7 +493,7 @@ def test_retry_workspace_failure_after_commitment_stays_outside_outcome_matrix(
         commit_monotonic_ns=1,
         provider_started_monotonic_ns=2,
         attempt_deadline_monotonic_ns=50,
-        shared_deadline_monotonic_ns=10**30,
+        shared_deadline_monotonic_ns=100,
         capture_ready_monotonic_ns=51,
         exit_code=0x475A0001,
         mechanical_outcome="timeout",
@@ -500,12 +506,15 @@ def test_retry_workspace_failure_after_commitment_stays_outside_outcome_matrix(
     )
     frozen_attempt = answerer.KnowledgeAnswerAttemptV1({}, b"events", b"final")
     preparation_calls = 0
+    current_monotonic_ns = 99
 
     def prepare_attempt(_root: Path) -> answerer._AttemptPackageV1:
-        nonlocal preparation_calls
+        nonlocal current_monotonic_ns, preparation_calls
         preparation_calls += 1
         if preparation_calls == 1:
             return package
+        if deadline_crossed:
+            current_monotonic_ns = 100
         raise answerer.KnowledgeAnswererInputInvalidV1("retry workspace rejected")
 
     monkeypatch.setattr(answerer, "_create_attempt_package_v1", prepare_attempt)
@@ -521,23 +530,47 @@ def test_retry_workspace_failure_after_commitment_stays_outside_outcome_matrix(
         "_wait_retry_backoff_v1",
         lambda **_kwargs: "ready",
     )
+    monkeypatch.setattr(
+        answerer.time,
+        "monotonic_ns",
+        lambda: current_monotonic_ns,
+    )
 
-    with pytest.raises(
-        answerer.KnowledgeAnswererUnsafeHoldErrorV1,
-        match="Retry attempt preparation failed after commitment",
-    ):
-        answerer.answer_nonzero_v1(
+    if deadline_crossed:
+        verdict = answerer.answer_nonzero_v1(
             retrieval,  # type: ignore[arg-type]
             question_bytes=b"{}\n",
             knowledge_root=tmp_path,
         )
+        assert verdict.status == "blocked"
+        assert verdict.error == {
+            "code": "codex_timeout_exhausted",
+            "stage": "synthesis",
+        }
+        assert verdict.attempts == (frozen_attempt,)
+    else:
+        with pytest.raises(
+            answerer.KnowledgeAnswererUnsafeHoldErrorV1,
+            match="Retry attempt preparation failed after commitment",
+        ):
+            answerer.answer_nonzero_v1(
+                retrieval,  # type: ignore[arg-type]
+                question_bytes=b"{}\n",
+                knowledge_root=tmp_path,
+            )
 
     assert preparation_calls == 2
 
 
-def test_third_attempt_schema_failure_after_commitment_stays_outside_matrix(
+@pytest.mark.parametrize(
+    "deadline_crossed",
+    (False, True),
+    ids=("proof-failure", "deadline-wins"),
+)
+def test_third_attempt_schema_failure_after_commitment_arbitrates_deadline(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    deadline_crossed: bool,
 ) -> None:
     retrieval = _patch_answerer_pre_attempt_inputs_v1(monkeypatch, tmp_path)
     preparation_calls = 0
@@ -578,7 +611,7 @@ def test_third_attempt_schema_failure_after_commitment_stays_outside_matrix(
             commit_monotonic_ns=ordinal,
             provider_started_monotonic_ns=ordinal + 1,
             attempt_deadline_monotonic_ns=50 + ordinal,
-            shared_deadline_monotonic_ns=10**30,
+            shared_deadline_monotonic_ns=100,
             capture_ready_monotonic_ns=51 + ordinal,
             exit_code=0x475A0001,
             mechanical_outcome="timeout",
@@ -615,16 +648,34 @@ def test_third_attempt_schema_failure_after_commitment_stays_outside_matrix(
         "_wait_retry_backoff_v1",
         lambda **_kwargs: "ready",
     )
+    monkeypatch.setattr(
+        answerer.time,
+        "monotonic_ns",
+        lambda: 100 if deadline_crossed and preparation_calls == 3 else 99,
+    )
 
-    with pytest.raises(
-        answerer.KnowledgeAnswererUnsafeHoldErrorV1,
-        match="Retry attempt preparation failed after commitment",
-    ):
-        answerer.answer_nonzero_v1(
+    if deadline_crossed:
+        verdict = answerer.answer_nonzero_v1(
             retrieval,  # type: ignore[arg-type]
             question_bytes=b"{}\n",
             knowledge_root=tmp_path,
         )
+        assert verdict.status == "blocked"
+        assert verdict.error == {
+            "code": "codex_timeout_exhausted",
+            "stage": "synthesis",
+        }
+        assert verdict.attempts == tuple(frozen_attempts)
+    else:
+        with pytest.raises(
+            answerer.KnowledgeAnswererUnsafeHoldErrorV1,
+            match="Retry attempt preparation failed after commitment",
+        ):
+            answerer.answer_nonzero_v1(
+                retrieval,  # type: ignore[arg-type]
+                question_bytes=b"{}\n",
+                knowledge_root=tmp_path,
+            )
 
     assert [attempt.events_bytes for attempt in frozen_attempts] == [
         b"events-1",
@@ -638,14 +689,21 @@ def test_third_attempt_schema_failure_after_commitment_stays_outside_matrix(
     ]
 
 
-def test_retry_child_preparation_rejection_stays_outside_outcome_matrix(
+@pytest.mark.parametrize(
+    "deadline_crossed",
+    (False, True),
+    ids=("proof-failure", "deadline-wins"),
+)
+def test_retry_child_preparation_rejection_arbitrates_deadline(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    deadline_crossed: bool,
 ) -> None:
     retrieval = _patch_answerer_pre_attempt_inputs_v1(monkeypatch, tmp_path)
     packages: list[answerer._AttemptPackageV1] = []
     removed_packages: list[Path] = []
     run_ordinals: list[int] = []
+    current_monotonic_ns = 99
 
     def prepare_attempt(_root: Path) -> answerer._AttemptPackageV1:
         ordinal = len(packages) + 1
@@ -663,9 +721,12 @@ def test_retry_child_preparation_rejection_stays_outside_outcome_matrix(
     def run_attempt(
         request: answerer.KnowledgeAnswerAttemptRequestV1,
     ) -> AttemptTerminalEvidenceV1 | PreAttemptRejectedV1:
+        nonlocal current_monotonic_ns
         ordinal = request.attempt_ordinal
         run_ordinals.append(ordinal)
         if ordinal == 2:
+            if deadline_crossed:
+                current_monotonic_ns = 100
             return PreAttemptRejectedV1(
                 reason="preparation_failed:CodexChildWin32ErrorV1",
                 resource_ledger_count=0,
@@ -683,7 +744,7 @@ def test_retry_child_preparation_rejection_stays_outside_outcome_matrix(
             commit_monotonic_ns=1,
             provider_started_monotonic_ns=2,
             attempt_deadline_monotonic_ns=50,
-            shared_deadline_monotonic_ns=10**30,
+            shared_deadline_monotonic_ns=100,
             capture_ready_monotonic_ns=51,
             exit_code=0x475A0001,
             mechanical_outcome="timeout",
@@ -713,16 +774,34 @@ def test_retry_child_preparation_rejection_stays_outside_outcome_matrix(
         "_wait_retry_backoff_v1",
         lambda **_kwargs: "ready",
     )
+    monkeypatch.setattr(
+        answerer.time,
+        "monotonic_ns",
+        lambda: current_monotonic_ns,
+    )
 
-    with pytest.raises(
-        answerer.KnowledgeAnswererUnsafeHoldErrorV1,
-        match="Retry attempt preparation failed after commitment",
-    ):
-        answerer.answer_nonzero_v1(
+    if deadline_crossed:
+        verdict = answerer.answer_nonzero_v1(
             retrieval,  # type: ignore[arg-type]
             question_bytes=b"{}\n",
             knowledge_root=tmp_path,
         )
+        assert verdict.status == "blocked"
+        assert verdict.error == {
+            "code": "codex_timeout_exhausted",
+            "stage": "synthesis",
+        }
+        assert verdict.attempts == (frozen_attempt,)
+    else:
+        with pytest.raises(
+            answerer.KnowledgeAnswererUnsafeHoldErrorV1,
+            match="Retry attempt preparation failed after commitment",
+        ):
+            answerer.answer_nonzero_v1(
+                retrieval,  # type: ignore[arg-type]
+                question_bytes=b"{}\n",
+                knowledge_root=tmp_path,
+            )
 
     assert run_ordinals == [1, 2]
     assert removed_packages == [package.root for package in packages]

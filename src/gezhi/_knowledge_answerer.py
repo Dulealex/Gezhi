@@ -1027,6 +1027,36 @@ def _cancel_wins_v1(
     )
 
 
+def _precommit_window_stop_v1(
+    *,
+    cancellation: CancellationObservationV1,
+    shared_deadline_monotonic_ns: int | None,
+    prompt_bytes: bytes,
+    schema_bytes: bytes,
+    attempts: tuple[KnowledgeAnswerAttemptV1, ...],
+) -> KnowledgeAnswererVerdictV1 | None:
+    if _cancel_wins_v1(cancellation, shared_deadline_monotonic_ns):
+        return _stopped_answerer_v1(
+            status="interrupted",
+            error=None,
+            prompt_bytes=prompt_bytes,
+            schema_bytes=schema_bytes,
+            attempts=attempts,
+        )
+    if (
+        shared_deadline_monotonic_ns is not None
+        and shared_deadline_monotonic_ns <= time.monotonic_ns()
+    ):
+        return _stopped_answerer_v1(
+            status="blocked",
+            error={"code": "codex_timeout_exhausted", "stage": "synthesis"},
+            prompt_bytes=prompt_bytes,
+            schema_bytes=schema_bytes,
+            attempts=attempts,
+        )
+    return None
+
+
 def _cancel_wins_completion_v1(
     cancellation: CancellationObservationV1,
     completion_monotonic_ns: int,
@@ -1129,28 +1159,15 @@ def answer_nonzero_v1(
     last_attempt: KnowledgeAnswerAttemptV1 | None = None
     for ordinal in range(1, 4):
         attempt_package: _AttemptPackageV1 | None = None
-        if _cancel_wins_v1(
-            cancellation_observation,
-            shared_deadline_monotonic_ns,
-        ):
-            return _stopped_answerer_v1(
-                status="interrupted",
-                error=None,
-                prompt_bytes=prompt_bytes,
-                schema_bytes=schema_bytes,
-                attempts=tuple(attempts),
-            )
-        if (
-            shared_deadline_monotonic_ns is not None
-            and shared_deadline_monotonic_ns <= time.monotonic_ns()
-        ):
-            return _stopped_answerer_v1(
-                status="blocked",
-                error={"code": "codex_timeout_exhausted", "stage": "synthesis"},
-                prompt_bytes=prompt_bytes,
-                schema_bytes=schema_bytes,
-                attempts=tuple(attempts),
-            )
+        precommit_stop = _precommit_window_stop_v1(
+            cancellation=cancellation_observation,
+            shared_deadline_monotonic_ns=shared_deadline_monotonic_ns,
+            prompt_bytes=prompt_bytes,
+            schema_bytes=schema_bytes,
+            attempts=tuple(attempts),
+        )
+        if precommit_stop is not None:
+            return precommit_stop
         try:
             attempt_package = _create_attempt_package_v1(temporary_root)
             with attempt_package.schema_path.open("xb") as schema_target:
@@ -1165,17 +1182,15 @@ def answer_nonzero_v1(
                     attempt_package.root,
                     temporary_root,
                 )
-            if _cancel_wins_v1(
-                cancellation_observation,
-                shared_deadline_monotonic_ns,
-            ):
-                return _stopped_answerer_v1(
-                    status="interrupted",
-                    error=None,
-                    prompt_bytes=prompt_bytes,
-                    schema_bytes=schema_bytes,
-                    attempts=tuple(attempts),
-                )
+            precommit_stop = _precommit_window_stop_v1(
+                cancellation=cancellation_observation,
+                shared_deadline_monotonic_ns=shared_deadline_monotonic_ns,
+                prompt_bytes=prompt_bytes,
+                schema_bytes=schema_bytes,
+                attempts=tuple(attempts),
+            )
+            if precommit_stop is not None:
+                return precommit_stop
             if attempts:
                 raise KnowledgeAnswererUnsafeHoldErrorV1(
                     "Retry attempt preparation failed after commitment"
@@ -1235,6 +1250,15 @@ def answer_nonzero_v1(
                     result.reason.startswith("preparation_failed:")
                     and result.reason != "preparation_failed:"
                 ):
+                    precommit_stop = _precommit_window_stop_v1(
+                        cancellation=cancellation_observation,
+                        shared_deadline_monotonic_ns=shared_deadline_monotonic_ns,
+                        prompt_bytes=prompt_bytes,
+                        schema_bytes=schema_bytes,
+                        attempts=tuple(attempts),
+                    )
+                    if precommit_stop is not None:
+                        return precommit_stop
                     if attempts:
                         raise KnowledgeAnswererUnsafeHoldErrorV1(
                             "Retry attempt preparation failed after commitment"

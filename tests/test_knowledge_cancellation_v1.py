@@ -78,7 +78,7 @@ def test_packaged_native_bridge_has_the_frozen_hash_and_x64_pe_identity() -> Non
     verified = _verified_native_dll_path_v1()
 
     assert verified.name == "gezhi_cancel_v1.dll"
-    assert verified.stat().st_size == 106_496
+    assert verified.stat().st_size == 107_008
 
 
 @pytest.mark.parametrize(

@@ -4,6 +4,7 @@ import ctypes
 import json
 import sys
 import threading
+import time
 from pathlib import Path
 
 
@@ -44,6 +45,15 @@ def _bind_native_test_dll(path: Path) -> ctypes.WinDLL:
     dll.gezhi_cancel_v1_test_poison_before_next_seal_gate.restype = ctypes.c_int
     dll.gezhi_cancel_v1_test_poison_before_next_seal_commit.argtypes = []
     dll.gezhi_cancel_v1_test_poison_before_next_seal_commit.restype = ctypes.c_int
+    dll.gezhi_cancel_v1_test_arm_seal_waiter_race.argtypes = []
+    dll.gezhi_cancel_v1_test_arm_seal_waiter_race.restype = ctypes.c_int
+    dll.gezhi_cancel_v1_test_seal_waiter_race_stage.argtypes = []
+    dll.gezhi_cancel_v1_test_seal_waiter_race_stage.restype = ctypes.c_int
+    dll.gezhi_cancel_v1_test_advance_seal_waiter_race.argtypes = [
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+    ]
+    dll.gezhi_cancel_v1_test_advance_seal_waiter_race.restype = ctypes.c_int
     return dll
 
 
@@ -197,6 +207,49 @@ def _seal_poison_after_gate_v1(path: Path) -> dict[str, object]:
     return {"mode": "seal-poison-after-gate", "proof": "rejected"}
 
 
+def _wait_for_seal_waiter_race_stage_v1(
+    dll: ctypes.WinDLL,
+    expected: int,
+) -> None:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if dll.gezhi_cancel_v1_test_seal_waiter_race_stage() == expected:
+            return
+        time.sleep(0.001)
+    raise AssertionError(f"seal/waiter race did not reach stage {expected}")
+
+
+def _seal_waiter_race_v1(path: Path) -> dict[str, object]:
+    dll = _activate_test_dll_v1(path)
+    seal_results: list[int] = []
+    dispatch_results: list[int] = []
+    assert dll.gezhi_cancel_v1_test_arm_seal_waiter_race() == 1
+    seal_worker = threading.Thread(
+        target=lambda: seal_results.append(dll.gezhi_cancel_v1_conditional_seal(0, 43))
+    )
+    seal_worker.start()
+    _wait_for_seal_waiter_race_stage_v1(dll, 2)
+    dispatch_worker = threading.Thread(
+        target=lambda: dispatch_results.append(dll.gezhi_cancel_v1_test_dispatch(0))
+    )
+    dispatch_worker.start()
+    _wait_for_seal_waiter_race_stage_v1(dll, 3)
+    assert dll.gezhi_cancel_v1_test_advance_seal_waiter_race(3, 4) == 1
+    _wait_for_seal_waiter_race_stage_v1(dll, 5)
+    assert dll.gezhi_cancel_v1_test_advance_seal_waiter_race(5, 6) == 1
+    dispatch_worker.join(timeout=5)
+    seal_worker.join(timeout=5)
+    assert not dispatch_worker.is_alive()
+    assert not seal_worker.is_alive()
+    assert dll.gezhi_cancel_v1_test_seal_waiter_race_stage() == 7
+    assert dispatch_results == [0]
+    assert seal_results == [1]
+    assert dll.gezhi_cancel_v1_try_begin_work() == 0
+    assert _snapshot(dll) == (3, 0, 0, 0, 0, 0, 43)
+    assert dll.gezhi_cancel_v1_release() == 1
+    return {"mode": "seal-waiter-race", "proof": "sealed"}
+
+
 def _interactive_profile_v1() -> dict[str, object]:
     from gezhi._knowledge_cancellation import (
         WindowsConsoleCancellationBridgeV1,
@@ -242,6 +295,8 @@ def main() -> int:
             receipt = _seal_poison_race_v1(path)
         elif mode == "seal-poison-after-gate":
             receipt = _seal_poison_after_gate_v1(path)
+        elif mode == "seal-waiter-race":
+            receipt = _seal_waiter_race_v1(path)
         else:
             raise SystemExit("unknown probe mode")
     print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))

@@ -9,6 +9,9 @@
 #define GEZHI_GENERATION_MASK UINT64_C(0x0FFFFFFF)
 #define GEZHI_TOKEN_SHIFT 32
 #define GEZHI_MAX_GENERATION UINT64_C(0x0FFFFFFF)
+#define GEZHI_OBSERVER_CLOSED_BIT UINT64_C(0x8000000000000000)
+#define GEZHI_OBSERVER_FAILED_BIT UINT64_C(0x4000000000000000)
+#define GEZHI_OBSERVER_COUNT_MASK UINT64_C(0x3FFFFFFFFFFFFFFF)
 
 #define GEZHI_PHASE_OUTSIDE UINT64_C(0)
 #define GEZHI_PHASE_ARMED UINT64_C(1)
@@ -19,6 +22,7 @@
 
 static volatile LONG64 gezhi_control = 0;
 static volatile LONG64 gezhi_observed_ns = 0;
+__declspec(align(8)) static volatile LONG64 gezhi_admission_observer_state = 0;
 static volatile LONG gezhi_publication_ready = 0;
 static volatile LONG gezhi_admission_gate = 0;
 static volatile LONG gezhi_accepted_in_flight = 0;
@@ -28,6 +32,7 @@ static LARGE_INTEGER gezhi_qpc_frequency = {0};
 #ifdef GEZHI_CANCEL_TESTING
 static volatile LONG gezhi_test_poison_before_seal_gate = 0;
 static volatile LONG gezhi_test_poison_before_seal_commit = 0;
+static volatile LONG gezhi_test_seal_waiter_race_stage = 0;
 #endif
 
 static LONG64 gezhi_load_control(void) {
@@ -47,34 +52,149 @@ static BOOL gezhi_phase_is_accepting(uint64_t phase) {
         || phase == GEZHI_PHASE_ACCEPTING_POST_ID;
 }
 
-static int gezhi_try_enter_admission_gate(void) {
-    LONG observed;
+static uint64_t gezhi_load_admission_observer_state(void) {
+    return (uint64_t)InterlockedCompareExchange64(
+        &gezhi_admission_observer_state, 0, 0);
+}
+
+static int gezhi_fail_admission_observer(void) {
+    uint64_t previous = (uint64_t)InterlockedOr64(
+        &gezhi_admission_observer_state,
+        (LONG64)GEZHI_OBSERVER_FAILED_BIT);
+
+    if ((previous & GEZHI_OBSERVER_CLOSED_BIT) != 0) {
+        return 0;
+    }
+    InterlockedExchange(&gezhi_poisoned, 1);
+    return -1;
+}
+
+static int gezhi_register_admission_observer(void) {
+    uint64_t count;
+    uint64_t desired;
+    uint64_t observed;
     int attempt;
 
     for (attempt = 0; attempt < 4096; ++attempt) {
+        observed = gezhi_load_admission_observer_state();
+        if ((observed & GEZHI_OBSERVER_CLOSED_BIT) != 0) {
+            return 0;
+        }
+        if ((observed & GEZHI_OBSERVER_FAILED_BIT) != 0) {
+            InterlockedExchange(&gezhi_poisoned, 1);
+            return -1;
+        }
+        count = observed & GEZHI_OBSERVER_COUNT_MASK;
+        if (count == GEZHI_OBSERVER_COUNT_MASK) {
+            return gezhi_fail_admission_observer();
+        }
+        desired = observed + UINT64_C(1);
+        if ((uint64_t)InterlockedCompareExchange64(
+                &gezhi_admission_observer_state,
+                (LONG64)desired,
+                (LONG64)observed) == observed) {
+            return 1;
+        }
+        YieldProcessor();
+    }
+    return gezhi_fail_admission_observer();
+}
+
+static void gezhi_leave_admission_observer(void) {
+    uint64_t count;
+    uint64_t desired;
+    uint64_t observed;
+    int attempt;
+
+    for (attempt = 0; attempt < 4096; ++attempt) {
+        observed = gezhi_load_admission_observer_state();
+        count = observed & GEZHI_OBSERVER_COUNT_MASK;
+        if (count == 0) {
+            InterlockedExchange(&gezhi_poisoned, 1);
+            return;
+        }
+        desired = (observed & ~GEZHI_OBSERVER_COUNT_MASK) | (count - 1);
+        if ((uint64_t)InterlockedCompareExchange64(
+                &gezhi_admission_observer_state,
+                (LONG64)desired,
+                (LONG64)observed) == observed) {
+            return;
+        }
+        YieldProcessor();
+    }
+    InterlockedExchange(&gezhi_poisoned, 1);
+}
+
+static int gezhi_try_enter_admission_gate(void) {
+    LONG observed;
+    int admission;
+    int attempt;
+
+    admission = gezhi_register_admission_observer();
+    if (admission != 1) {
+        return admission;
+    }
+    for (attempt = 0; attempt < 4096; ++attempt) {
+        if ((gezhi_load_admission_observer_state()
+                & GEZHI_OBSERVER_CLOSED_BIT) != 0) {
+            admission = 0;
+            break;
+        }
         observed = InterlockedCompareExchange(&gezhi_admission_gate, 0, 0);
         if (observed < 0) {
             if (!gezhi_phase_is_accepting(
                     gezhi_phase((uint64_t)gezhi_load_control()))) {
-                return 0;
+                admission = 0;
+                break;
             }
             YieldProcessor();
             continue;
         }
         if (observed == LONG_MAX) {
-            InterlockedExchange(&gezhi_poisoned, 1);
-            return -1;
+            admission = gezhi_fail_admission_observer();
+            break;
         }
         if (InterlockedCompareExchange(
                 &gezhi_admission_gate,
                 observed + 1,
                 observed) == observed) {
-            return 1;
+            admission = 1;
+            break;
         }
         YieldProcessor();
     }
+    if (attempt == 4096) {
+#ifdef GEZHI_CANCEL_TESTING
+        if (InterlockedCompareExchange(
+                &gezhi_test_seal_waiter_race_stage, 3, 2) == 2) {
+            while (InterlockedCompareExchange(
+                    &gezhi_test_seal_waiter_race_stage, 0, 0) < 6) {
+                YieldProcessor();
+            }
+        }
+#endif
+        admission = gezhi_fail_admission_observer();
+#ifdef GEZHI_CANCEL_TESTING
+        InterlockedCompareExchange(&gezhi_test_seal_waiter_race_stage, 7, 6);
+#endif
+    }
+    gezhi_leave_admission_observer();
+    return admission;
+}
+
+static int gezhi_drain_admission_observers(void) {
+    uint64_t state;
+    uint32_t attempt;
+
+    for (attempt = 0; attempt < 1000000; ++attempt) {
+        state = gezhi_load_admission_observer_state();
+        if ((state & GEZHI_OBSERVER_COUNT_MASK) == 0) {
+            return 1;
+        }
+        SwitchToThread();
+    }
     InterlockedExchange(&gezhi_poisoned, 1);
-    return -1;
+    return 0;
 }
 
 static void gezhi_leave_admission_gate(void) {
@@ -110,11 +230,8 @@ static BOOL WINAPI gezhi_handler(DWORD control_type) {
         return FALSE;
     }
     admission = gezhi_try_enter_admission_gate();
-    if (admission == 0) {
+    if (admission != 1) {
         return FALSE;
-    }
-    if (admission < 0) {
-        return TRUE;
     }
     observed = (uint64_t)gezhi_load_control();
     if (!gezhi_phase_is_accepting(gezhi_phase(observed))) {
@@ -197,6 +314,7 @@ __declspec(dllexport) int __stdcall gezhi_cancel_v1_arm(void) {
 
     if (gezhi_load_control() != (LONG64)expected
         || InterlockedCompareExchange(&gezhi_registered, 0, 0) != 0
+        || gezhi_load_admission_observer_state() != 0
         || !QueryPerformanceFrequency(&gezhi_qpc_frequency)
         || gezhi_qpc_frequency.QuadPart <= 0) {
         return 0;
@@ -354,6 +472,7 @@ __declspec(dllexport) int __stdcall gezhi_cancel_v1_conditional_seal(
     uint32_t expected_generation,
     uint32_t candidate_token) {
     uint64_t observed;
+    uint64_t observer_state_before_close;
     uint64_t desired;
     int sealed;
 
@@ -373,6 +492,15 @@ __declspec(dllexport) int __stdcall gezhi_cancel_v1_conditional_seal(
         InterlockedExchange(&gezhi_admission_gate, 0);
         return -1;
     }
+#ifdef GEZHI_CANCEL_TESTING
+    if (InterlockedCompareExchange(
+            &gezhi_test_seal_waiter_race_stage, 2, 1) == 1) {
+        while (InterlockedCompareExchange(
+                &gezhi_test_seal_waiter_race_stage, 0, 0) < 4) {
+            YieldProcessor();
+        }
+    }
+#endif
     observed = (uint64_t)gezhi_load_control();
     if (!gezhi_phase_is_accepting(gezhi_phase(observed))
         || gezhi_generation(observed) != expected_generation) {
@@ -396,12 +524,35 @@ __declspec(dllexport) int __stdcall gezhi_cancel_v1_conditional_seal(
         &gezhi_control,
         (LONG64)desired,
         (LONG64)observed) == observed;
-    if (InterlockedCompareExchange(&gezhi_poisoned, 0, 0) != 0) {
+    if (!sealed) {
+        InterlockedExchange(&gezhi_admission_gate, 0);
+        return InterlockedCompareExchange(&gezhi_poisoned, 0, 0) != 0
+            ? -1
+            : 0;
+    }
+    observer_state_before_close = (uint64_t)InterlockedOr64(
+        &gezhi_admission_observer_state,
+        (LONG64)GEZHI_OBSERVER_CLOSED_BIT);
+    if ((observer_state_before_close
+            & (GEZHI_OBSERVER_CLOSED_BIT | GEZHI_OBSERVER_FAILED_BIT)) != 0) {
+        InterlockedExchange(&gezhi_poisoned, 1);
+    }
+#ifdef GEZHI_CANCEL_TESTING
+    if (InterlockedCompareExchange(
+            &gezhi_test_seal_waiter_race_stage, 5, 4) == 4) {
+        while (InterlockedCompareExchange(
+                &gezhi_test_seal_waiter_race_stage, 0, 0) < 6) {
+            YieldProcessor();
+        }
+    }
+#endif
+    if (!gezhi_drain_admission_observers()
+        || InterlockedCompareExchange(&gezhi_poisoned, 0, 0) != 0) {
         InterlockedExchange(&gezhi_admission_gate, 0);
         return -1;
     }
     InterlockedExchange(&gezhi_admission_gate, 0);
-    return sealed;
+    return 1;
 }
 
 __declspec(dllexport) int __stdcall gezhi_cancel_v1_release(void) {
@@ -480,5 +631,34 @@ gezhi_cancel_v1_test_poison_before_next_seal_commit(void) {
     }
     return InterlockedCompareExchange(
         &gezhi_test_poison_before_seal_commit, 1, 0) == 0;
+}
+
+__declspec(dllexport) int __stdcall
+gezhi_cancel_v1_test_arm_seal_waiter_race(void) {
+    if (InterlockedCompareExchange(&gezhi_poisoned, 0, 0) != 0) {
+        return 0;
+    }
+    return InterlockedCompareExchange(
+        &gezhi_test_seal_waiter_race_stage, 1, 0) == 0;
+}
+
+__declspec(dllexport) int __stdcall
+gezhi_cancel_v1_test_seal_waiter_race_stage(void) {
+    return InterlockedCompareExchange(
+        &gezhi_test_seal_waiter_race_stage, 0, 0);
+}
+
+__declspec(dllexport) int __stdcall
+gezhi_cancel_v1_test_advance_seal_waiter_race(
+    uint32_t expected_stage,
+    uint32_t next_stage) {
+    if (!((expected_stage == 3 && next_stage == 4)
+            || (expected_stage == 5 && next_stage == 6))) {
+        return 0;
+    }
+    return InterlockedCompareExchange(
+        &gezhi_test_seal_waiter_race_stage,
+        (LONG)next_stage,
+        (LONG)expected_stage) == (LONG)expected_stage;
 }
 #endif

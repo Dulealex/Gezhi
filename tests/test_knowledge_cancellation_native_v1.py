@@ -187,6 +187,32 @@ def test_native_seal_rechecks_poison_after_forming_the_transition(
     }
 
 
+def test_native_seal_drains_a_handler_poised_after_its_last_gate_observation(
+    tmp_path: Path,
+) -> None:
+    dll_path = tmp_path / "gezhi_cancel_seal_waiter_race_test_v1.dll"
+    subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            str(REPOSITORY_ROOT / "tools" / "build-knowledge-cancellation.ps1"),
+            "-OutputPath",
+            str(dll_path),
+            "-TestHooks",
+        ],
+        check=True,
+        capture_output=True,
+        cwd=REPOSITORY_ROOT,
+        timeout=30,
+    )
+
+    assert _run_native_probe_v1("seal-waiter-race", dll_path) == {
+        "mode": "seal-waiter-race",
+        "proof": "sealed",
+    }
+
+
 def test_test_hooks_require_an_explicit_nonproduction_output_path() -> None:
     production = REPOSITORY_ROOT / "src" / "gezhi" / "_native" / "gezhi_cancel_v1.dll"
     before = hashlib.sha256(production.read_bytes()).hexdigest()
