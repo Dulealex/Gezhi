@@ -1157,6 +1157,38 @@ def test_existing_shared_deadline_before_commit_creates_no_attempt(
     assert result.resource_ledger_count == 0
 
 
+@pytest.mark.parametrize(
+    ("cancel_offset_ns", "expected_reason"),
+    (
+        (-1, "cancelled_before_commit"),
+        (0, "cancelled_before_commit"),
+        (1, "shared_deadline_before_commit"),
+    ),
+    ids=("cancel-earlier", "cancel-tied", "deadline-earlier"),
+)
+def test_final_precommit_gate_arbitrates_cancel_and_shared_deadline(
+    tmp_path: Path,
+    cancel_offset_ns: int,
+    expected_reason: str,
+) -> None:
+    shared_deadline_ns = time.monotonic_ns() - 1_000
+    plan = _plan(
+        tmp_path,
+        "success",
+        existing_shared_deadline_monotonic_ns=shared_deadline_ns,
+    )
+
+    result = run_codex_child_v1(
+        plan,
+        _FixedCancellation(shared_deadline_ns + cancel_offset_ns),
+    )
+
+    assert isinstance(result, PreAttemptRejectedV1)
+    assert result.reason == expected_reason
+    assert result.create_process_calls == 0
+    assert result.resource_ledger_count == 0
+
+
 @pytest.mark.parametrize("boundary", ["create", "assign"])
 def test_shared_deadline_crossing_kernel_boundary_prevents_resume(
     tmp_path: Path,

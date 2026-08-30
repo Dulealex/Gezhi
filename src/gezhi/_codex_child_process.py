@@ -2173,18 +2173,26 @@ def _run_codex_child_core_v1(
             reason=f"commit_gate_failed:{type(error).__name__}",
             resource_ledger_count=prepared.ledger.count(),
         )
-    if (
-        cancel_before_commit is not None
-        and cancel_before_commit <= commit_monotonic_ns
-    ) or (
-        plan.existing_shared_deadline_monotonic_ns is not None
-        and plan.existing_shared_deadline_monotonic_ns <= commit_monotonic_ns
-    ):
+    cancel_reached_commit = (
+        cancel_before_commit is not None and cancel_before_commit <= commit_monotonic_ns
+    )
+    deadline_reached_commit = (
+        shared_deadline_ns is not None and shared_deadline_ns <= commit_monotonic_ns
+    )
+    if cancel_reached_commit or deadline_reached_commit:
+        cancellation_wins = cancel_reached_commit and (
+            not deadline_reached_commit
+            or (
+                cancel_before_commit is not None
+                and shared_deadline_ns is not None
+                and cancel_before_commit <= shared_deadline_ns
+            )
+        )
         _cleanup_precommit(prepared, plan)
         return PreAttemptRejectedV1(
             reason=(
                 "cancelled_before_commit"
-                if cancel_before_commit is not None
+                if cancellation_wins
                 else "shared_deadline_before_commit"
             ),
             resource_ledger_count=prepared.ledger.count(),

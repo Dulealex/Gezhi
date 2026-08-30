@@ -492,6 +492,58 @@ def _validate_attempt_record_v1(record: Mapping[str, object]) -> dict[str, objec
     return dict(record)
 
 
+def _validate_attempt_terminal_matrix_v1(
+    *,
+    status: str,
+    error: dict[str, object] | None,
+    candidate_count: int | None,
+    attempts: list[dict[str, object]],
+) -> None:
+    error_code = None if error is None else error.get("code")
+    if not attempts:
+        if error_code in {
+            "codex_timeout_exhausted",
+            "codex_process_failed",
+            "answer_output_invalid",
+            "citation_link_construction_failed",
+            "answer_rendering_failed",
+        }:
+            raise AnswerTerminalRequestInvalidV1(
+                "Answer terminal matrix requires an attempt"
+            )
+        return
+    if candidate_count is None or candidate_count <= 0:
+        raise AnswerTerminalRequestInvalidV1("Answer terminal matrix has no Candidate")
+    failure_classes = tuple(attempt["failure_class"] for attempt in attempts)
+    if any(
+        failure_class not in {None, "timeout", "process_error", "interrupted"}
+        for failure_class in failure_classes
+    ) or any(failure_class != "timeout" for failure_class in failure_classes[:-1]):
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer terminal matrix has an invalid attempt sequence"
+        )
+    last_failure = failure_classes[-1]
+    valid = False
+    if status == "succeeded":
+        valid = last_failure is None
+    elif status == "interrupted":
+        valid = last_failure in {None, "timeout", "interrupted"}
+    elif error_code == "codex_timeout_exhausted":
+        valid = last_failure == "timeout"
+    elif error_code == "codex_process_failed":
+        valid = last_failure == "process_error"
+    elif error_code in {
+        "answer_output_invalid",
+        "citation_link_construction_failed",
+        "answer_rendering_failed",
+    }:
+        valid = last_failure is None
+    if not valid:
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer terminal matrix differs from its attempts"
+        )
+
+
 def _validate_utf8_text_asset_v1(payload: bytes, *, label: str) -> None:
     if payload.startswith(b"\xef\xbb\xbf") or not payload.endswith(b"\n"):
         raise AnswerTerminalRequestInvalidV1(f"{label} framing is invalid")
@@ -717,6 +769,12 @@ def _request_assets(
             )
         )
         attempt_records.append(record)
+    _validate_attempt_terminal_matrix_v1(
+        status=request.status,
+        error=error,
+        candidate_count=candidate_count,
+        attempts=attempt_records,
+    )
     return tuple(assets), tuple(attempt_records)
 
 
