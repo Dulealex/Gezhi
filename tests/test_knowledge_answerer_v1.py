@@ -13,6 +13,7 @@ from gezhi._codex_child_process import (
     AttemptTerminalEvidenceV1,
     CancellationObservationV1,
     CaptureEvidenceV1,
+    PreAttemptRejectedV1,
 )
 
 
@@ -373,6 +374,91 @@ def test_attempt_workspace_formation_failure_is_input_invalid(
             question_bytes=b"{}\n",
             knowledge_root=tmp_path,
         )
+
+
+def test_precommit_proof_failure_stays_outside_the_answer_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    retrieval = _patch_answerer_pre_attempt_inputs_v1(monkeypatch, tmp_path)
+    package_root = tmp_path / "g1234567"
+    attempt_root = package_root / "attempt"
+    attempt_root.mkdir(parents=True)
+    package = answerer._AttemptPackageV1(
+        root=package_root,
+        attempt_root=attempt_root,
+        schema_path=package_root / "schema.json",
+    )
+    removed_packages: list[Path] = []
+    monkeypatch.setattr(answerer, "_create_attempt_package_v1", lambda _root: package)
+    monkeypatch.setattr(
+        answerer,
+        "_run_role_attempt_v1",
+        lambda _request: PreAttemptRejectedV1(
+            reason="commit_gate_failed:RuntimeError",
+            resource_ledger_count=0,
+        ),
+    )
+    monkeypatch.setattr(
+        answerer,
+        "_remove_attempt_package_v1",
+        lambda root, _temporary_root: removed_packages.append(root),
+    )
+
+    with pytest.raises(
+        answerer.KnowledgeAnswererUnsafeHoldErrorV1,
+        match="precommit proof",
+    ):
+        answerer.answer_nonzero_v1(
+            retrieval,  # type: ignore[arg-type]
+            question_bytes=b"{}\n",
+            knowledge_root=tmp_path,
+        )
+
+    assert removed_packages == [package_root]
+
+
+def test_safe_preparation_rejection_remains_runtime_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    retrieval = _patch_answerer_pre_attempt_inputs_v1(monkeypatch, tmp_path)
+    package_root = tmp_path / "g1234567"
+    attempt_root = package_root / "attempt"
+    attempt_root.mkdir(parents=True)
+    package = answerer._AttemptPackageV1(
+        root=package_root,
+        attempt_root=attempt_root,
+        schema_path=package_root / "schema.json",
+    )
+    removed_packages: list[Path] = []
+    monkeypatch.setattr(answerer, "_create_attempt_package_v1", lambda _root: package)
+    monkeypatch.setattr(
+        answerer,
+        "_run_role_attempt_v1",
+        lambda _request: PreAttemptRejectedV1(
+            reason="preparation_failed:CodexChildWin32ErrorV1",
+            resource_ledger_count=0,
+        ),
+    )
+    monkeypatch.setattr(
+        answerer,
+        "_remove_attempt_package_v1",
+        lambda root, _temporary_root: removed_packages.append(root),
+    )
+
+    verdict = answerer.answer_nonzero_v1(
+        retrieval,  # type: ignore[arg-type]
+        question_bytes=b"{}\n",
+        knowledge_root=tmp_path,
+    )
+
+    assert verdict.status == "blocked"
+    assert verdict.error == {
+        "code": "codex_runtime_unavailable",
+        "stage": "synthesis",
+    }
+    assert removed_packages == [package_root]
 
 
 def test_retry_workspace_failure_preserves_the_completed_timeout_attempt(

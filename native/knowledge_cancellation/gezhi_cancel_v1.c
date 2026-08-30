@@ -223,27 +223,64 @@ __declspec(dllexport) int __stdcall gezhi_cancel_v1_activate(void) {
 }
 
 __declspec(dllexport) int __stdcall gezhi_cancel_v1_try_answer_id_cutover(void) {
-    uint64_t observed = (uint64_t)gezhi_load_control();
+    uint64_t observed;
     uint64_t desired;
+    int cutover;
 
+    if (InterlockedCompareExchange(&gezhi_poisoned, 0, 0) != 0) {
+        return -1;
+    }
+    if (InterlockedCompareExchange(&gezhi_admission_gate, -1, 0) != 0) {
+        return InterlockedCompareExchange(&gezhi_poisoned, 0, 0) != 0
+            ? -1
+            : 0;
+    }
+    if (InterlockedCompareExchange(&gezhi_poisoned, 0, 0) != 0) {
+        InterlockedExchange(&gezhi_admission_gate, 0);
+        return -1;
+    }
+    observed = (uint64_t)gezhi_load_control();
     if (gezhi_phase(observed) != GEZHI_PHASE_ACCEPTING_PRE_ID
         || (observed & GEZHI_LATCH_BIT) != 0
-        || gezhi_generation(observed) != 0
-        || InterlockedCompareExchange(&gezhi_poisoned, 0, 0) != 0) {
+        || gezhi_generation(observed) != 0) {
+        InterlockedExchange(&gezhi_admission_gate, 0);
         return 0;
     }
     desired = (observed & ~GEZHI_PHASE_MASK)
         | GEZHI_PHASE_ACCEPTING_POST_ID;
-    return (uint64_t)InterlockedCompareExchange64(
+    cutover = (uint64_t)InterlockedCompareExchange64(
         &gezhi_control,
         (LONG64)desired,
         (LONG64)observed) == observed;
+    if (InterlockedCompareExchange(&gezhi_poisoned, 0, 0) != 0) {
+        cutover = -1;
+    }
+    InterlockedExchange(&gezhi_admission_gate, 0);
+    return cutover;
 }
 
 __declspec(dllexport) int __stdcall gezhi_cancel_v1_try_begin_work(void) {
-    uint64_t control = (uint64_t)gezhi_load_control();
-    return gezhi_phase_is_accepting(gezhi_phase(control))
-        && (control & GEZHI_LATCH_BIT) == 0;
+    LONG first_gate;
+    LONG second_gate;
+    uint64_t first_control;
+    uint64_t second_control;
+
+    if (InterlockedCompareExchange(&gezhi_poisoned, 0, 0) != 0) {
+        return -1;
+    }
+    first_gate = InterlockedCompareExchange(&gezhi_admission_gate, 0, 0);
+    first_control = (uint64_t)gezhi_load_control();
+    second_control = (uint64_t)gezhi_load_control();
+    second_gate = InterlockedCompareExchange(&gezhi_admission_gate, 0, 0);
+    if (InterlockedCompareExchange(&gezhi_poisoned, 0, 0) != 0) {
+        return -1;
+    }
+    if (first_gate != 0 || second_gate != 0 || first_gate != second_gate
+        || first_control != second_control) {
+        return 0;
+    }
+    return gezhi_phase_is_accepting(gezhi_phase(first_control))
+        && (first_control & GEZHI_LATCH_BIT) == 0;
 }
 
 __declspec(dllexport) int __stdcall gezhi_cancel_v1_snapshot(
@@ -383,5 +420,25 @@ __declspec(dllexport) int __stdcall gezhi_cancel_v1_release(void) {
 __declspec(dllexport) int __stdcall gezhi_cancel_v1_test_dispatch(
     uint32_t control_type) {
     return gezhi_handler((DWORD)control_type) ? 1 : 0;
+}
+
+__declspec(dllexport) int __stdcall
+gezhi_cancel_v1_test_begin_poison_publication(void) {
+    if (InterlockedCompareExchange(&gezhi_poisoned, 0, 0) != 0
+        || !gezhi_phase_is_accepting(
+            gezhi_phase((uint64_t)gezhi_load_control()))) {
+        return 0;
+    }
+    return InterlockedCompareExchange(&gezhi_admission_gate, 1, 0) == 0;
+}
+
+__declspec(dllexport) int __stdcall
+gezhi_cancel_v1_test_finish_poison_publication(void) {
+    if (InterlockedCompareExchange(&gezhi_admission_gate, 1, 1) != 1) {
+        return 0;
+    }
+    InterlockedExchange(&gezhi_poisoned, 1);
+    gezhi_leave_admission_gate();
+    return 1;
 }
 #endif

@@ -31,7 +31,7 @@ _FILE_SHARE_WRITE = 0x00000002
 _OPEN_EXISTING = 3
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 _MAX_CANDIDATE_TOKEN = 0xFFFFFFFF
-_NATIVE_DLL_SHA256 = "27d9fad527ea1525f212aad3974ecbd7bc26026713f38583d055525be72c0d8d"
+_NATIVE_DLL_SHA256 = "bd02adcc0c7b0b752d9f8a2bd8e8a19ccb44791eb11d4a80f7c6e14055d182a7"
 _NATIVE_DLL_MAX_BYTES = 262_144
 _NATIVE_DLL_PATH = Path(__file__).with_name("_native") / "gezhi_cancel_v1.dll"
 _NATIVE_PHASES: dict[int, CancellationPhaseV1] = {
@@ -383,10 +383,20 @@ class _NativeCancellationApiV1:
         return self._activate() == 1
 
     def try_begin_work_v1(self) -> bool:
-        return self._try_begin_work() == 1
+        result = self._try_begin_work()
+        if result not in {0, 1}:
+            raise KnowledgeCancellationBridgeErrorV1(
+                "Native cancellation work-admission proof failed"
+            )
+        return result == 1
 
     def try_answer_id_cutover_v1(self) -> bool:
-        return self._try_answer_id_cutover() == 1
+        result = self._try_answer_id_cutover()
+        if result not in {0, 1}:
+            raise KnowledgeCancellationBridgeErrorV1(
+                "Native cancellation answer-identity proof failed"
+            )
+        return result == 1
 
     def snapshot_v1(self) -> CancellationSnapshotV1:
         phase = ctypes.c_uint32()

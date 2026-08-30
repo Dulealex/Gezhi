@@ -6,8 +6,10 @@ import pytest
 
 from gezhi._knowledge_cancellation import (
     CancellationSnapshotV1,
+    KnowledgeCancellationBridgeErrorV1,
     NoInteractiveCancellationBridgeV1,
     _classify_console_cancellation_capability_v1,
+    _NativeCancellationApiV1,
     _validated_native_snapshot_v1,
     _verified_native_dll_path_v1,
 )
@@ -77,6 +79,24 @@ def test_packaged_native_bridge_has_the_frozen_hash_and_x64_pe_identity() -> Non
 
     assert verified.name == "gezhi_cancel_v1.dll"
     assert verified.stat().st_size == 106_496
+
+
+@pytest.mark.parametrize(
+    ("raw_export", "method"),
+    (
+        ("_try_begin_work", "try_begin_work_v1"),
+        ("_try_answer_id_cutover", "try_answer_id_cutover_v1"),
+    ),
+)
+def test_native_boolean_admission_rejects_a_poison_proof_sentinel(
+    raw_export: str,
+    method: str,
+) -> None:
+    api = object.__new__(_NativeCancellationApiV1)
+    setattr(api, raw_export, lambda: -1)
+
+    with pytest.raises(KnowledgeCancellationBridgeErrorV1, match="proof failed"):
+        getattr(api, method)()
 
 
 @pytest.mark.parametrize(

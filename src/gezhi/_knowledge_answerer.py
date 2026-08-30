@@ -1223,15 +1223,22 @@ def answer_nonzero_v1(
                         schema_bytes=schema_bytes,
                         attempts=tuple(attempts),
                     )
-                return _stopped_answerer_v1(
-                    status="blocked",
-                    error={
-                        "code": "codex_runtime_unavailable",
-                        "stage": "synthesis",
-                    },
-                    prompt_bytes=prompt_bytes,
-                    schema_bytes=schema_bytes,
-                    attempts=tuple(attempts),
+                if (
+                    result.reason.startswith("preparation_failed:")
+                    and result.reason != "preparation_failed:"
+                ):
+                    return _stopped_answerer_v1(
+                        status="blocked",
+                        error={
+                            "code": "codex_runtime_unavailable",
+                            "stage": "synthesis",
+                        },
+                        prompt_bytes=prompt_bytes,
+                        schema_bytes=schema_bytes,
+                        attempts=tuple(attempts),
+                    )
+                raise KnowledgeAnswererUnsafeHoldErrorV1(
+                    "Knowledge attempt precommit proof failed"
                 )
             if not isinstance(result, AttemptTerminalEvidenceV1):
                 raise TypeError("Knowledge attempt result type is invalid")
