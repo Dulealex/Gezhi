@@ -90,11 +90,6 @@ _ASK_PRIMARY = {
         "冻结的 Codex CLI 运行能力不可用",
         "运行 gezhi doctor 检查项目 Codex CLI 与登录能力，恢复后重新提问",
     ),
-    "codex_timeout_exhausted": (
-        "knowledge.ask.codex_timeout_exhausted.v1",
-        "Codex 回答尝试已耗尽超时预算",
-        "稍后重新提问；若持续发生，运行 gezhi doctor 检查 Codex 环境能力",
-    ),
     "synthesis_input_invalid": (
         "knowledge.ask.synthesis_input_invalid.v1",
         "Codex 回答输入包未通过本地验证",

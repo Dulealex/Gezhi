@@ -310,7 +310,6 @@ def validate_knowledge_ask_report_v1(report: KnowledgeAskReportV1) -> None:
     committed_reasons = {
         ("blocked", "retrieval_view_too_large"),
         ("blocked", "codex_runtime_unavailable"),
-        ("blocked", "codex_timeout_exhausted"),
         ("failed", "codex_process_failed"),
         ("failed", "answer_output_invalid"),
         ("failed", "answer_rendering_failed"),
@@ -500,6 +499,7 @@ class KnowledgeAsksV1:
                 except RetrievalDataRootIntegrityLostV1:
                     return _failed_report_v1("data_root_integrity_lost")
                 if isinstance(retrieval, NonZeroCandidatesV1):
+                    retrieval_audit_bytes = retrieval.retrieval_audit_bytes
                     if retrieval.measured_retrieval_view.status == "too_large":
                         terminal_status: KnowledgeAskOutcomeV1 = "blocked"
                         terminal_error: dict[str, object] | None = {
@@ -513,6 +513,7 @@ class KnowledgeAsksV1:
                         answer_output_bytes = None
                         answer_markdown_bytes = None
                         retrieval_view_bytes = None
+                        del retrieval
                     else:
                         from gezhi._knowledge_answerer import (
                             KnowledgeAnswererInputInvalidV1,
@@ -560,7 +561,6 @@ class KnowledgeAsksV1:
                             answer_output_bytes = answerer.answer_output_bytes
                             answer_markdown_bytes = answerer.answer_markdown_bytes
                         retrieval_view_bytes = retrieval.measured_retrieval_view.buffer
-                    retrieval_audit_bytes = retrieval.retrieval_audit_bytes
                 elif type(retrieval) is ZeroCandidateRetrievalV1:
                     terminal_status = "succeeded"
                     terminal_error = None
