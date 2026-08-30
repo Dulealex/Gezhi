@@ -501,15 +501,27 @@ def _validate_attempt_terminal_matrix_v1(
 ) -> None:
     error_code = None if error is None else error.get("code")
     if not attempts:
-        if error_code in {
+        legacy_transient_error = error_code in {
+            "codex_network_exhausted",
+            "codex_rate_limit_exhausted",
+            "codex_server_error_exhausted",
+            "codex_transient_exhausted",
+        }
+        attempt_required = error_code in {
             "codex_timeout_exhausted",
             "codex_process_failed",
-            "answer_output_invalid",
-            "citation_link_construction_failed",
-            "answer_rendering_failed",
-        }:
+        } or (
+            candidate_count != 0
+            and error_code
+            in {
+                "answer_output_invalid",
+                "citation_link_construction_failed",
+                "answer_rendering_failed",
+            }
+        )
+        if legacy_transient_error or attempt_required:
             raise AnswerTerminalRequestInvalidV1(
-                "Answer terminal matrix requires an attempt"
+                "Answer terminal matrix rejects the no-attempt cause"
             )
         return
     if candidate_count is None or candidate_count <= 0:
@@ -527,7 +539,9 @@ def _validate_attempt_terminal_matrix_v1(
     if status == "succeeded":
         valid = last_failure is None
     elif status == "interrupted":
-        valid = last_failure in {None, "timeout", "interrupted"}
+        valid = last_failure in {None, "interrupted"} or (
+            last_failure == "timeout" and len(failure_classes) < 3
+        )
     elif error_code == "codex_timeout_exhausted":
         valid = last_failure == "timeout"
     elif error_code == "codex_process_failed":

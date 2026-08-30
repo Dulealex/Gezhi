@@ -120,6 +120,41 @@ def _request_with_terminal_matrix(
     )
 
 
+def _zero_candidate_request(
+    *,
+    error: dict[str, object],
+) -> terminal.AnswerPublishRequestV1:
+    base = _request_with_terminal_matrix(
+        status="failed",
+        error=error,
+        failure_classes=(),
+    )
+    retrieval_view_bytes = _canonical_json_file(
+        {
+            "candidate_count": 0,
+            "schema_version": "gezhi.retrieval_view.v1",
+        }
+    )
+    retrieval_audit_bytes = _canonical_json_file(
+        {
+            "retrieval_view_measurement": {
+                "byte_length": len(retrieval_view_bytes),
+                "limit_bytes": 262_144,
+                "sha256": hashlib.sha256(retrieval_view_bytes).hexdigest(),
+                "status": "within_limit",
+            },
+            "schema_version": "gezhi.retrieval_audit.v1",
+        }
+    )
+    return replace(
+        base,
+        retrieval_audit_bytes=retrieval_audit_bytes,
+        retrieval_view_bytes=retrieval_view_bytes,
+        prompt_bytes=None,
+        schema_bytes=None,
+    )
+
+
 def test_terminal_writer_rejects_success_with_a_timeout_attempt() -> None:
     request = _succeeded_request_with_timeout_attempt()
 
@@ -196,6 +231,7 @@ def test_terminal_writer_accepts_closed_attempt_matrices(
             ("process_error",),
         ),
         ("interrupted", None, ("process_error",)),
+        ("interrupted", None, ("timeout", "timeout", "timeout")),
         ("succeeded", None, (None, "timeout")),
         (
             "blocked",
@@ -207,15 +243,40 @@ def test_terminal_writer_accepts_closed_attempt_matrices(
             {"code": "codex_network_exhausted", "stage": "synthesis"},
             ("network",),
         ),
+        (
+            "blocked",
+            {"code": "codex_network_exhausted", "stage": "synthesis"},
+            (),
+        ),
+        (
+            "blocked",
+            {"code": "codex_rate_limit_exhausted", "stage": "synthesis"},
+            (),
+        ),
+        (
+            "blocked",
+            {"code": "codex_server_error_exhausted", "stage": "synthesis"},
+            (),
+        ),
+        (
+            "blocked",
+            {"code": "codex_transient_exhausted", "stage": "synthesis"},
+            (),
+        ),
     ),
     ids=(
         "exhaustion-with-success",
         "process-failure-with-timeout",
         "validation-with-process-error",
         "interrupt-with-process-error",
+        "interrupt-after-three-timeouts",
         "failure-after-success",
         "exhaustion-without-attempt",
         "legacy-writer-class",
+        "legacy-network-without-attempt",
+        "legacy-rate-limit-without-attempt",
+        "legacy-server-error-without-attempt",
+        "legacy-transient-without-attempt",
     ),
 )
 def test_terminal_writer_rejects_cross_field_attempt_mismatches(
@@ -234,3 +295,18 @@ def test_terminal_writer_rejects_cross_field_attempt_mismatches(
         match="terminal matrix",
     ):
         terminal._validate_request(request)
+
+
+@pytest.mark.parametrize(
+    "error",
+    (
+        {"code": "answer_output_invalid", "stage": "validation"},
+        {"code": "citation_link_construction_failed", "stage": "rendering"},
+        {"code": "answer_rendering_failed", "stage": "rendering"},
+    ),
+    ids=("validation", "citation-link", "rendering"),
+)
+def test_terminal_writer_accepts_zero_candidate_post_synthesis_failure(
+    error: dict[str, object],
+) -> None:
+    terminal._validate_request(_zero_candidate_request(error=error))
