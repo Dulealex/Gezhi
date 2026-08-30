@@ -11,9 +11,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Literal, TypeAlias
+from typing import Literal, TypeAlias, cast
 
 from gezhi._answer_terminal import (
+    AnswerAttemptPublishV1,
     AnswerCommitFailedV1,
     AnswerCommitIndeterminateV1,
     AnswerManifestFailedV1,
@@ -83,10 +84,6 @@ _GOVERNANCE_DISCLOSURE = (
 
 class _ProvenanceUnavailableV1(RuntimeError):
     pass
-
-
-class _NonZeroCandidatePathDeferredV1(RuntimeError):
-    """T21 owns the Candidate-backed Codex path."""
 
 
 def _canonical_json_file_v1(value: object) -> bytes:
@@ -298,11 +295,38 @@ def validate_knowledge_ask_report_v1(report: KnowledgeAskReportV1) -> None:
         answer_id = report.result["answer_id"]
         if type(answer_id) is not str or _ANSWER_ID.fullmatch(answer_id) is None:
             raise ValueError("Knowledge ask result identity is invalid")
-        if report.result["answer_output"] != _zero_candidate_answer_output_v1():
-            raise ValueError("Knowledge ask zero-candidate output is invalid")
+        answer_output = report.result["answer_output"]
+        if type(answer_output) is not dict:
+            raise ValueError("Knowledge ask AnswerOutput is invalid")
+        try:
+            from gezhi._knowledge_answerer import AnswerOutputV1
+
+            AnswerOutputV1.model_validate(answer_output, strict=True)
+        except (ImportError, ValueError) as error:
+            raise ValueError("Knowledge ask AnswerOutput is invalid") from error
         return
-    if report.result is not None or type(report.reason) is not str:
+    if type(report.reason) is not str:
         raise ValueError("Knowledge ask non-success presence is invalid")
+    committed_reasons = {
+        ("blocked", "retrieval_view_too_large"),
+        ("blocked", "codex_runtime_unavailable"),
+        ("failed", "codex_process_failed"),
+        ("failed", "answer_output_invalid"),
+        ("failed", "answer_rendering_failed"),
+        ("failed", "citation_link_construction_failed"),
+        ("failed", "synthesis_input_invalid"),
+    }
+    if report.result is not None:
+        if (
+            (report.outcome, report.reason) not in committed_reasons
+            or type(report.result) is not dict
+            or set(report.result) != {"answer_id", "answer_output"}
+            or type(report.result["answer_id"]) is not str
+            or _ANSWER_ID.fullmatch(report.result["answer_id"]) is None
+            or report.result["answer_output"] is not None
+        ):
+            raise ValueError("Knowledge ask committed stop receipt is invalid")
+        return
     if (report.outcome, report.reason) not in {
         ("blocked", "invalid_question"),
         ("blocked", "question_too_large"),
@@ -475,17 +499,83 @@ class KnowledgeAsksV1:
                 except RetrievalDataRootIntegrityLostV1:
                     return _failed_report_v1("data_root_integrity_lost")
                 if isinstance(retrieval, NonZeroCandidatesV1):
-                    raise _NonZeroCandidatePathDeferredV1(
-                        "Non-zero Candidate synthesis belongs to T21"
-                    )
-                if type(retrieval) is not ZeroCandidateRetrievalV1:
-                    raise TypeError("Knowledge retrieval verdict type is invalid")
+                    retrieval_audit_bytes = retrieval.retrieval_audit_bytes
+                    if retrieval.measured_retrieval_view.status == "too_large":
+                        terminal_status: KnowledgeAskOutcomeV1 = "blocked"
+                        terminal_error: dict[str, object] | None = {
+                            "code": "retrieval_view_too_large",
+                            "stage": "retrieval",
+                        }
+                        prompt_bytes = None
+                        schema_bytes = None
+                        attempts: tuple[AnswerAttemptPublishV1, ...] = ()
+                        answer_output = None
+                        answer_output_bytes = None
+                        answer_markdown_bytes = None
+                        retrieval_view_bytes = None
+                        del retrieval
+                    else:
+                        from gezhi._knowledge_answerer import (
+                            KnowledgeAnswererInputInvalidV1,
+                            answer_nonzero_v1,
+                        )
 
-                answer_output = _zero_candidate_answer_output_v1()
-                answer_output_bytes = _canonical_json_file_v1(answer_output)
-                answer_markdown_bytes = _zero_candidate_answer_markdown_v1(
-                    normalized.question
-                )
+                        canonical_root = root.inspection.canonical_path
+                        if canonical_root is None:
+                            return _failed_report_v1("data_root_integrity_lost")
+                        try:
+                            answerer = answer_nonzero_v1(
+                                retrieval,
+                                question_bytes=question_bytes,
+                                knowledge_root=Path(canonical_root),
+                                environ=(
+                                    os.environ.copy() if environ is None else environ
+                                ),
+                            )
+                        except KnowledgeAnswererInputInvalidV1:
+                            terminal_status = "failed"
+                            terminal_error = {
+                                "code": "synthesis_input_invalid",
+                                "stage": "synthesis",
+                            }
+                            prompt_bytes = None
+                            schema_bytes = None
+                            attempts = ()
+                            answer_output = None
+                            answer_output_bytes = None
+                            answer_markdown_bytes = None
+                        else:
+                            terminal_status = answerer.status
+                            terminal_error = answerer.error
+                            prompt_bytes = answerer.prompt_bytes
+                            schema_bytes = answerer.schema_bytes
+                            attempts = tuple(
+                                AnswerAttemptPublishV1(
+                                    record=attempt.record,
+                                    events_bytes=attempt.events_bytes,
+                                    final_message_bytes=attempt.final_message_bytes,
+                                )
+                                for attempt in answerer.attempts
+                            )
+                            answer_output = answerer.answer_output
+                            answer_output_bytes = answerer.answer_output_bytes
+                            answer_markdown_bytes = answerer.answer_markdown_bytes
+                        retrieval_view_bytes = retrieval.measured_retrieval_view.buffer
+                elif type(retrieval) is ZeroCandidateRetrievalV1:
+                    terminal_status = "succeeded"
+                    terminal_error = None
+                    prompt_bytes = None
+                    schema_bytes = None
+                    attempts = ()
+                    answer_output = _zero_candidate_answer_output_v1()
+                    answer_output_bytes = _canonical_json_file_v1(answer_output)
+                    answer_markdown_bytes = _zero_candidate_answer_markdown_v1(
+                        normalized.question
+                    )
+                    retrieval_view_bytes = retrieval.measured_retrieval_view.buffer
+                    retrieval_audit_bytes = retrieval.retrieval_audit_bytes
+                else:
+                    raise TypeError("Knowledge retrieval verdict type is invalid")
                 request = AnswerPublishRequestV1(
                     answer_id=answer_id,
                     started_at=started_at,
@@ -494,8 +584,13 @@ class KnowledgeAsksV1:
                     effective_config_bytes=effective_config_bytes,
                     question_bytes=question_bytes,
                     retrieval_query_bytes=retrieval_query_bytes,
-                    retrieval_audit_bytes=retrieval.retrieval_audit_bytes,
-                    retrieval_view_bytes=retrieval.measured_retrieval_view.buffer,
+                    retrieval_audit_bytes=retrieval_audit_bytes,
+                    retrieval_view_bytes=retrieval_view_bytes,
+                    status=terminal_status,
+                    error=terminal_error,
+                    prompt_bytes=prompt_bytes,
+                    schema_bytes=schema_bytes,
+                    attempts=attempts,
                     answer_output_bytes=answer_output_bytes,
                     answer_markdown_bytes=answer_markdown_bytes,
                 )
@@ -515,17 +610,30 @@ class KnowledgeAsksV1:
                     raise
                 if (
                     committed.answer_id != answer_id
+                    or committed.status != terminal_status
+                    or committed.error != terminal_error
                     or committed.answer_output_bytes != answer_output_bytes
                     or committed.answer_markdown_bytes != answer_markdown_bytes
                 ):
                     raise RuntimeError("Committed Answer proof differs")
+                if terminal_status == "succeeded":
+                    if answer_output is None:
+                        raise RuntimeError("Succeeded Answer output is absent")
+                    report_reason: str | None = None
+                    report_output: dict[str, object] | None = answer_output
+                else:
+                    if terminal_error is None:
+                        report_reason = "user_interrupted"
+                    else:
+                        report_reason = cast(str, terminal_error["code"])
+                    report_output = None
                 report = KnowledgeAskReportV1(
-                    outcome="succeeded",
+                    outcome=terminal_status,
                     result={
                         "answer_id": committed.answer_id,
-                        "answer_output": answer_output,
+                        "answer_output": report_output,
                     },
-                    reason=None,
+                    reason=report_reason,
                 )
                 return _seal_knowledge_ask_report_v1(
                     report,

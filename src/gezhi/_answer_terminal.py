@@ -36,7 +36,7 @@ _INT64_MAX = 9_223_372_036_854_775_807
 ANSWER_MANIFEST_MAX_BYTES = 65_536
 ANSWER_TERMINAL_MAX_BYTES = 56_623_104
 
-_ASSET_SPECS = (
+_ROOT_ASSET_SPECS = (
     (
         "effective_config.json",
         "schema_id",
@@ -63,6 +63,18 @@ _ASSET_SPECS = (
         262_144,
     ),
     (
+        "prompt.txt",
+        "media_type",
+        "text/plain; charset=utf-8",
+        262_144,
+    ),
+    (
+        "schema.json",
+        "media_type",
+        "application/schema+json",
+        262_144,
+    ),
+    (
         "answer_output.json",
         "schema_id",
         "gezhi.answer_output.v1",
@@ -75,6 +87,26 @@ _ASSET_SPECS = (
         524_288,
     ),
 )
+
+_ATTEMPT_EVENTS_CAP = 16_777_216
+_ATTEMPT_FINAL_CAP = 1_048_576
+_ERROR_MATRIX = {
+    "fts5_unavailable": ("blocked", "retrieval"),
+    "retrieval_view_too_large": ("blocked", "retrieval"),
+    "retrieval_query_failed": ("failed", "retrieval"),
+    "retrieval_materialization_failed": ("failed", "retrieval"),
+    "codex_runtime_unavailable": ("blocked", "synthesis"),
+    "codex_timeout_exhausted": ("blocked", "synthesis"),
+    "codex_network_exhausted": ("blocked", "synthesis"),
+    "codex_rate_limit_exhausted": ("blocked", "synthesis"),
+    "codex_server_error_exhausted": ("blocked", "synthesis"),
+    "codex_transient_exhausted": ("blocked", "synthesis"),
+    "synthesis_input_invalid": ("failed", "synthesis"),
+    "codex_process_failed": ("failed", "synthesis"),
+    "answer_output_invalid": ("failed", "validation"),
+    "citation_link_construction_failed": ("failed", "rendering"),
+    "answer_rendering_failed": ("failed", "rendering"),
+}
 
 _EXPECTED_EFFECTIVE_CONFIG = {
     "attempt_timeout_ms": 1_800_000,
@@ -133,6 +165,13 @@ class AnswerStagingScanV1:
 
 
 @dataclass(frozen=True, slots=True)
+class AnswerAttemptPublishV1:
+    record: Mapping[str, object]
+    events_bytes: bytes
+    final_message_bytes: bytes
+
+
+@dataclass(frozen=True, slots=True)
 class AnswerPublishRequestV1:
     """Caller-owned values; it intentionally contains no paths or proof."""
 
@@ -144,9 +183,14 @@ class AnswerPublishRequestV1:
     question_bytes: bytes
     retrieval_query_bytes: bytes
     retrieval_audit_bytes: bytes
-    retrieval_view_bytes: bytes
-    answer_output_bytes: bytes
-    answer_markdown_bytes: bytes
+    retrieval_view_bytes: bytes | None
+    status: Literal["succeeded", "blocked", "failed", "interrupted"] = "succeeded"
+    error: Mapping[str, object] | None = None
+    prompt_bytes: bytes | None = None
+    schema_bytes: bytes | None = None
+    attempts: tuple[AnswerAttemptPublishV1, ...] = ()
+    answer_output_bytes: bytes | None = None
+    answer_markdown_bytes: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,8 +199,10 @@ class CommittedAnswerProofV1:
 
     answer_id: str
     manifest_sha256: str
-    answer_output_bytes: bytes
-    answer_markdown_bytes: bytes
+    status: Literal["succeeded", "blocked", "failed", "interrupted"]
+    error: dict[str, object] | None
+    answer_output_bytes: bytes | None
+    answer_markdown_bytes: bytes | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,57 +431,271 @@ def _validate_provenance(value: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+def _validate_attempt_record_v1(record: Mapping[str, object]) -> dict[str, object]:
+    if type(record) is not dict or set(record) != {
+        "cached_input_tokens",
+        "elapsed_ms",
+        "exit_code",
+        "failure_class",
+        "finished_at",
+        "input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "started_at",
+        "usage_unavailable",
+    }:
+        raise AnswerTerminalRequestInvalidV1("Answer attempt record is not closed")
+    _validate_timestamp(record["started_at"])
+    _validate_timestamp(record["finished_at"])
+    elapsed_ms = record["elapsed_ms"]
+    exit_code = record["exit_code"]
+    failure_class = record["failure_class"]
+    usage_unavailable = record["usage_unavailable"]
+    if (
+        type(elapsed_ms) is not int
+        or not 0 <= elapsed_ms <= _INT64_MAX
+        or exit_code is not None
+        and (type(exit_code) is not int or not 0 <= exit_code <= 4_294_967_295)
+        or failure_class
+        not in {
+            None,
+            "timeout",
+            "network",
+            "rate_limit",
+            "server_error",
+            "runtime_unavailable",
+            "process_error",
+            "interrupted",
+        }
+        or type(usage_unavailable) is not bool
+    ):
+        raise AnswerTerminalRequestInvalidV1("Answer attempt scalar is invalid")
+    tokens = []
+    for name in (
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+    ):
+        value = record[name]
+        if value is not None and (
+            type(value) is not int or not 0 <= value <= _INT64_MAX
+        ):
+            raise AnswerTerminalRequestInvalidV1("Answer attempt usage is invalid")
+        tokens.append(value)
+    if usage_unavailable is not any(value is None for value in tokens):
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer attempt usage availability differs"
+        )
+    if failure_class is None and exit_code != 0:
+        raise AnswerTerminalRequestInvalidV1("Successful Answer attempt exit differs")
+    return dict(record)
+
+
+def _validate_utf8_text_asset_v1(payload: bytes, *, label: str) -> None:
+    if payload.startswith(b"\xef\xbb\xbf") or not payload.endswith(b"\n"):
+        raise AnswerTerminalRequestInvalidV1(f"{label} framing is invalid")
+    try:
+        if payload.decode("utf-8").encode("utf-8") != payload:
+            raise UnicodeError(f"{label} changed on round-trip")
+    except UnicodeError as error:
+        raise AnswerTerminalRequestInvalidV1(f"{label} is not strict UTF-8") from error
+
+
 def _request_assets(
     request: AnswerPublishRequestV1,
-) -> tuple[tuple[str, bytes, str, str, int], ...]:
-    payloads = (
-        request.effective_config_bytes,
-        request.question_bytes,
-        request.retrieval_query_bytes,
-        request.retrieval_audit_bytes,
-        request.retrieval_view_bytes,
-        request.answer_output_bytes,
-        request.answer_markdown_bytes,
-    )
+) -> tuple[
+    tuple[tuple[str, bytes, str, str, int], ...],
+    tuple[dict[str, object], ...],
+]:
+    if (request.prompt_bytes is None) is not (request.schema_bytes is None):
+        raise AnswerTerminalRequestInvalidV1("Answer prompt/Schema pair is partial")
+    if (request.answer_output_bytes is None) is not (
+        request.answer_markdown_bytes is None
+    ):
+        raise AnswerTerminalRequestInvalidV1("Answer result pair is partial")
+    payload_by_path: dict[str, bytes | None] = {
+        "effective_config.json": request.effective_config_bytes,
+        "question.json": request.question_bytes,
+        "retrieval_query.json": request.retrieval_query_bytes,
+        "retrieval_audit.json": request.retrieval_audit_bytes,
+        "retrieval_view.json": request.retrieval_view_bytes,
+        "prompt.txt": request.prompt_bytes,
+        "schema.json": request.schema_bytes,
+        "answer_output.json": request.answer_output_bytes,
+        "answer.md": request.answer_markdown_bytes,
+    }
     assets: list[tuple[str, bytes, str, str, int]] = []
-    for spec, payload in zip(_ASSET_SPECS, payloads, strict=True):
-        path, identity_key, identity_value, cap = spec
+    decoded: dict[str, dict[str, object]] = {}
+    for path, identity_key, identity_value, cap in _ROOT_ASSET_SPECS:
+        payload = payload_by_path[path]
+        if payload is None:
+            continue
         if type(payload) is not bytes or len(payload) > cap:
             raise AnswerTerminalRequestInvalidV1(
                 "Answer asset type or capacity is invalid"
             )
         if path.endswith(".json"):
-            decoded = _decode_canonical_json_asset(payload)
-            if decoded.get("schema_version") != identity_value:
+            document = _decode_canonical_json_asset(payload)
+            decoded[path] = document
+            if path == "schema.json":
+                if document.get("$id") != (
+                    "https://gezhi.local/schemas/answer-output-v1.schema.json"
+                ):
+                    raise AnswerTerminalRequestInvalidV1(
+                        "Answer Schema snapshot identity is invalid"
+                    )
+            elif document.get("schema_version") != identity_value:
                 raise AnswerTerminalRequestInvalidV1(
                     "Answer asset schema identity is invalid"
                 )
             if (
                 path == "effective_config.json"
-                and decoded != _EXPECTED_EFFECTIVE_CONFIG
+                and document != _EXPECTED_EFFECTIVE_CONFIG
             ):
                 raise AnswerTerminalRequestInvalidV1(
                     "Answer effective configuration is invalid"
                 )
         else:
-            if payload.startswith(b"\xef\xbb\xbf") or not payload.endswith(b"\n"):
-                raise AnswerTerminalRequestInvalidV1(
-                    "Answer Markdown framing is invalid"
-                )
-            try:
-                if payload.decode("utf-8").encode("utf-8") != payload:
-                    raise UnicodeError("Answer Markdown changed on round-trip")
-            except UnicodeError as error:
-                raise AnswerTerminalRequestInvalidV1(
-                    "Answer Markdown is not strict UTF-8"
-                ) from error
+            _validate_utf8_text_asset_v1(payload, label=path)
         assets.append((path, payload, identity_key, identity_value, cap))
-    return tuple(assets)
+
+    audit = decoded["retrieval_audit.json"]
+    measurement = audit.get("retrieval_view_measurement")
+    if type(measurement) is not dict:
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer Retrieval View measurement is invalid"
+        )
+    view = decoded.get("retrieval_view.json")
+    candidate_count: int | None = None
+    if request.retrieval_view_bytes is not None:
+        if view is None or type(view.get("candidate_count")) is not int:
+            raise AnswerTerminalRequestInvalidV1("Answer Retrieval View is invalid")
+        candidate_count = cast(int, view["candidate_count"])
+        if measurement != {
+            "byte_length": len(request.retrieval_view_bytes),
+            "limit_bytes": 262_144,
+            "sha256": hashlib.sha256(request.retrieval_view_bytes).hexdigest(),
+            "status": "within_limit",
+        }:
+            raise AnswerTerminalRequestInvalidV1(
+                "Answer Retrieval View measurement differs"
+            )
+    elif measurement.get("status") != "too_large":
+        raise AnswerTerminalRequestInvalidV1(
+            "Missing Retrieval View is not an over-limit branch"
+        )
+
+    if request.status == "succeeded":
+        if request.error is not None or request.answer_output_bytes is None:
+            raise AnswerTerminalRequestInvalidV1(
+                "Succeeded Answer terminal presence is invalid"
+            )
+        error: dict[str, object] | None = None
+    elif request.status in {"blocked", "failed"}:
+        if (
+            type(request.error) is not dict
+            or set(request.error) != {"code", "stage"}
+            or request.answer_output_bytes is not None
+        ):
+            raise AnswerTerminalRequestInvalidV1(
+                "Stopped Answer terminal presence is invalid"
+            )
+        code = request.error.get("code")
+        stage = request.error.get("stage")
+        if (
+            type(code) is not str
+            or type(stage) is not str
+            or _ERROR_MATRIX.get(code) != (request.status, stage)
+        ):
+            raise AnswerTerminalRequestInvalidV1("Answer terminal error is invalid")
+        error = dict(request.error)
+    elif request.status == "interrupted":
+        if request.error is not None or request.answer_output_bytes is not None:
+            raise AnswerTerminalRequestInvalidV1(
+                "Interrupted Answer terminal presence is invalid"
+            )
+        error = None
+    else:
+        raise AnswerTerminalRequestInvalidV1("Answer terminal status is invalid")
+
+    has_call_pair = request.prompt_bytes is not None
+    if has_call_pair and (candidate_count is None or not 1 <= candidate_count <= 12):
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer synthesis pair has no non-zero Retrieval View"
+        )
+    if request.attempts and not has_call_pair:
+        raise AnswerTerminalRequestInvalidV1("Answer attempts have no synthesis pair")
+    if not 0 <= len(request.attempts) <= 3:
+        raise AnswerTerminalRequestInvalidV1("Answer attempt count is invalid")
+    if request.status == "succeeded" and (
+        candidate_count == 0
+        and (has_call_pair or request.attempts)
+        or candidate_count is not None
+        and candidate_count > 0
+        and (not has_call_pair or not request.attempts)
+    ):
+        raise AnswerTerminalRequestInvalidV1(
+            "Succeeded Answer synthesis presence is invalid"
+        )
+    if (
+        error is not None
+        and error.get("code") == "retrieval_view_too_large"
+        and (
+            request.retrieval_view_bytes is not None
+            or has_call_pair
+            or request.attempts
+            or measurement.get("status") != "too_large"
+        )
+    ):
+        raise AnswerTerminalRequestInvalidV1(
+            "Over-limit Retrieval View terminal presence is invalid"
+        )
+
+    attempt_records: list[dict[str, object]] = []
+    for ordinal, attempt in enumerate(request.attempts, start=1):
+        if type(attempt) is not AnswerAttemptPublishV1:
+            raise AnswerTerminalRequestInvalidV1("Answer attempt type is invalid")
+        record = _validate_attempt_record_v1(attempt.record)
+        if (
+            type(attempt.events_bytes) is not bytes
+            or len(attempt.events_bytes) > _ATTEMPT_EVENTS_CAP
+            or type(attempt.final_message_bytes) is not bytes
+            or len(attempt.final_message_bytes) > _ATTEMPT_FINAL_CAP
+        ):
+            raise AnswerTerminalRequestInvalidV1(
+                "Answer attempt capture capacity is invalid"
+            )
+        prefix = f"attempts/{ordinal:02d}"
+        assets.extend(
+            (
+                (
+                    prefix + "/events.jsonl",
+                    attempt.events_bytes,
+                    "media_type",
+                    "application/octet-stream",
+                    _ATTEMPT_EVENTS_CAP,
+                ),
+                (
+                    prefix + "/final_message.txt",
+                    attempt.final_message_bytes,
+                    "media_type",
+                    "application/octet-stream",
+                    _ATTEMPT_FINAL_CAP,
+                ),
+            )
+        )
+        attempt_records.append(record)
+    return tuple(assets), tuple(attempt_records)
 
 
 def _validate_request(
     request: AnswerPublishRequestV1,
-) -> tuple[dict[str, object], tuple[tuple[str, bytes, str, str, int], ...]]:
+) -> tuple[
+    dict[str, object],
+    tuple[tuple[str, bytes, str, str, int], ...],
+    tuple[dict[str, object], ...],
+]:
     if type(request) is not AnswerPublishRequestV1:
         raise TypeError("Answer publish request type is invalid")
     if (
@@ -451,7 +711,8 @@ def _validate_request(
     ):
         raise AnswerTerminalRequestInvalidV1("Answer monotonic start is invalid")
     provenance = _validate_provenance(request.provenance)
-    return provenance, _request_assets(request)
+    assets, attempts = _request_assets(request)
+    return provenance, assets, attempts
 
 
 def _ensure_child_directory(
@@ -507,6 +768,22 @@ def _install_assets(
     assets: tuple[tuple[str, bytes, str, str, int], ...],
 ) -> tuple[_VerifiedAssetV1, ...]:
     installed: list[_VerifiedAssetV1] = []
+    attempt_ordinals = tuple(
+        dict.fromkeys(
+            path.split("/")[1]
+            for path, _payload, _key, _value, _cap in assets
+            if path.startswith("attempts/")
+        )
+    )
+    if attempt_ordinals:
+        try:
+            (stage_path / "attempts").mkdir()
+            for ordinal in attempt_ordinals:
+                (stage_path / "attempts" / ordinal).mkdir()
+        except OSError as error:
+            raise AnswerStagingFailedV1(
+                "Answer attempt directories could not be formed"
+            ) from error
     for path, payload, identity_key, identity_value, cap in assets:
         _root_checkpoint(root)
         target = stage_path / path
@@ -526,13 +803,30 @@ def _install_assets(
     try:
         with open_validated_data_root_v1(str(stage_path)) as stage:
             names = stage.relative_entry_names_v1()
-    except (DataRootOpenErrorV1, OSError) as error:
+        root_names = tuple(
+            sorted(
+                {"attempts" if "/" in item.path else item.path for item in installed}
+            )
+        )
+        if names != root_names:
+            raise ValueError("Answer root asset set is not closed")
+        if attempt_ordinals:
+            with open_validated_data_root_v1(str(stage_path / "attempts")) as nested:
+                if nested.relative_entry_names_v1() != tuple(sorted(attempt_ordinals)):
+                    raise ValueError("Answer attempt ordinal set is not closed")
+            for ordinal in attempt_ordinals:
+                with open_validated_data_root_v1(
+                    str(stage_path / "attempts" / ordinal)
+                ) as attempt_root:
+                    if attempt_root.relative_entry_names_v1() != (
+                        "events.jsonl",
+                        "final_message.txt",
+                    ):
+                        raise ValueError("Answer attempt asset pair is not closed")
+    except (DataRootOpenErrorV1, OSError, ValueError) as error:
         raise AnswerStagingFailedV1(
             "Answer staging closure could not be proved"
         ) from error
-    expected = tuple(sorted(item.path for item in installed))
-    if names != expected:
-        raise AnswerStagingFailedV1("Answer staging asset set is not closed")
     return tuple(installed)
 
 
@@ -540,6 +834,7 @@ def _manifest_bytes(
     request: AnswerPublishRequestV1,
     provenance: dict[str, object],
     assets: tuple[_VerifiedAssetV1, ...],
+    attempts: tuple[dict[str, object], ...],
 ) -> bytes:
     try:
         finished_at = _utc_now_milliseconds_v1()
@@ -559,22 +854,30 @@ def _manifest_bytes(
         (asset.manifest_item() for asset in assets),
         key=lambda item: cast(str, item["path"]).encode("utf-8"),
     )
+    usage_totals: dict[str, int | None] = {}
+    for name in (
+        "cached_input_tokens",
+        "input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+    ):
+        values = [attempt[name] for attempt in attempts]
+        if any(type(value) is not int for value in values):
+            usage_totals[name] = None
+            continue
+        total = sum(cast(int, value) for value in values)
+        usage_totals[name] = total if total <= _INT64_MAX else None
     manifest = {
         "schema_version": "gezhi.answer_manifest.v1",
         "answer_id": request.answer_id,
-        "status": "succeeded",
-        "error": None,
+        "status": request.status,
+        "error": None if request.error is None else dict(request.error),
         "started_at": request.started_at,
         "finished_at": finished_at,
         "elapsed_ms": elapsed_ms,
         "provenance": provenance,
-        "attempts": [],
-        "usage_totals": {
-            "cached_input_tokens": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "reasoning_output_tokens": 0,
-        },
+        "attempts": list(attempts),
+        "usage_totals": usage_totals,
         "assets": asset_items,
     }
     try:
@@ -625,7 +928,12 @@ def _install_and_validate_manifest(
         raise AnswerManifestFailedV1(
             "Answer terminal tree closure could not be proved"
         ) from error
-    expected_names = tuple(sorted((*[asset.path for asset in assets], "manifest.json")))
+    expected_names = tuple(
+        sorted(
+            {"attempts" if "/" in asset.path else asset.path for asset in assets}
+            | {"manifest.json"}
+        )
+    )
     if names != expected_names:
         raise AnswerManifestFailedV1(
             "Answer terminal tree contains an unexpected entry"
@@ -661,10 +969,10 @@ def publish_answer_v1(
     ownership: WriterOwnershipV1,
     request: AnswerPublishRequestV1,
 ) -> CommittedAnswerProofV1:
-    """Create, validate, and non-replacingly publish one zero-attempt Answer."""
+    """Create, validate, and non-replacingly publish one terminal Answer."""
 
     _assert_writer_ownership(root, ownership)
-    provenance, request_assets = _validate_request(request)
+    provenance, request_assets, attempt_records = _validate_request(request)
     root_path_text, root_identity = _root_facts(root)
     root_path = Path(root_path_text)
     _root_checkpoint(root)
@@ -710,7 +1018,12 @@ def publish_answer_v1(
         _root_checkpoint(root)
         raise
     try:
-        manifest_bytes = _manifest_bytes(request, provenance, installed)
+        manifest_bytes = _manifest_bytes(
+            request,
+            provenance,
+            installed,
+            attempt_records,
+        )
         _install_and_validate_manifest(root, stage_path, manifest_bytes, installed)
     except AnswerManifestFailedV1:
         _root_checkpoint(root)
@@ -754,6 +1067,8 @@ def publish_answer_v1(
     return CommittedAnswerProofV1(
         answer_id=request.answer_id,
         manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+        status=request.status,
+        error=None if request.error is None else dict(request.error),
         answer_output_bytes=request.answer_output_bytes,
         answer_markdown_bytes=request.answer_markdown_bytes,
     )
@@ -762,6 +1077,7 @@ def publish_answer_v1(
 __all__ = [
     "ANSWER_MANIFEST_MAX_BYTES",
     "ANSWER_TERMINAL_MAX_BYTES",
+    "AnswerAttemptPublishV1",
     "AnswerCommitFailedV1",
     "AnswerCommitIndeterminateV1",
     "AnswerManifestFailedV1",
