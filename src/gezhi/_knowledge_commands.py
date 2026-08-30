@@ -80,6 +80,46 @@ _ASK_PRIMARY = {
         "无法建立 Knowledge Answer 单写者协调",
         "运行 gezhi status 观察 Knowledge 状态（status 不会修复），在外部恢复 Windows 单写者协调后重试",
     ),
+    "retrieval_view_too_large": (
+        "knowledge.ask.retrieval_view_too_large.v1",
+        "检索视图超过 262144 字节上限",
+        "使用更具体的问题重新提问；保留 Answer ID 作为本次超限审计",
+    ),
+    "codex_runtime_unavailable": (
+        "knowledge.ask.codex_runtime_unavailable.v1",
+        "冻结的 Codex CLI 运行能力不可用",
+        "运行 gezhi doctor 检查项目 Codex CLI 与登录能力，恢复后重新提问",
+    ),
+    "codex_timeout_exhausted": (
+        "knowledge.ask.codex_timeout_exhausted.v1",
+        "Codex 回答尝试已耗尽超时预算",
+        "稍后重新提问；若持续发生，运行 gezhi doctor 检查 Codex 环境能力",
+    ),
+    "synthesis_input_invalid": (
+        "knowledge.ask.synthesis_input_invalid.v1",
+        "Codex 回答输入包未通过本地验证",
+        "运行 gezhi status 观察 Knowledge 与 Answer 整体状态（status 不会修复），保留 Answer ID 并检查本地输入形成",
+    ),
+    "codex_process_failed": (
+        "knowledge.ask.codex_process_failed.v1",
+        "Codex 子进程或捕获链失败",
+        "先运行 gezhi status 观察 Knowledge 与 Answer 整体状态（status 不会修复）；必要时运行 gezhi doctor 检查 Codex 环境能力",
+    ),
+    "answer_output_invalid": (
+        "knowledge.ask.answer_output_invalid.v1",
+        "Codex 回答未通过结构、引用或状态校验",
+        "重新表述问题后提问；若持续发生，运行 gezhi status 观察 Knowledge 与 Answer 整体状态（status 不会修复）",
+    ),
+    "citation_link_construction_failed": (
+        "knowledge.ask.citation_link_construction_failed.v1",
+        "来源标识符无法形成安全引用链接",
+        "运行 gezhi status 观察整体 Work 与 Knowledge 状态（status 不会修复），在外部修正 DOI 或 arXiv 身份后重新提问",
+    ),
+    "answer_rendering_failed": (
+        "knowledge.ask.answer_rendering_failed.v1",
+        "可读 Answer 未能确定性渲染",
+        "运行 gezhi status 观察 Knowledge 与 Answer 整体状态（status 不会修复），保留 Answer ID 并检查确定性渲染",
+    ),
     "pre_answer_formation_failed": (
         "knowledge.ask.pre_answer_formation_failed.v1",
         "Answer 身份建立前的本地审计对象形成失败",
@@ -585,7 +625,15 @@ def _knowledge_ask_human_buffer_v1(
             "failed": "Knowledge ask：失败",
             "interrupted": "Knowledge ask：已中断",
         }[report.outcome]
-        payload = (f"{heading}\n原因：{reason}\n下一步：{next_step}\n").encode()
+        answer_line = ""
+        if report.result is not None:
+            answer_id = report.result["answer_id"]
+            if type(answer_id) is not str:
+                raise TypeError("Knowledge ask Human Answer ID is invalid")
+            answer_line = f"Answer ID：{answer_id}\n"
+        payload = (
+            f"{heading}\n{answer_line}原因：{reason}\n下一步：{next_step}\n"
+        ).encode()
     if len(payload) > _ASK_HUMAN_OUTPUT_CAP:
         raise ValueError("Knowledge ask Human output exceeds its byte limit")
     return payload

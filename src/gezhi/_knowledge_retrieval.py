@@ -99,12 +99,15 @@ class ZeroCandidateRetrievalV1:
 
 @dataclass(frozen=True, slots=True)
 class NonZeroCandidatesV1:
-    """A T21 hand-off verdict; T20 must not publish an approximate zero Answer."""
+    """A closed, measured non-zero retrieval package for the Answerer."""
 
     registry_snapshot_sha256: str
     selected_candidate_ids: tuple[str, ...]
     trigram_match_count: int
     unicode61_match_count: int
+    measured_retrieval_view: MeasuredRetrievalViewV1
+    retrieval_audit: dict[str, object]
+    retrieval_audit_bytes: bytes
 
 
 KnowledgeRetrievalResultV1: TypeAlias = ZeroCandidateRetrievalV1 | NonZeroCandidatesV1
@@ -115,6 +118,25 @@ class _BranchHitV1:
     candidate_id: str
     rank: int
     bm25_float64_hex: str
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateSnapshotV1:
+    identity: dict[str, object]
+    candidate: dict[str, object]
+    citation: dict[str, object]
+    descriptor_snapshots: list[object]
+    evidence_snapshots: list[object]
+
+
+@dataclass(frozen=True, slots=True)
+class _FinalSelectionV1:
+    candidate_id: str
+    final_rank: int
+    trigram_rank: int | None
+    unicode61_rank: int | None
+    rrf_numerator: int
+    rrf_denominator: int
 
 
 def _is_hash_v1(value: object) -> TypeGuard[str]:
@@ -348,7 +370,7 @@ def _projection_fields_v1(
 def _snapshot_entry_v1(
     connection: sqlite3.Connection,
     row: tuple[object, ...],
-) -> dict[str, object]:
+) -> _CandidateSnapshotV1:
     if len(row) != 17:
         raise RetrievalMaterializationFailedV1(
             "Candidate snapshot row shape is invalid"
@@ -476,12 +498,18 @@ def _snapshot_entry_v1(
     search_projection_sha256 = hashlib.sha256(
         canonical_json_bytes_v1(projection)
     ).hexdigest()
-    return {
-        "candidate_id": candidate_id,
-        "payload_sha256": payload_sha256,
-        "review_revision": review_revision,
-        "search_projection_sha256": search_projection_sha256,
-    }
+    return _CandidateSnapshotV1(
+        identity={
+            "candidate_id": candidate_id,
+            "payload_sha256": payload_sha256,
+            "review_revision": review_revision,
+            "search_projection_sha256": search_projection_sha256,
+        },
+        candidate=candidate,
+        citation=citation,
+        descriptor_snapshots=descriptor_snapshots,
+        evidence_snapshots=evidence_snapshots,
+    )
 
 
 def _registry_snapshot_sha256_v1(connection: sqlite3.Connection) -> str:
@@ -512,7 +540,8 @@ def _registry_snapshot_sha256_v1(connection: sqlite3.Connection) -> str:
         try:
             for raw_row in cursor:
                 row = cast(tuple[object, ...], raw_row)
-                entry = _snapshot_entry_v1(connection, row)
+                snapshot = _snapshot_entry_v1(connection, row)
+                entry = snapshot.identity
                 candidate_id = cast(str, entry["candidate_id"])
                 if previous_candidate_id is not None and previous_candidate_id.encode(
                     "ascii"
@@ -537,6 +566,58 @@ def _registry_snapshot_sha256_v1(connection: sqlite3.Connection) -> str:
         b'],"schema_version":"gezhi.registry_retrieval_snapshot_identity.v1"}'
     )
     return digest.hexdigest()
+
+
+def _candidate_snapshot_v1(
+    connection: sqlite3.Connection,
+    candidate_id: str,
+) -> _CandidateSnapshotV1:
+    try:
+        rows = connection.execute(
+            """
+            SELECT content.candidate_id, content.payload_sha256,
+                   content.candidate_json, content.citation_json,
+                   content.descriptor_snapshots_json,
+                   content.evidence_snapshots_json,
+                   content.content_manifest_sha256,
+                   content.content_candidates_sha256,
+                   content.promotion_status, current.review_revision,
+                   current.review_status, current.intake_status,
+                   current.status_handoff_id, content.work_id,
+                   content.source_id, content.source_sha256,
+                   content.canonical_content_sha256
+            FROM candidate_content AS content
+            JOIN candidate_current AS current USING(candidate_id)
+            WHERE content.candidate_id = ?
+            """,
+            (candidate_id,),
+        ).fetchall()
+    except sqlite3.Error as error:
+        raise RetrievalMaterializationFailedV1(
+            "Selected Candidate snapshot cannot be read"
+        ) from error
+    if len(rows) != 1 or type(rows[0]) is not tuple:
+        raise RetrievalMaterializationFailedV1(
+            "Selected Candidate snapshot is not singular"
+        )
+    return _snapshot_entry_v1(connection, cast(tuple[object, ...], rows[0]))
+
+
+def _snapshot_identity_map_v1(
+    connection: sqlite3.Connection,
+    candidate_ids: tuple[str, ...],
+) -> dict[str, _CandidateSnapshotV1]:
+    snapshots: dict[str, _CandidateSnapshotV1] = {}
+    for candidate_id in candidate_ids:
+        if candidate_id in snapshots:
+            continue
+        snapshot = _candidate_snapshot_v1(connection, candidate_id)
+        if snapshot.identity.get("candidate_id") != candidate_id:
+            raise RetrievalMaterializationFailedV1(
+                "Selected Candidate snapshot identity differs"
+            )
+        snapshots[candidate_id] = snapshot
+    return snapshots
 
 
 def _branch_hits_v1(
@@ -603,19 +684,181 @@ def _branch_hits_v1(
 def _rank_candidates_v1(
     unicode_hits: tuple[_BranchHitV1, ...],
     trigram_hits: tuple[_BranchHitV1, ...],
-) -> tuple[str, ...]:
+) -> tuple[_FinalSelectionV1, ...]:
     scores: dict[str, Fraction] = {}
+    unicode_ranks = {hit.candidate_id: hit.rank for hit in unicode_hits}
+    trigram_ranks = {hit.candidate_id: hit.rank for hit in trigram_hits}
     for hits in (unicode_hits, trigram_hits):
         for hit in hits:
             scores[hit.candidate_id] = scores.get(
                 hit.candidate_id, Fraction()
             ) + Fraction(1, 12 + hit.rank)
+    ordered = sorted(
+        scores.items(),
+        key=lambda item: (-item[1], item[0].encode("ascii")),
+    )[:12]
     return tuple(
-        candidate_id
-        for candidate_id, _score in sorted(
-            scores.items(),
-            key=lambda item: (-item[1], item[0].encode("ascii")),
-        )[:12]
+        _FinalSelectionV1(
+            candidate_id=candidate_id,
+            final_rank=final_rank,
+            trigram_rank=trigram_ranks.get(candidate_id),
+            unicode61_rank=unicode_ranks.get(candidate_id),
+            rrf_numerator=score.numerator,
+            rrf_denominator=score.denominator,
+        )
+        for final_rank, (candidate_id, score) in enumerate(ordered, start=1)
+    )
+
+
+def _branch_audit_items_v1(
+    hits: tuple[_BranchHitV1, ...],
+    snapshots: dict[str, _CandidateSnapshotV1],
+) -> list[dict[str, object]]:
+    items: list[dict[str, object]] = []
+    for hit in hits:
+        try:
+            identity = snapshots[hit.candidate_id].identity
+        except KeyError as error:
+            raise RetrievalMaterializationFailedV1(
+                "Retrieval branch identity is missing"
+            ) from error
+        items.append(
+            {
+                "bm25_float64_hex": hit.bm25_float64_hex,
+                "candidate_id": identity["candidate_id"],
+                "payload_sha256": identity["payload_sha256"],
+                "rank": hit.rank,
+                "review_revision": identity["review_revision"],
+                "search_projection_sha256": identity["search_projection_sha256"],
+            }
+        )
+    return items
+
+
+def _final_audit_items_v1(
+    selected: tuple[_FinalSelectionV1, ...],
+    snapshots: dict[str, _CandidateSnapshotV1],
+) -> list[dict[str, object]]:
+    items: list[dict[str, object]] = []
+    for selection in selected:
+        try:
+            identity = snapshots[selection.candidate_id].identity
+        except KeyError as error:
+            raise RetrievalMaterializationFailedV1(
+                "Final retrieval identity is missing"
+            ) from error
+        items.append(
+            {
+                "candidate_id": identity["candidate_id"],
+                "final_rank": selection.final_rank,
+                "payload_sha256": identity["payload_sha256"],
+                "review_revision": identity["review_revision"],
+                "rrf_denominator": selection.rrf_denominator,
+                "rrf_numerator": selection.rrf_numerator,
+                "search_projection_sha256": identity["search_projection_sha256"],
+                "trigram_rank": selection.trigram_rank,
+                "unicode61_rank": selection.unicode61_rank,
+            }
+        )
+    return items
+
+
+def _nonzero_candidate_result_v1(
+    connection: sqlite3.Connection,
+    *,
+    search_text: SearchTextV1,
+    question_asset_sha256: str,
+    retrieval_query_asset_sha256: str,
+    registry_snapshot_sha256: str,
+    unicode_hits: tuple[_BranchHitV1, ...],
+    trigram_hits: tuple[_BranchHitV1, ...],
+    selected: tuple[_FinalSelectionV1, ...],
+) -> NonZeroCandidatesV1:
+    all_candidate_ids = tuple(
+        dict.fromkeys(
+            (
+                *(hit.candidate_id for hit in trigram_hits),
+                *(hit.candidate_id for hit in unicode_hits),
+            )
+        )
+    )
+    snapshots = _snapshot_identity_map_v1(connection, all_candidate_ids)
+    view_items: list[dict[str, object]] = []
+    for selection in selected:
+        try:
+            snapshot = snapshots[selection.candidate_id]
+        except KeyError as error:
+            raise RetrievalMaterializationFailedV1(
+                "Selected Candidate material is missing"
+            ) from error
+        view_items.append(
+            {
+                "candidate": snapshot.candidate,
+                "citation": snapshot.citation,
+                "descriptor_snapshots": snapshot.descriptor_snapshots,
+                "evidence_snapshots": snapshot.evidence_snapshots,
+                "governance": {
+                    "intake_status": "active",
+                    "promotion_status": "not_promoted",
+                    "review_status": "accepted",
+                },
+                "rank": selection.final_rank,
+            }
+        )
+    view: dict[str, object] = {
+        "answer_kind": "candidate_backed",
+        "candidate_count": len(view_items),
+        "items": view_items,
+        "schema_version": _VIEW_SCHEMA_VERSION,
+    }
+    view_buffer = _canonical_json_file_v1(view)
+    measured = MeasuredRetrievalViewV1(
+        value=view,
+        buffer=view_buffer,
+        byte_length=len(view_buffer),
+        sha256=hashlib.sha256(view_buffer).hexdigest(),
+        status=(
+            "within_limit" if len(view_buffer) <= _VIEW_LIMIT_BYTES else "too_large"
+        ),
+    )
+    audit: dict[str, object] = {
+        "algorithm_version": _ALGORITHM_VERSION,
+        "branch_results": {
+            "trigram": _branch_audit_items_v1(trigram_hits, snapshots),
+            "unicode61": _branch_audit_items_v1(unicode_hits, snapshots),
+        },
+        "final_selection": _final_audit_items_v1(selected, snapshots),
+        "query_atoms": {
+            "trigram": list(search_text.trigram_atoms),
+            "unicode61": list(search_text.unicode61_atoms),
+        },
+        "question_asset_sha256": question_asset_sha256,
+        "registry_snapshot_sha256": registry_snapshot_sha256,
+        "retrieval_query_asset_sha256": retrieval_query_asset_sha256,
+        "retrieval_view_measurement": {
+            "byte_length": measured.byte_length,
+            "limit_bytes": _VIEW_LIMIT_BYTES,
+            "sha256": measured.sha256,
+            "status": measured.status,
+        },
+        "schema_version": _AUDIT_SCHEMA_VERSION,
+    }
+    audit_bytes = _canonical_json_file_v1(audit)
+    if len(audit_bytes) > _AUDIT_LIMIT_BYTES:
+        raise RetrievalMaterializationFailedV1("Retrieval Audit exceeds its byte limit")
+    selected_candidate_ids = tuple(item.candidate_id for item in selected)
+    if not 1 <= len(selected_candidate_ids) <= 12:
+        raise RetrievalMaterializationFailedV1(
+            "Non-zero Retrieval View candidate count is invalid"
+        )
+    return NonZeroCandidatesV1(
+        registry_snapshot_sha256=registry_snapshot_sha256,
+        selected_candidate_ids=selected_candidate_ids,
+        trigram_match_count=len(trigram_hits),
+        unicode61_match_count=len(unicode_hits),
+        measured_retrieval_view=measured,
+        retrieval_audit=audit,
+        retrieval_audit_bytes=audit_bytes,
     )
 
 
@@ -725,11 +968,15 @@ def _retrieve_v1(
             )
             selected = _rank_candidates_v1(unicode_hits, trigram_hits)
             if selected:
-                result = NonZeroCandidatesV1(
+                result = _nonzero_candidate_result_v1(
+                    connection,
+                    search_text=search_text,
+                    question_asset_sha256=question_asset_sha256,
+                    retrieval_query_asset_sha256=retrieval_query_asset_sha256,
                     registry_snapshot_sha256=registry_snapshot_sha256,
-                    selected_candidate_ids=selected,
-                    trigram_match_count=len(trigram_hits),
-                    unicode61_match_count=len(unicode_hits),
+                    unicode_hits=unicode_hits,
+                    trigram_hits=trigram_hits,
+                    selected=selected,
                 )
             else:
                 result = _zero_candidate_result_v1(
