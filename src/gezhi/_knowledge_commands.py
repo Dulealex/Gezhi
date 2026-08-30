@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import json
-import msvcrt
 import os
+from dataclasses import dataclass
 
-from gezhi._knowledge_read import KnowledgeReadReportV1, KnowledgeReadsV1
-from gezhi._knowledge_registry import canonical_json_bytes_v1
+from gezhi._knowledge_read import (
+    KnowledgeReadReportV1,
+    KnowledgeReadsV1,
+    validate_knowledge_read_report_v1,
+)
+from gezhi._presentation import (
+    CliJsonOutputTooLargeV1,
+    cli_json_buffer_v1,
+    write_binary_buffer_v1,
+)
 
 _OUTPUT_CAP = 1_048_576
 _WRITE_CHUNK = 65_536
@@ -16,48 +24,6 @@ _DISCLOSURE = (
 _WITHDRAWN_WARNING = (
     "注意：该 Candidate 已撤回，不参与 search 或 ask 检索；以下内容仅供历史审计。"
 )
-
-_REASONS = {
-    "knowledge.search": frozenset(
-        {
-            "invalid_query",
-            "query_too_large",
-            "query_too_complex",
-            "configuration_invalid",
-            "configuration_incompatible",
-            "data_root_unavailable",
-            "data_root_unsafe",
-            "data_root_identity_unavailable",
-            "registry_unavailable",
-            "registry_incompatible",
-            "fts5_unavailable",
-            "result_too_large",
-            "data_root_integrity_lost",
-            "registry_corrupt",
-            "retrieval_query_failed",
-            "retrieval_materialization_failed",
-        }
-    ),
-    "knowledge.show": frozenset(
-        {
-            "invalid_candidate_id",
-            "configuration_invalid",
-            "configuration_incompatible",
-            "data_root_unavailable",
-            "data_root_unsafe",
-            "data_root_identity_unavailable",
-            "registry_unavailable",
-            "registry_incompatible",
-            "candidate_not_found",
-            "result_too_large",
-            "data_root_integrity_lost",
-            "registry_corrupt",
-            "registry_read_failed",
-            "candidate_corrupt",
-            "evidence_corrupt",
-        }
-    ),
-}
 
 _HUMAN_DIAGNOSTICS = {
     "invalid_query": "搜索内容无效；请提供包含可检索文字的查询。",
@@ -140,12 +106,11 @@ _LABELS = {
 
 
 def _diagnostics_v1(report: KnowledgeReadReportV1) -> list[dict[str, object]]:
+    validate_knowledge_read_report_v1(report)
     if report.outcome == "succeeded":
-        if report.reason is not None:
-            raise ValueError("successful Knowledge read has a reason")
         return []
-    if report.reason is None or report.reason not in _REASONS[report.command]:
-        raise ValueError("unsuccessful Knowledge read has an invalid reason")
+    if report.reason is None:
+        raise ValueError("unsuccessful Knowledge read has no reason")
     return [
         {
             "code": f"{report.command}.{report.reason}.v1",
@@ -154,45 +119,51 @@ def _diagnostics_v1(report: KnowledgeReadReportV1) -> list[dict[str, object]]:
     ]
 
 
-def _envelope_v1(report: KnowledgeReadReportV1) -> dict[str, object]:
+def _json_buffer_v1(report: KnowledgeReadReportV1) -> bytes:
     diagnostics = _diagnostics_v1(report)
     if report.outcome == "succeeded":
         if report.result is None or diagnostics:
             raise ValueError("successful Knowledge read envelope is invalid")
     elif report.result is not None or len(diagnostics) != 1:
         raise ValueError("unsuccessful Knowledge read envelope is invalid")
-    return {
-        "command": report.command,
-        "diagnostics": diagnostics,
-        "outcome": report.outcome,
-        "result": report.result,
-        "schema_version": "gezhi.cli_result.v1",
-    }
-
-
-def _json_buffer_without_cap_v1(report: KnowledgeReadReportV1) -> bytes:
-    return canonical_json_bytes_v1(_envelope_v1(report)) + b"\n"
-
-
-def _apply_result_cap_v1(report: KnowledgeReadReportV1) -> KnowledgeReadReportV1:
-    if report.outcome != "succeeded":
-        return report
-    if len(_json_buffer_without_cap_v1(report)) <= _OUTPUT_CAP:
-        return report
-    return KnowledgeReadReportV1(
+    return cli_json_buffer_v1(
         command=report.command,
-        outcome="blocked",
-        result=None,
-        reason="result_too_large",
+        outcome=report.outcome,
+        result=report.result,
+        diagnostics=diagnostics,
+        output_cap=_OUTPUT_CAP,
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedKnowledgeReadV1:
+    report: KnowledgeReadReportV1
+    json_buffer: bytes
+
+
+def _prepare_knowledge_read_v1(
+    report: KnowledgeReadReportV1,
+) -> _PreparedKnowledgeReadV1:
+    try:
+        json_buffer = _json_buffer_v1(report)
+    except CliJsonOutputTooLargeV1:
+        if report.outcome != "succeeded":
+            raise
+        prepared = KnowledgeReadReportV1(
+            command=report.command,
+            outcome="blocked",
+            result=None,
+            reason="result_too_large",
+        )
+        return _PreparedKnowledgeReadV1(
+            report=prepared,
+            json_buffer=_json_buffer_v1(prepared),
+        )
+    return _PreparedKnowledgeReadV1(report=report, json_buffer=json_buffer)
+
+
 def build_knowledge_read_json_buffer_v1(report: KnowledgeReadReportV1) -> bytes:
-    prepared = _apply_result_cap_v1(report)
-    buffer = _json_buffer_without_cap_v1(prepared)
-    if len(buffer) > _OUTPUT_CAP:
-        raise ValueError("Knowledge read diagnostic exceeds the output cap")
-    return buffer
+    return _prepare_knowledge_read_v1(report).json_buffer
 
 
 def _scalar_token_v1(value: object) -> str:
@@ -252,18 +223,17 @@ def _human_container_lines_v1(value: object, *, depth: int) -> list[str]:
     raise TypeError("HumanTree container is invalid")
 
 
-def build_knowledge_read_human_buffer_v1(report: KnowledgeReadReportV1) -> bytes:
-    prepared = _apply_result_cap_v1(report)
-    if prepared.outcome != "succeeded":
-        if prepared.reason is None or prepared.reason not in _HUMAN_DIAGNOSTICS:
+def _human_buffer_v1(report: KnowledgeReadReportV1) -> bytes:
+    if report.outcome != "succeeded":
+        if report.reason is None or report.reason not in _HUMAN_DIAGNOSTICS:
             raise ValueError("Knowledge read Human diagnostic is invalid")
-        return (_HUMAN_DIAGNOSTICS[prepared.reason] + "\n").encode("utf-8")
-    result = prepared.result
+        return (_HUMAN_DIAGNOSTICS[report.reason] + "\n").encode("utf-8")
+    result = report.result
     if type(result) is not dict:
         raise TypeError("Knowledge read Human result is invalid")
     heading = (
         "Knowledge 候选搜索"
-        if prepared.command == "knowledge.search"
+        if report.command == "knowledge.search"
         else "Knowledge 候选详情"
     )
     lines = [heading, _DISCLOSURE]
@@ -271,7 +241,7 @@ def build_knowledge_read_human_buffer_v1(report: KnowledgeReadReportV1) -> bytes
         item = result[key]
         lines.extend(_human_container_lines_v1({key: item}, depth=0))
         if (
-            prepared.command == "knowledge.show"
+            report.command == "knowledge.show"
             and key == "governance"
             and type(item) is dict
             and item.get("intake_status") == "withdrawn"
@@ -280,48 +250,67 @@ def build_knowledge_read_human_buffer_v1(report: KnowledgeReadReportV1) -> bytes
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def _write_buffer_v1(buffer: bytes, *, fd: int) -> None:
-    try:
-        msvcrt.setmode(fd, os.O_BINARY)
-    except OSError:
-        os._exit(1)
-    view = memoryview(buffer)
-    offset = 0
-    while offset < len(buffer):
-        requested = min(_WRITE_CHUNK, len(buffer) - offset)
-        current = view[offset : offset + requested]
-        if (
-            current.obj is not buffer
-            or current.nbytes != requested
-            or not 1 <= requested <= _WRITE_CHUNK
-        ):
-            raise RuntimeError("Knowledge read write view invariant failed")
-        try:
-            count = os.write(fd, current)
-        except OSError:
-            os._exit(1)
-        if type(count) is not int or not 1 <= count <= requested:
-            os._exit(1)
-        offset += count
+def build_knowledge_read_human_buffer_v1(report: KnowledgeReadReportV1) -> bytes:
+    prepared = _prepare_knowledge_read_v1(report)
+    return _human_buffer_v1(prepared.report)
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedKnowledgeReadPresentationV1:
+    report: KnowledgeReadReportV1
+    buffer: bytes
+    json_output: bool
+
+
+class _KnowledgeReadPresentationSealFailedV1(RuntimeError):
+    pass
+
+
+def _prepare_knowledge_read_presentation_v1(
+    report: KnowledgeReadReportV1,
+    *,
+    json_output: bool,
+) -> _PreparedKnowledgeReadPresentationV1:
+    prepared = _prepare_knowledge_read_v1(report)
+    return _PreparedKnowledgeReadPresentationV1(
+        report=prepared.report,
+        buffer=(
+            prepared.json_buffer
+            if json_output
+            else _human_buffer_v1(prepared.report)
+        ),
+        json_output=json_output,
+    )
 
 
 def _present_v1(
     report: KnowledgeReadReportV1,
     *,
     json_output: bool,
+    prepared_candidate: _PreparedKnowledgeReadPresentationV1 | None = None,
 ) -> KnowledgeReadReportV1:
     try:
-        prepared = _apply_result_cap_v1(report)
-        buffer = (
-            build_knowledge_read_json_buffer_v1(prepared)
-            if json_output
-            else build_knowledge_read_human_buffer_v1(prepared)
+        candidate = (
+            _prepare_knowledge_read_presentation_v1(
+                report,
+                json_output=json_output,
+            )
+            if prepared_candidate is None
+            else prepared_candidate
         )
+        if prepared_candidate is not None and (
+            candidate.report != report or candidate.json_output is not json_output
+        ):
+            raise ValueError("Knowledge read presentation candidate differs")
     except Exception:  # noqa: BLE001 - the contract hard-stops seal failures.
         os._exit(1)
-    fd = 1 if json_output or prepared.outcome == "succeeded" else 2
-    _write_buffer_v1(buffer, fd=fd)
-    return prepared
+    fd = 1 if json_output or candidate.report.outcome == "succeeded" else 2
+    write_binary_buffer_v1(
+        candidate.buffer,
+        fd=fd,
+        max_chunk_size=_WRITE_CHUNK,
+    )
+    return candidate.report
 
 
 def run_search(
@@ -330,8 +319,32 @@ def run_search(
     json_output: bool,
     cli_patch: tuple[tuple[str, str], ...],
 ) -> int:
-    report = KnowledgeReadsV1.search(query, cli_patch=cli_patch)
-    prepared = _present_v1(report, json_output=json_output)
+    prepared_candidate: _PreparedKnowledgeReadPresentationV1 | None = None
+
+    def seal_report(report: KnowledgeReadReportV1) -> KnowledgeReadReportV1:
+        nonlocal prepared_candidate
+        try:
+            prepared_candidate = _prepare_knowledge_read_presentation_v1(
+                report,
+                json_output=json_output,
+            )
+        except Exception as error:
+            raise _KnowledgeReadPresentationSealFailedV1 from error
+        return prepared_candidate.report
+
+    try:
+        report = KnowledgeReadsV1.search(
+            query,
+            cli_patch=cli_patch,
+            report_sealer=seal_report,
+        )
+    except _KnowledgeReadPresentationSealFailedV1:
+        os._exit(1)
+    prepared = _present_v1(
+        report,
+        json_output=json_output,
+        prepared_candidate=prepared_candidate,
+    )
     return {"succeeded": 0, "blocked": 2, "failed": 1}[prepared.outcome]
 
 
@@ -341,8 +354,32 @@ def run_show(
     json_output: bool,
     cli_patch: tuple[tuple[str, str], ...],
 ) -> int:
-    report = KnowledgeReadsV1.show(candidate_id, cli_patch=cli_patch)
-    prepared = _present_v1(report, json_output=json_output)
+    prepared_candidate: _PreparedKnowledgeReadPresentationV1 | None = None
+
+    def seal_report(report: KnowledgeReadReportV1) -> KnowledgeReadReportV1:
+        nonlocal prepared_candidate
+        try:
+            prepared_candidate = _prepare_knowledge_read_presentation_v1(
+                report,
+                json_output=json_output,
+            )
+        except Exception as error:
+            raise _KnowledgeReadPresentationSealFailedV1 from error
+        return prepared_candidate.report
+
+    try:
+        report = KnowledgeReadsV1.show(
+            candidate_id,
+            cli_patch=cli_patch,
+            report_sealer=seal_report,
+        )
+    except _KnowledgeReadPresentationSealFailedV1:
+        os._exit(1)
+    prepared = _present_v1(
+        report,
+        json_output=json_output,
+        prepared_candidate=prepared_candidate,
+    )
     return {"succeeded": 0, "blocked": 2, "failed": 1}[prepared.outcome]
 
 

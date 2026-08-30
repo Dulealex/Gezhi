@@ -1110,8 +1110,12 @@ def test_schema_is_revalidated_inside_the_registry_write_transaction(
 
     real_bootstrap = knowledge_intake._bootstrap_registry
 
-    def drift_after_bootstrap(connection: sqlite3.Connection) -> None:
-        real_bootstrap(connection)
+    def drift_after_bootstrap(
+        connection: sqlite3.Connection,
+        validated: object,
+        imports_root: Path,
+    ) -> None:
+        real_bootstrap(connection, validated, imports_root)  # type: ignore[arg-type]
         connection.execute("CREATE TABLE injected_schema_drift(value TEXT)")
 
     monkeypatch.setattr(

@@ -23,20 +23,52 @@ def test_operations_human_and_json_caps_are_inclusive() -> None:
         diagnostics=(),
     )
     exact_fill = 65_536 - len(base)
-    assert len(
-        presentation.operations_json_buffer(
-            command="doctor",
-            outcome="succeeded",
-            result={"value": "a" * exact_fill},
-            diagnostics=(),
+    assert (
+        len(
+            presentation.operations_json_buffer(
+                command="doctor",
+                outcome="succeeded",
+                result={"value": "a" * exact_fill},
+                diagnostics=(),
+            )
         )
-    ) == 65_536
+        == 65_536
+    )
     with pytest.raises(ValueError, match="byte limit"):
         presentation.operations_json_buffer(
             command="doctor",
             outcome="succeeded",
             result={"value": "a" * (exact_fill + 1)},
             diagnostics=(),
+        )
+
+
+def test_shared_cli_json_writer_has_an_inclusive_caller_selected_cap() -> None:
+    uncapped = presentation.cli_json_buffer_v1(
+        command="knowledge.search",
+        outcome="succeeded",
+        result={"value": ""},
+        diagnostics=(),
+        output_cap=1_048_576,
+    )
+    exact_cap = len(uncapped)
+    assert (
+        presentation.cli_json_buffer_v1(
+            command="knowledge.search",
+            outcome="succeeded",
+            result={"value": ""},
+            diagnostics=(),
+            output_cap=exact_cap,
+        )
+        == uncapped
+    )
+    with pytest.raises(presentation.CliJsonOutputTooLargeV1):
+        presentation.cli_json_buffer_v1(
+            command="knowledge.search",
+            outcome="succeeded",
+            result={"value": ""},
+            diagnostics=(),
+            output_cap=exact_cap - 1,
         )
 
 

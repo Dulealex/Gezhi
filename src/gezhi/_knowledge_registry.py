@@ -160,6 +160,34 @@ def _trigram_atoms(value: str) -> tuple[str, ...]:
     return _ordered_unique(atoms)
 
 
+def _search_text_from_normalized_v1(normalized: str) -> SearchTextV1:
+    atom_text = _tokenizable_search_text(normalized)
+    searchable_characters = [
+        character
+        for character in atom_text
+        if unicodedata.category(character)[0] in {"L", "N"}
+    ]
+    if (
+        not normalized
+        or not searchable_characters
+        or (len(searchable_characters) == 1 and _is_han(searchable_characters[0]))
+    ):
+        raise SearchQueryInvalidV1("Query contains no searchable text")
+    unicode_atoms = _unicode_atoms(atom_text)
+    trigram_atoms = _trigram_atoms(atom_text)
+    if len(unicode_atoms) > 128 or len(trigram_atoms) > 128:
+        raise SearchQueryTooComplexV1("Query has too many search atoms")
+    if not unicode_atoms and not trigram_atoms:
+        raise SearchQueryInvalidV1("Query contains no search atoms")
+    return SearchTextV1(normalized, unicode_atoms, trigram_atoms)
+
+
+def validate_normalized_search_text_v1(value: object) -> SearchTextV1:
+    if type(value) is not str or _base_search_text(value) != value:
+        raise SearchQueryInvalidV1("SearchText is not canonical")
+    return _search_text_from_normalized_v1(value)
+
+
 def normalize_search_query_v1(raw_query: str) -> SearchTextV1:
     if type(raw_query) is not str:
         raise SearchQueryInvalidV1("Query must be a string")
@@ -186,25 +214,7 @@ def normalize_search_query_v1(raw_query: str) -> SearchTextV1:
     if len(canonical) > 2_000 or byte_length > 8_192:
         raise SearchQueryTooLargeV1("Query exceeds its size limit")
     normalized = _base_search_text(canonical)
-    atom_text = _tokenizable_search_text(normalized)
-    searchable_characters = [
-        character
-        for character in atom_text
-        if unicodedata.category(character)[0] in {"L", "N"}
-    ]
-    if (
-        not normalized
-        or not searchable_characters
-        or (len(searchable_characters) == 1 and _is_han(searchable_characters[0]))
-    ):
-        raise SearchQueryInvalidV1("Query contains no searchable text")
-    unicode_atoms = _unicode_atoms(atom_text)
-    trigram_atoms = _trigram_atoms(atom_text)
-    if len(unicode_atoms) > 128 or len(trigram_atoms) > 128:
-        raise SearchQueryTooComplexV1("Query has too many search atoms")
-    if not unicode_atoms and not trigram_atoms:
-        raise SearchQueryInvalidV1("Query contains no search atoms")
-    return SearchTextV1(normalized, unicode_atoms, trigram_atoms)
+    return _search_text_from_normalized_v1(normalized)
 
 
 def _joined_search_values(values: Iterable[str]) -> str:
@@ -330,4 +340,5 @@ __all__ = [
     "remove_search_document_v1",
     "replace_active_search_document_v1",
     "search_document_fields_v1",
+    "validate_normalized_search_text_v1",
 ]

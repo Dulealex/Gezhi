@@ -1359,7 +1359,80 @@ def _open_registry(path: Path) -> tuple[sqlite3.Connection, ValidatedFileV1]:
         ) from error
 
 
-def _bootstrap_registry(connection: sqlite3.Connection) -> None:
+def _require_exact_projection_upgrade_replay_v1(
+    connection: sqlite3.Connection,
+    validated: _ValidatedHandoffV1,
+    imports_root: Path,
+) -> tuple[str, ...]:
+    try:
+        candidate_rows = connection.execute(
+            "SELECT candidate_id FROM candidate_content "
+            "ORDER BY candidate_id COLLATE BINARY"
+        ).fetchall()
+        candidate_ids: list[str] = []
+        for row in candidate_rows:
+            if (
+                type(row) is not tuple
+                or len(row) != 1
+                or type(row[0]) is not str
+                or _CANDIDATE_ID.fullmatch(row[0]) is None
+            ):
+                raise _RegistryConflictV1(
+                    "Candidate Registry replay identity is invalid"
+                )
+            candidate_id = cast(str, row[0])
+            _verify_candidate_import_history(
+                connection,
+                imports_root,
+                candidate_id,
+                allow_historical_content_projection=True,
+            )
+            candidate_ids.append(candidate_id)
+        recorded = connection.execute(
+            """
+            SELECT candidate_id, payload_sha256, review_revision, action,
+                   review_status, work_id, source_id, source_sha256,
+                   canonical_content_sha256, canonical_run_id, semantic_run_id,
+                   manifest_sha256, candidates_sha256
+            FROM handoff_revisions WHERE handoff_id = ?
+            """,
+            (validated.handoff_id,),
+        ).fetchone()
+    except (_RegistryBusyV1, _RegistryConflictV1):
+        raise
+    except sqlite3.Error as error:
+        if _sqlite_is_busy(error):
+            raise _RegistryBusyV1("Candidate Registry is busy") from error
+        raise _RegistryConflictV1(
+            "Candidate Registry replay cannot be verified"
+        ) from error
+    expected = (
+        validated.candidate_id,
+        validated.payload_sha256,
+        validated.review_revision,
+        validated.action,
+        validated.review_status,
+        validated.work_id,
+        validated.source_id,
+        validated.source_sha256,
+        validated.canonical_content_sha256,
+        validated.canonical_run_id,
+        validated.semantic_run_id,
+        validated.manifest_sha256,
+        validated.candidates_sha256,
+    )
+    if recorded != expected:
+        raise _RegistryConflictV1(
+            "search projection upgrade requires an exact Handoff replay"
+        )
+    return tuple(candidate_ids)
+
+
+def _bootstrap_registry(
+    connection: sqlite3.Connection,
+    validated: _ValidatedHandoffV1,
+    imports_root: Path,
+) -> None:
     try:
         application_id = cast(
             int,
@@ -1395,6 +1468,14 @@ def _bootstrap_registry(connection: sqlite3.Connection) -> None:
         try:
             connection.execute("BEGIN IMMEDIATE")
             _validate_base_registry_schema(connection)
+            candidate_ids = _require_exact_projection_upgrade_replay_v1(
+                connection,
+                validated,
+                imports_root,
+            )
+            for candidate_id in candidate_ids:
+                _rebuild_current_projection(connection, candidate_id)
+                _rebuild_content_import_projection(connection, candidate_id)
             for statement in SEARCH_PROJECTION_SCHEMA_STATEMENTS:
                 connection.execute(statement)
             generation = connection.execute(
@@ -1551,6 +1632,54 @@ def _rebuild_content_import_projection(
         raise _RegistryConflictV1("Candidate content projection is missing")
 
 
+def _synchronize_candidate_search_projection_v1(
+    connection: sqlite3.Connection,
+    candidate_id: str,
+) -> None:
+    row = connection.execute(
+        """
+        SELECT content.candidate_json, content.citation_json,
+               content.descriptor_snapshots_json, content.promotion_status,
+               current.review_status, current.intake_status
+        FROM candidate_content AS content
+        JOIN candidate_current AS current USING(candidate_id)
+        WHERE content.candidate_id = ?
+        """,
+        (candidate_id,),
+    ).fetchone()
+    if row is None or len(row) != 6 or row[3] != "not_promoted":
+        raise _RegistryConflictV1("Candidate search projection source is invalid")
+    if row[4:] == ("accepted", "active"):
+        try:
+            candidate = decode_canonical_json_blob_v1(row[0])
+            citation = decode_canonical_json_blob_v1(row[1])
+            descriptor_snapshots = decode_canonical_json_blob_v1(row[2])
+        except ValueError as error:
+            raise _RegistryConflictV1(
+                "Candidate search projection source is invalid"
+            ) from error
+        if (
+            type(candidate) is not dict
+            or type(citation) is not dict
+            or type(descriptor_snapshots) is not list
+        ):
+            raise _RegistryConflictV1(
+                "Candidate search projection source is invalid"
+            )
+        replace_active_search_document_v1(
+            connection,
+            candidate_id=candidate_id,
+            candidate=candidate,
+            citation=citation,
+            descriptor_snapshots=descriptor_snapshots,
+        )
+        return
+    if row[4] in {"rejected", "deferred"} and row[5] == "withdrawn":
+        remove_search_document_v1(connection, candidate_id=candidate_id)
+        return
+    raise _RegistryConflictV1("Candidate search governance is invalid")
+
+
 def _commit_registry_transaction(connection: sqlite3.Connection) -> None:
     try:
         connection.commit()
@@ -1608,6 +1737,8 @@ def _verify_candidate_import_history(
     connection: sqlite3.Connection,
     imports_root: Path,
     candidate_id: str,
+    *,
+    allow_historical_content_projection: bool = False,
 ) -> None:
     rows = connection.execute(
         """
@@ -1636,6 +1767,7 @@ def _verify_candidate_import_history(
     ).fetchone()
     immutable_content: tuple[object, ...] | None = None
     latest_content_projection: tuple[object, ...] | None = None
+    historical_content_projections: set[tuple[object, ...]] = set()
     for row in rows:
         handoff_id = row[0]
         if type(handoff_id) is not str or _HANDOFF_ID.fullmatch(handoff_id) is None:
@@ -1695,6 +1827,7 @@ def _verify_candidate_import_history(
                     "Accepted Candidate snapshots changed across revisions"
                 )
             latest_content_projection = _stored_content_values(observed)
+            historical_content_projections.add(latest_content_projection)
         elif immutable_content is None or (
             observed.payload_sha256,
             observed.work_id,
@@ -1715,7 +1848,10 @@ def _verify_candidate_import_history(
         raise _RegistryConflictV1("Candidate content has no Handoff history")
     if rows and immutable_content is None:
         raise _RegistryConflictV1("Candidate history has no accepted Handoff")
-    if stored_content is not None and stored_content != latest_content_projection:
+    content_projection_is_valid = stored_content == latest_content_projection
+    if allow_historical_content_projection and stored_content is not None:
+        content_projection_is_valid = stored_content in historical_content_projections
+    if stored_content is not None and not content_projection_is_valid:
         raise _RegistryConflictV1(
             "Candidate content and latest accept evidence differ"
         )
@@ -1782,6 +1918,11 @@ def _apply_accept_transaction(
                 raise _RegistryConflictV1("Recorded Candidate content conflicts")
             _rebuild_current_projection(connection, validated.candidate_id)
             _rebuild_content_import_projection(connection, validated.candidate_id)
+            _synchronize_candidate_search_projection_v1(
+                connection,
+                validated.candidate_id,
+            )
+            bind_search_projection_generation_v1(connection)
             _commit_registry_transaction(connection)
             return "unchanged"
         if connection.execute(
@@ -1962,6 +2103,11 @@ def _apply_withdraw_transaction(
                 raise _RevisionConflictV1("Recorded Handoff identity conflicts")
             _rebuild_current_projection(connection, validated.candidate_id)
             _rebuild_content_import_projection(connection, validated.candidate_id)
+            _synchronize_candidate_search_projection_v1(
+                connection,
+                validated.candidate_id,
+            )
+            bind_search_projection_generation_v1(connection)
             _commit_registry_transaction(connection)
             return "unchanged"
 
@@ -2156,18 +2302,23 @@ class KnowledgeIntakeAdapterV1:
                     connection, registry_guard = _open_registry(
                         Path(root_path) / "registry.sqlite3"
                     )
-                    _bootstrap_registry(connection)
+                    imports_root = Path(root_path) / "imports"
+                    _bootstrap_registry(
+                        connection,
+                        validated,
+                        imports_root,
+                    )
                     disposition = (
                         _apply_accept_transaction(
                             connection,
                             validated,
-                            Path(root_path) / "imports",
+                            imports_root,
                         )
                         if validated.action == "accept"
                         else _apply_withdraw_transaction(
                             connection,
                             validated,
-                            Path(root_path) / "imports",
+                            imports_root,
                         )
                     )
                     _verify_applied(connection, validated)
