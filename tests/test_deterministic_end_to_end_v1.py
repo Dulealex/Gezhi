@@ -1504,3 +1504,59 @@ def test_ocr_failed_terminal_recovers_with_the_other_launcher(
         )["status"]
         == "succeeded"
     )
+
+
+@pytest.mark.parametrize("launcher_index", (0, 1), ids=("console", "module"))
+def test_real_mineru_coordinate_rounding_is_accepted_through_public_cli(
+    deterministic_e2e_workspace: _E2eWorkspaceV1,
+    launcher_index: int,
+) -> None:
+    workspace = deterministic_e2e_workspace
+    added = run_launcher(
+        launcher_commands(
+            (
+                "--literature-data-root",
+                str(workspace.literature_root),
+                "literature",
+                "add",
+                str(workspace.pdf_path),
+                "--json",
+            )
+        )[launcher_index]
+    )
+    assert added.returncode == 0
+    added_result = _json_result(added)["result"]
+    assert isinstance(added_result, dict)
+
+    resumed = run_launcher(
+        launcher_commands(
+            (
+                "--literature-data-root",
+                str(workspace.literature_root),
+                "literature",
+                "resume",
+                str(added_result["work_id"]),
+                "--json",
+            )
+        )[launcher_index],
+        pythonpath_roots=(workspace.site_root, TEST_ROOT, SOURCE_ROOT),
+        environment_updates={
+            "CODEX_HOME": str(workspace.runtime_root / "codex-home"),
+            "T25_CODEX_DOUBLE_EXE": str(CODEX_DOUBLE),
+            "T25_DOUBLE_MODE": "literature",
+            "T25_OCR_DOUBLE_EXE": str(OCR_DOUBLE),
+            "T25_OCR_DOUBLE_SCENARIO": "origin-coordinate-rounding",
+            "TEMP": str(workspace.runtime_root / "temp"),
+            "TMP": str(workspace.runtime_root / "temp"),
+        },
+        timeout=45.0,
+    )
+
+    assert resumed.returncode == 2
+    envelope = _json_result(resumed)
+    assert envelope["outcome"] == "blocked"
+    result = envelope["result"]
+    assert isinstance(result, dict)
+    assert result["advanced_stages"] == ["ocr", "canonicalize", "read"]
+    assert result["start_stage"] == "ocr"
+    assert result["stop_stage"] == "review"
