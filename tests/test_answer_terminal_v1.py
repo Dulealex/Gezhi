@@ -2,11 +2,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from support.knowledge_handoff_factory_v1 import accepted_handoff_v1
 
 from gezhi import _answer_terminal as terminal
+from gezhi import _knowledge_answerer as answerer
+from gezhi import _knowledge_retrieval as retrieval
+from gezhi import _windows_data_root as windows_root
+from gezhi._knowledge_registry import normalize_search_query_v1
+from gezhi._windows_data_root import open_validated_data_root_v1
+from gezhi._windows_ownership import try_acquire_knowledge_answer_writer_v1
 
 
 def _canonical_json_file(value: object) -> bytes:
@@ -22,23 +32,129 @@ def _canonical_json_file(value: object) -> bytes:
     )
 
 
-def _succeeded_request_with_timeout_attempt() -> terminal.AnswerPublishRequestV1:
-    retrieval_view_bytes = _canonical_json_file(
+def _candidate_retrieval_documents() -> tuple[
+    bytes,
+    bytes,
+    bytes,
+    bytes,
+    dict[str, object],
+    dict[str, dict[str, object]],
+]:
+    question = "示例结论"
+    question_bytes = _canonical_json_file(
+        {"question": question, "schema_version": "gezhi.question.v1"}
+    )
+    search_text = normalize_search_query_v1(question)
+    retrieval_query_bytes = _canonical_json_file(
         {
-            "candidate_count": 1,
-            "schema_version": "gezhi.retrieval_view.v1",
+            "normalized_text": search_text.normalized_text,
+            "schema_version": "gezhi.retrieval_query.v1",
+            "trigram_atoms": list(search_text.trigram_atoms),
+            "unicode61_atoms": list(search_text.unicode61_atoms),
         }
     )
-    retrieval_audit_bytes = _canonical_json_file(
-        {
-            "retrieval_view_measurement": {
-                "byte_length": len(retrieval_view_bytes),
-                "limit_bytes": 262_144,
-                "sha256": hashlib.sha256(retrieval_view_bytes).hexdigest(),
-                "status": "within_limit",
-            },
-            "schema_version": "gezhi.retrieval_audit.v1",
-        }
+    handoff = accepted_handoff_v1(
+        ordinal=1,
+        statement_text="示例结论",
+        source_terms=["示例", "结论"],
+        title="示例论文",
+    )
+    record = json.loads(handoff.candidates_bytes)
+    candidate = record["candidate"]
+    candidate_id = candidate["candidate_id"]
+    payload_sha256 = candidate["payload_sha256"]
+    assert type(candidate_id) is str
+    assert type(payload_sha256) is str
+    view_item: dict[str, object] = {
+        "candidate": candidate,
+        "citation": record["citation"],
+        "descriptor_snapshots": record["descriptor_snapshots"],
+        "evidence_snapshots": record["evidence_snapshots"],
+        "governance": {
+            "intake_status": "active",
+            "promotion_status": "not_promoted",
+            "review_status": "accepted",
+        },
+        "rank": 1,
+    }
+    retrieval_view = {
+        "answer_kind": "candidate_backed",
+        "candidate_count": 1,
+        "items": [view_item],
+        "schema_version": "gezhi.retrieval_view.v1",
+    }
+    retrieval_view_bytes = _canonical_json_file(retrieval_view)
+    identity = {
+        "candidate_id": candidate_id,
+        "payload_sha256": payload_sha256,
+        "review_revision": 1,
+        "search_projection_sha256": "1" * 64,
+    }
+    branch_item = {
+        "bm25_float64_hex": "0x0.0p+0",
+        **identity,
+        "rank": 1,
+    }
+    final_item = {
+        **identity,
+        "final_rank": 1,
+        "rrf_denominator": 13,
+        "rrf_numerator": 1,
+        "trigram_rank": None,
+        "unicode61_rank": 1,
+    }
+    retrieval_audit = {
+        "algorithm_version": "gezhi.fts5_dual_rrf_k12.v1",
+        "branch_results": {"trigram": [], "unicode61": [branch_item]},
+        "final_selection": [final_item],
+        "query_atoms": {
+            "trigram": list(search_text.trigram_atoms),
+            "unicode61": list(search_text.unicode61_atoms),
+        },
+        "question_asset_sha256": hashlib.sha256(question_bytes).hexdigest(),
+        "registry_snapshot_sha256": "2" * 64,
+        "retrieval_query_asset_sha256": hashlib.sha256(
+            retrieval_query_bytes
+        ).hexdigest(),
+        "retrieval_view_measurement": {
+            "byte_length": len(retrieval_view_bytes),
+            "limit_bytes": 262_144,
+            "sha256": hashlib.sha256(retrieval_view_bytes).hexdigest(),
+            "status": "within_limit",
+        },
+        "schema_version": "gezhi.retrieval_audit.v1",
+    }
+    answer_output: dict[str, object] = {
+        "answer_status": "answered",
+        "answer_units": [
+            {"candidate_id": candidate_id, "text": "示例结论由该 Candidate 支持。"}
+        ],
+        "insufficiency_reason": None,
+        "qualification_units": [],
+        "schema_version": "gezhi.answer_output.v1",
+    }
+    return (
+        question_bytes,
+        retrieval_query_bytes,
+        _canonical_json_file(retrieval_audit),
+        retrieval_view_bytes,
+        answer_output,
+        {candidate_id: view_item},
+    )
+
+
+def _succeeded_request_with_timeout_attempt() -> terminal.AnswerPublishRequestV1:
+    (
+        question_bytes,
+        retrieval_query_bytes,
+        retrieval_audit_bytes,
+        retrieval_view_bytes,
+        answer_output,
+        candidates,
+    ) = _candidate_retrieval_documents()
+    prompt_bytes = answerer._effective_prompt_v1(
+        question_bytes,
+        retrieval_view_bytes,
     )
     timestamp = "2026-08-31T12:00:00.000Z"
     return terminal.AnswerPublishRequestV1(
@@ -60,16 +176,12 @@ def _succeeded_request_with_timeout_attempt() -> terminal.AnswerPublishRequestV1
                 "schema_version": "gezhi.knowledge_answerer_effective_config.v1",
             }
         ),
-        question_bytes=_canonical_json_file({"schema_version": "gezhi.question.v1"}),
-        retrieval_query_bytes=_canonical_json_file(
-            {"schema_version": "gezhi.retrieval_query.v1"}
-        ),
+        question_bytes=question_bytes,
+        retrieval_query_bytes=retrieval_query_bytes,
         retrieval_audit_bytes=retrieval_audit_bytes,
         retrieval_view_bytes=retrieval_view_bytes,
-        prompt_bytes=b"prompt\n",
-        schema_bytes=_canonical_json_file(
-            {"$id": ("https://gezhi.local/schemas/answer-output-v1.schema.json")}
-        ),
+        prompt_bytes=prompt_bytes,
+        schema_bytes=answerer.answer_output_schema_bytes_v1(),
         attempts=(
             terminal.AnswerAttemptPublishV1(
                 record={
@@ -88,10 +200,12 @@ def _succeeded_request_with_timeout_attempt() -> terminal.AnswerPublishRequestV1
                 final_message_bytes=b"",
             ),
         ),
-        answer_output_bytes=_canonical_json_file(
-            {"schema_version": "gezhi.answer_output.v1"}
+        answer_output_bytes=_canonical_json_file(answer_output),
+        answer_markdown_bytes=answerer.render_answer_markdown_v1(
+            "示例结论",
+            answer_output,
+            candidates,
         ),
-        answer_markdown_bytes=b"answer\n",
     )
 
 
@@ -136,12 +250,29 @@ def _zero_candidate_request(
     )
     retrieval_view_bytes = _canonical_json_file(
         {
+            "answer_kind": "candidate_backed",
             "candidate_count": 0,
+            "items": [],
             "schema_version": "gezhi.retrieval_view.v1",
         }
     )
+    assert base.question_bytes is not None
+    assert base.retrieval_query_bytes is not None
+    query = json.loads(base.retrieval_query_bytes)
     retrieval_audit_bytes = _canonical_json_file(
         {
+            "algorithm_version": "gezhi.fts5_dual_rrf_k12.v1",
+            "branch_results": {"trigram": [], "unicode61": []},
+            "final_selection": [],
+            "query_atoms": {
+                "trigram": query["trigram_atoms"],
+                "unicode61": query["unicode61_atoms"],
+            },
+            "question_asset_sha256": hashlib.sha256(base.question_bytes).hexdigest(),
+            "registry_snapshot_sha256": "2" * 64,
+            "retrieval_query_asset_sha256": hashlib.sha256(
+                base.retrieval_query_bytes
+            ).hexdigest(),
             "retrieval_view_measurement": {
                 "byte_length": len(retrieval_view_bytes),
                 "limit_bytes": 262_144,
@@ -206,17 +337,1160 @@ def _request_with_candidate_count(
 
 
 def _too_large_retrieval_audit_bytes() -> bytes:
-    return _canonical_json_file(
-        {
-            "retrieval_view_measurement": {
-                "byte_length": 262_145,
+    _question, _query, audit_bytes, _view, _output, _candidates = (
+        _candidate_retrieval_documents()
+    )
+    audit = json.loads(audit_bytes)
+    audit["retrieval_view_measurement"] = {
+        "byte_length": 262_145,
+        "limit_bytes": 262_144,
+        "sha256": "0" * 64,
+        "status": "too_large",
+    }
+    return _canonical_json_file(audit)
+
+
+def test_committed_reader_revalidates_a_published_answer(tmp_path) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner:
+            committed = terminal.publish_answer_v1(root, owner, request)
+
+        observed = terminal.read_committed_answer_v1(root, request.answer_id)
+
+    assert observed.answer_id == committed.answer_id
+    assert observed.manifest_sha256 == committed.manifest_sha256
+    assert observed.status == "succeeded"
+    assert observed.answer_output_bytes == request.answer_output_bytes
+    assert observed.answer_markdown_bytes == request.answer_markdown_bytes
+
+
+def _rename_answer_target_to_case_alias_v1(target: Path, answer_id: str) -> Path:
+    intermediate = target.with_name(answer_id + ".case-hop")
+    alias = target.with_name(answer_id.upper())
+    target.rename(intermediate)
+    intermediate.rename(alias)
+    return alias
+
+
+def test_committed_reader_rejects_a_case_alias_target_basename(
+    tmp_path: Path,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner:
+            terminal.publish_answer_v1(root, owner, request)
+        target = knowledge_root / "answers" / request.answer_id
+        alias = _rename_answer_target_to_case_alias_v1(target, request.answer_id)
+
+        observed = terminal.read_committed_answer_v1(root, request.answer_id)
+
+    assert type(observed) is terminal.TerminalAnswerBytesRejectedV1
+    assert alias.is_dir()
+
+
+def _rewrite_terminal_assets(
+    target: Path,
+    replacements: dict[str, bytes],
+) -> None:
+    manifest_path = target / "manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    by_path = {item["path"]: item for item in manifest["assets"]}
+    for relative_path, payload in replacements.items():
+        (target / relative_path).write_bytes(payload)
+        item = by_path[relative_path]
+        item["byte_length"] = len(payload)
+        item["sha256"] = hashlib.sha256(payload).hexdigest()
+    manifest_path.write_bytes(_canonical_json_file(manifest))
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "answer-output-schema",
+        "answer-markdown-rendering",
+        "schema-snapshot",
+        "prompt-binding",
+        "retrieval-view-schema",
+    ),
+)
+def test_committed_reader_rejects_semantically_invalid_rehashed_assets(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner:
+            terminal.publish_answer_v1(root, owner, request)
+
+        target = knowledge_root / "answers" / request.answer_id
+        if corruption == "answer-output-schema":
+            output = json.loads((target / "answer_output.json").read_bytes())
+            output["unexpected"] = True
+            replacements = {"answer_output.json": _canonical_json_file(output)}
+        elif corruption == "answer-markdown-rendering":
+            replacements = {"answer.md": b"# unrelated but valid UTF-8\n"}
+        elif corruption == "schema-snapshot":
+            schema = json.loads((target / "schema.json").read_bytes())
+            schema["unexpected"] = True
+            replacements = {"schema.json": _canonical_json_file(schema)}
+        elif corruption == "prompt-binding":
+            replacements = {
+                "prompt.txt": (target / "prompt.txt").read_bytes() + b"tampered\n"
+            }
+        else:
+            view_bytes = _canonical_json_file(
+                {
+                    "candidate_count": 1,
+                    "schema_version": "gezhi.retrieval_view.v1",
+                }
+            )
+            audit = json.loads((target / "retrieval_audit.json").read_bytes())
+            audit["retrieval_view_measurement"] = {
+                "byte_length": len(view_bytes),
                 "limit_bytes": 262_144,
-                "sha256": "0" * 64,
-                "status": "too_large",
-            },
-            "schema_version": "gezhi.retrieval_audit.v1",
+                "sha256": hashlib.sha256(view_bytes).hexdigest(),
+                "status": "within_limit",
+            }
+            replacements = {
+                "retrieval_audit.json": _canonical_json_file(audit),
+                "retrieval_view.json": view_bytes,
+            }
+        _rewrite_terminal_assets(target, replacements)
+
+        observed = terminal.read_committed_answer_v1(root, request.answer_id)
+
+    assert type(observed) is terminal.TerminalAnswerBytesRejectedV1
+
+
+def test_terminal_retrieval_rejects_hits_for_an_empty_query_atom_branch() -> None:
+    (
+        _question_bytes,
+        _retrieval_query_bytes,
+        retrieval_audit_bytes,
+        retrieval_view_bytes,
+        _answer_output,
+        _candidates,
+    ) = _candidate_retrieval_documents()
+    question_bytes = _canonical_json_file(
+        {"question": "示例", "schema_version": "gezhi.question.v1"}
+    )
+    search_text = normalize_search_query_v1("示例")
+    assert search_text.trigram_atoms == ()
+    retrieval_query_bytes = _canonical_json_file(
+        {
+            "normalized_text": search_text.normalized_text,
+            "schema_version": "gezhi.retrieval_query.v1",
+            "trigram_atoms": [],
+            "unicode61_atoms": list(search_text.unicode61_atoms),
         }
     )
+    audit = json.loads(retrieval_audit_bytes)
+    forged_hit = audit["branch_results"]["unicode61"][0]
+    audit["branch_results"] = {"trigram": [forged_hit], "unicode61": []}
+    audit["final_selection"][0]["trigram_rank"] = 1
+    audit["final_selection"][0]["unicode61_rank"] = None
+    audit["query_atoms"] = {
+        "trigram": [],
+        "unicode61": list(search_text.unicode61_atoms),
+    }
+    audit["question_asset_sha256"] = hashlib.sha256(question_bytes).hexdigest()
+    audit["retrieval_query_asset_sha256"] = hashlib.sha256(
+        retrieval_query_bytes
+    ).hexdigest()
+
+    with pytest.raises(retrieval.RetrievalMaterializationFailedV1):
+        retrieval.validate_terminal_retrieval_assets_v1(
+            question_bytes=question_bytes,
+            retrieval_query_bytes=retrieval_query_bytes,
+            retrieval_audit_bytes=_canonical_json_file(audit),
+            retrieval_view_bytes=retrieval_view_bytes,
+        )
+
+
+def test_manifest_cross_field_rejection_precedes_any_asset_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner:
+            terminal.publish_answer_v1(root, owner, request)
+        manifest_path = knowledge_root / "answers" / request.answer_id / "manifest.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        manifest["error"] = {"code": "answer_output_invalid", "stage": "validation"}
+        manifest_path.write_bytes(_canonical_json_file(manifest))
+        read_paths: list[str] = []
+        real_read = terminal._read_candidate_file_v1
+
+        def record_read(*args: object, **kwargs: object) -> bytes:
+            read_paths.append(str(args[1]))
+            return real_read(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(terminal, "_read_candidate_file_v1", record_read)
+        observed = terminal.read_committed_answer_v1(root, request.answer_id)
+
+    assert type(observed) is terminal.TerminalAnswerBytesRejectedV1
+    assert read_paths == ["manifest.json"]
+
+
+def test_terminal_namespace_validation_never_recursively_walks_an_extra_subtree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner:
+            terminal.publish_answer_v1(root, owner, request)
+        monkeypatch.setattr(
+            windows_root.ValidatedDataRootV1,
+            "relative_file_paths_v1",
+            lambda _self: (_ for _ in ()).throw(
+                AssertionError("terminal namespace must not recurse")
+            ),
+        )
+        observed = terminal.read_committed_answer_v1(root, request.answer_id)
+
+    assert type(observed) is terminal.TerminalAnswerBytesReadyV1
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (None, "attempts", "attempts/01", "manifest.json", "answer.md"),
+)
+def test_committed_reader_rejects_named_streams_on_terminal_entries(
+    tmp_path: Path,
+    relative_path: str | None,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner:
+            terminal.publish_answer_v1(root, owner, request)
+
+        target = knowledge_root / "answers" / request.answer_id
+        if relative_path is not None:
+            target /= relative_path
+        Path(f"{target}:unapproved").write_bytes(b"hidden bytes")
+        observed = terminal.read_committed_answer_v1(root, request.answer_id)
+
+    assert type(observed) is terminal.TerminalAnswerBytesRejectedV1
+
+
+def test_writer_readback_rejects_an_asset_changed_after_manifest_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+    real_create = terminal.create_exclusive_file_bytes_v1
+
+    def create_then_tamper(
+        parent: windows_root.ValidatedDataRootV1,
+        component: str,
+        payload: bytes,
+    ) -> None:
+        real_create(parent, component, payload)
+        if component == "manifest.json":
+            canonical_path = parent.inspection.canonical_path
+            assert canonical_path is not None
+            (Path(canonical_path) / "answer.md").write_bytes(b"tampered\n")
+
+    monkeypatch.setattr(
+        terminal,
+        "create_exclusive_file_bytes_v1",
+        create_then_tamper,
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner, pytest.raises(terminal.AnswerManifestFailedV1):
+            terminal.publish_answer_v1(root, owner, request)
+
+    staging = knowledge_root / "answers" / ".staging" / request.answer_id
+    target = knowledge_root / "answers" / request.answer_id
+    assert staging.is_dir()
+    assert not target.exists()
+
+
+def test_staging_scan_recovers_one_fully_valid_orphan(tmp_path: Path) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        first_owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert first_owner is not None
+        with first_owner:
+            terminal.publish_answer_v1(root, first_owner, request)
+
+        target = knowledge_root / "answers" / request.answer_id
+        orphan = knowledge_root / "answers" / ".staging" / request.answer_id
+        target.rename(orphan)
+
+        recovery_owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert recovery_owner is not None
+        with recovery_owner:
+            scan = terminal.scan_answer_staging_v1(root, recovery_owner)
+
+    assert scan.status == "complete"
+    assert scan.entry_count == 1
+    assert scan.recovered_count == 1
+    assert scan.quarantined_count == 0
+    assert scan.recovery_failed_count == 0
+    assert scan.target_conflict_count == 0
+    assert target.is_dir()
+    assert not orphan.exists()
+
+
+@pytest.mark.parametrize("corruption", ("manifest", "question"))
+def test_staging_scan_quarantines_a_non_scalar_asset_and_continues(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    invalid_request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+    valid_request = replace(
+        invalid_request,
+        answer_id="ans_11111111-1111-4111-8111-111111111111",
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        for request in (invalid_request, valid_request):
+            owner = try_acquire_knowledge_answer_writer_v1(identity)
+            assert owner is not None
+            with owner:
+                terminal.publish_answer_v1(root, owner, request)
+            target = knowledge_root / "answers" / request.answer_id
+            orphan = knowledge_root / "answers" / ".staging" / request.answer_id
+            target.rename(orphan)
+
+        invalid_orphan = (
+            knowledge_root / "answers" / ".staging" / invalid_request.answer_id
+        )
+        if corruption == "manifest":
+            invalid_orphan.joinpath("manifest.json").write_bytes(
+                b'{"schema_version":"\\ud800"}\n'
+            )
+        else:
+            _rewrite_terminal_assets(
+                invalid_orphan,
+                {
+                    "question.json": (
+                        b'{"question":"\\ud800","schema_version":"gezhi.question.v1"}\n'
+                    )
+                },
+            )
+        recovery_owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert recovery_owner is not None
+        with recovery_owner:
+            scan = terminal.scan_answer_staging_v1(root, recovery_owner)
+
+    assert scan.status == "complete"
+    assert scan.entry_count == 2
+    assert scan.quarantined_count == 1
+    assert scan.recovered_count == 1
+    assert invalid_orphan.is_dir()
+    assert (knowledge_root / "answers" / valid_request.answer_id).is_dir()
+
+
+def test_staging_scan_quarantines_one_reparse_candidate_and_continues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+    reparse_id = "ans_ffffffff-ffff-4fff-8fff-ffffffffffff"
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        first_owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert first_owner is not None
+        with first_owner:
+            terminal.publish_answer_v1(root, first_owner, request)
+        target = knowledge_root / "answers" / request.answer_id
+        orphan = knowledge_root / "answers" / ".staging" / request.answer_id
+        target.rename(orphan)
+        real_entries = type(root).relative_entries_v1
+
+        def enumerate_staging(observed: object) -> tuple[object, ...]:
+            inspection = observed.inspection  # type: ignore[attr-defined]
+            assert inspection.canonical_path is not None
+            if not inspection.canonical_path.endswith(r"answers\.staging"):
+                return real_entries(observed)  # type: ignore[arg-type]
+            return (
+                SimpleNamespace(
+                    name=request.answer_id,
+                    is_directory=True,
+                    is_reparse=False,
+                    short_name=None,
+                ),
+                SimpleNamespace(
+                    name=reparse_id,
+                    is_directory=True,
+                    is_reparse=True,
+                    short_name=None,
+                ),
+            )
+
+        monkeypatch.setattr(
+            type(root),
+            "relative_entries_v1",
+            enumerate_staging,
+            raising=False,
+        )
+        recovery_owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert recovery_owner is not None
+        with recovery_owner:
+            scan = terminal.scan_answer_staging_v1(root, recovery_owner)
+
+    assert scan.status == "complete"
+    assert scan.entry_count == 2
+    assert scan.quarantined_count == 1
+    assert scan.recovered_count == 1
+    assert target.is_dir()
+    assert not orphan.exists()
+    assert not (knowledge_root / "answers" / reparse_id).exists()
+
+
+def test_current_publish_ignores_an_unrelated_quarantined_reparse_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    staging = knowledge_root / "answers" / ".staging"
+    staging.mkdir(parents=True)
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+    real_entries = windows_root.ValidatedDataRootV1.relative_entries_v1
+    real_names = windows_root.ValidatedDataRootV1.relative_entry_names_v1
+
+    def is_staging(observed: windows_root.ValidatedDataRootV1) -> bool:
+        path = observed.inspection.canonical_path
+        return path is not None and path.endswith(r"answers\.staging")
+
+    def entries_with_reparse(
+        observed: windows_root.ValidatedDataRootV1,
+    ) -> tuple[windows_root.DataRootEntryV1, ...]:
+        entries = real_entries(observed)
+        if not is_staging(observed):
+            return entries
+        return (
+            *entries,
+            windows_root.DataRootEntryV1(
+                name="ans_ffffffff-ffff-4fff-8fff-ffffffffffff",
+                is_directory=True,
+                is_reparse=True,
+                short_name=None,
+            ),
+        )
+
+    def strict_names(
+        observed: windows_root.ValidatedDataRootV1,
+    ) -> tuple[str, ...]:
+        if is_staging(observed):
+            raise windows_root.DataRootOpenErrorV1("unsafe")
+        return real_names(observed)
+
+    monkeypatch.setattr(
+        windows_root.ValidatedDataRootV1,
+        "relative_entries_v1",
+        entries_with_reparse,
+    )
+    monkeypatch.setattr(
+        windows_root.ValidatedDataRootV1,
+        "relative_entry_names_v1",
+        strict_names,
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner:
+            committed = terminal.publish_answer_v1(root, owner, request)
+
+    assert committed.answer_id == request.answer_id
+    assert (knowledge_root / "answers" / request.answer_id).is_dir()
+
+
+def test_current_publish_is_consumed_after_one_behavior_call(tmp_path: Path) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    first_request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+    second_request = replace(
+        first_request,
+        answer_id="ans_11111111-1111-4111-8111-111111111111",
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner:
+            terminal.publish_answer_v1(root, owner, first_request)
+            with pytest.raises(terminal.AnswerWriterOwnershipInvalidV1):
+                terminal.publish_answer_v1(root, owner, second_request)
+
+    assert (knowledge_root / "answers" / first_request.answer_id).is_dir()
+    assert not (knowledge_root / "answers" / second_request.answer_id).exists()
+
+
+def test_current_publish_is_consumed_even_when_request_validation_fails(
+    tmp_path: Path,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    invalid_request = _succeeded_request_with_timeout_attempt()
+    valid_request = replace(
+        _request_with_terminal_matrix(
+            status="succeeded",
+            error=None,
+            failure_classes=(None,),
+        ),
+        answer_id="ans_22222222-2222-4222-8222-222222222222",
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner:
+            with pytest.raises(terminal.AnswerTerminalRequestInvalidV1):
+                terminal.publish_answer_v1(root, owner, invalid_request)
+            with pytest.raises(terminal.AnswerWriterOwnershipInvalidV1):
+                terminal.publish_answer_v1(root, owner, valid_request)
+
+    assert not (knowledge_root / "answers").exists()
+
+
+def test_current_publish_target_conflict_is_no_commit_and_consumes_the_attempt(
+    tmp_path: Path,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+    target = knowledge_root / "answers" / request.answer_id
+    target.mkdir(parents=True)
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner:
+            with pytest.raises(terminal.AnswerTargetConflictV1):
+                terminal.publish_answer_v1(root, owner, request)
+            with pytest.raises(terminal.AnswerWriterOwnershipInvalidV1):
+                terminal.publish_answer_v1(root, owner, request)
+
+    assert target.is_dir()
+    assert not (knowledge_root / "answers" / ".staging" / request.answer_id).exists()
+
+
+def test_current_publish_determinate_rename_failure_keeps_staging_and_is_one_shot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+    monkeypatch.setattr(
+        terminal.os,
+        "rename",
+        lambda _source, _target: (_ for _ in ()).throw(
+            PermissionError("forced determinate publish failure")
+        ),
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner:
+            with pytest.raises(terminal.AnswerCommitFailedV1):
+                terminal.publish_answer_v1(root, owner, request)
+            with pytest.raises(terminal.AnswerWriterOwnershipInvalidV1):
+                terminal.publish_answer_v1(root, owner, request)
+
+    assert (knowledge_root / "answers" / ".staging" / request.answer_id).is_dir()
+    assert not (knowledge_root / "answers" / request.answer_id).exists()
+
+
+def test_current_publish_uncertain_completion_keeps_commit_but_returns_no_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+    real_rename = terminal.os.rename
+
+    def rename_then_report_failure(source: object, target: object) -> None:
+        real_rename(source, target)
+        raise PermissionError("forced uncertain publish completion")
+
+    monkeypatch.setattr(terminal.os, "rename", rename_then_report_failure)
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner:
+            with pytest.raises(terminal.AnswerCommitIndeterminateV1):
+                terminal.publish_answer_v1(root, owner, request)
+            with pytest.raises(terminal.AnswerWriterOwnershipInvalidV1):
+                terminal.publish_answer_v1(root, owner, request)
+
+    assert (knowledge_root / "answers" / request.answer_id).is_dir()
+    assert not (knowledge_root / "answers" / ".staging" / request.answer_id).exists()
+    assert not tuple(knowledge_root.rglob("current.json"))
+
+
+def test_manifest_aggregate_rejects_a_negative_internal_asset_length(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+    provenance, _request_assets, attempts = terminal._validate_request(request)
+    invalid_asset = terminal._VerifiedAssetV1(
+        path="answer.md",
+        byte_length=-1,
+        sha256="0" * 64,
+        identity_key="media_type",
+        identity_value="text/markdown; charset=utf-8",
+    )
+    monkeypatch.setattr(terminal, "_canonical_json_file", lambda _value: b"{}\n")
+
+    with pytest.raises(terminal.AnswerManifestFailedV1, match="capacity"):
+        terminal._manifest_bytes(
+            request,
+            provenance,
+            (invalid_asset,),
+            attempts,
+        )
+
+
+def test_manifest_aggregate_overflow_precedes_manifest_leaf_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+    written_names: list[str] = []
+    real_write = terminal._write_new_file
+
+    def record_write(path: Path, payload: bytes) -> None:
+        written_names.append(path.name)
+        real_write(path, payload)
+
+    monkeypatch.setattr(terminal, "_write_new_file", record_write)
+    monkeypatch.setattr(terminal, "ANSWER_TERMINAL_MAX_BYTES", 1)
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner, pytest.raises(terminal.AnswerManifestFailedV1):
+            terminal.publish_answer_v1(root, owner, request)
+
+    stage = knowledge_root / "answers" / ".staging" / request.answer_id
+    assert "manifest.json" not in written_names
+    assert not (stage / "manifest.json").exists()
+    assert stage.is_dir()
+
+
+def test_manifest_aggregate_uses_one_actual_serialized_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+    provenance, _request_assets, attempts = terminal._validate_request(request)
+    actual_manifest = b"{}\n"
+    asset = terminal._VerifiedAssetV1(
+        path="answer.md",
+        byte_length=terminal.ANSWER_TERMINAL_MAX_BYTES - len(actual_manifest),
+        sha256="0" * 64,
+        identity_key="media_type",
+        identity_value="text/markdown; charset=utf-8",
+    )
+    serialized: list[object] = []
+
+    def serialize_once(value: object) -> bytes:
+        serialized.append(value)
+        return actual_manifest
+
+    monkeypatch.setattr(terminal, "_canonical_json_file", serialize_once)
+
+    observed = terminal._manifest_bytes(
+        request,
+        provenance,
+        (asset,),
+        attempts,
+    )
+
+    assert observed is actual_manifest
+    assert len(serialized) == 1
+    assert asset.byte_length + 65_536 > terminal.ANSWER_TERMINAL_MAX_BYTES
+
+
+def test_terminal_manifest_uses_the_exclusive_relative_create_seam(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+    calls: list[str] = []
+
+    def exclusive_create(
+        parent: windows_root.ValidatedDataRootV1,
+        component: str,
+        payload: bytes,
+    ) -> None:
+        calls.append(component)
+        canonical_path = parent.inspection.canonical_path
+        assert canonical_path is not None
+        terminal._write_new_file(Path(canonical_path) / component, payload)
+
+    monkeypatch.setattr(
+        terminal,
+        "create_exclusive_file_bytes_v1",
+        exclusive_create,
+        raising=False,
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner:
+            terminal.publish_answer_v1(root, owner, request)
+
+    assert calls == ["manifest.json"]
+
+
+def test_committed_reader_bounds_each_asset_by_its_declared_length(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+    observed_limits: list[int] = []
+    real_read = windows_root.ValidatedFileV1.read_bytes_v1
+
+    def capture_limit(
+        source: windows_root.ValidatedFileV1,
+        *,
+        limit: int,
+    ) -> bytes:
+        if source.canonical_path.endswith(r"\answer.md"):
+            observed_limits.append(limit)
+        return real_read(source, limit=limit)
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner:
+            terminal.publish_answer_v1(root, owner, request)
+        monkeypatch.setattr(
+            windows_root.ValidatedFileV1,
+            "read_bytes_v1",
+            capture_limit,
+        )
+
+        observed = terminal.read_committed_answer_v1(root, request.answer_id)
+
+    assert type(observed) is terminal.TerminalAnswerBytesReadyV1
+    assert observed_limits == [len(request.answer_markdown_bytes or b"")]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b'{"a":[[[[[[[[0]]]]]]]]}\n',
+        b'{"a":10000000000000000000}\n',
+        b'{"a":0.0}\n',
+        b'{"a":1,"a":2}\n',
+    ),
+    ids=("depth-nine", "twenty-digit-integer", "float", "duplicate-key"),
+)
+def test_terminal_manifest_parser_rejects_resource_profile_violations(
+    payload: bytes,
+) -> None:
+    with pytest.raises(terminal.AnswerTerminalRequestInvalidV1):
+        terminal._decode_terminal_manifest_v1(payload)
+
+
+def test_staging_scan_quarantines_an_invalid_candidate_in_place(
+    tmp_path: Path,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    staging = knowledge_root / "answers" / ".staging"
+    invalid = staging / "not-an-answer"
+    invalid.mkdir(parents=True)
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner:
+            scan = terminal.scan_answer_staging_v1(root, owner)
+
+    assert scan.quarantined_count == 1
+    assert scan.recovered_count == 0
+    assert invalid.is_dir()
+
+
+@pytest.mark.parametrize(
+    "valid_target", (True, False), ids=("committed", "quarantined")
+)
+def test_staging_scan_validates_both_existing_target_matrix_rows_without_overwrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    valid_target: bool,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        first_owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert first_owner is not None
+        with first_owner:
+            terminal.publish_answer_v1(root, first_owner, request)
+        target = knowledge_root / "answers" / request.answer_id
+        orphan = knowledge_root / "answers" / ".staging" / request.answer_id
+        shutil.copytree(target, orphan)
+        if not valid_target:
+            target.joinpath("manifest.json").write_bytes(
+                b'{"schema_version":"\\ud800"}\n'
+            )
+        validated_parts: list[tuple[str, ...]] = []
+        real_validate = terminal._validate_terminal_candidate_v1
+
+        def record_validation(
+            observed_root: windows_root.ValidatedDataRootV1,
+            parts: tuple[str, ...],
+            answer_id: str,
+        ) -> terminal.TerminalAnswerBytesReadyV1:
+            validated_parts.append(parts)
+            return real_validate(observed_root, parts, answer_id)
+
+        monkeypatch.setattr(
+            terminal,
+            "_validate_terminal_candidate_v1",
+            record_validation,
+        )
+
+        recovery_owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert recovery_owner is not None
+        with recovery_owner:
+            scan = terminal.scan_answer_staging_v1(root, recovery_owner)
+
+    assert scan.target_conflict_count == 1
+    assert scan.recovered_count == 0
+    assert target.is_dir()
+    assert orphan.is_dir()
+    assert ("answers", ".staging", request.answer_id) in validated_parts
+    assert ("answers", request.answer_id) in validated_parts
+
+
+def test_staging_scan_treats_a_case_alias_target_as_a_quarantined_conflict(
+    tmp_path: Path,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        first_owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert first_owner is not None
+        with first_owner:
+            terminal.publish_answer_v1(root, first_owner, request)
+        target = knowledge_root / "answers" / request.answer_id
+        orphan = knowledge_root / "answers" / ".staging" / request.answer_id
+        shutil.copytree(target, orphan)
+        alias = _rename_answer_target_to_case_alias_v1(target, request.answer_id)
+
+        recovery_owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert recovery_owner is not None
+        with recovery_owner:
+            scan = terminal.scan_answer_staging_v1(root, recovery_owner)
+        observed = terminal.read_committed_answer_v1(root, request.answer_id)
+
+    assert scan.status == "complete"
+    assert scan.entry_count == 1
+    assert scan.quarantined_count == 0
+    assert scan.recovered_count == 0
+    assert scan.recovery_failed_count == 0
+    assert scan.target_conflict_count == 1
+    assert type(observed) is terminal.TerminalAnswerBytesRejectedV1
+    assert alias.is_dir()
+    assert orphan.is_dir()
+
+
+def test_staging_scan_keeps_a_determinate_recovery_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        first_owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert first_owner is not None
+        with first_owner:
+            terminal.publish_answer_v1(root, first_owner, request)
+        target = knowledge_root / "answers" / request.answer_id
+        orphan = knowledge_root / "answers" / ".staging" / request.answer_id
+        target.rename(orphan)
+
+        def fail_rename(_source: object, _target: object) -> None:
+            raise PermissionError("forced determinate failure")
+
+        monkeypatch.setattr(terminal.os, "rename", fail_rename)
+        recovery_owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert recovery_owner is not None
+        with recovery_owner:
+            scan = terminal.scan_answer_staging_v1(root, recovery_owner)
+
+    assert scan.recovery_failed_count == 1
+    assert scan.recovered_count == 0
+    assert orphan.is_dir()
+    assert not target.exists()
+
+
+def test_staging_scan_stops_on_an_indeterminate_recovery_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        first_owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert first_owner is not None
+        with first_owner:
+            terminal.publish_answer_v1(root, first_owner, request)
+        target = knowledge_root / "answers" / request.answer_id
+        orphan = knowledge_root / "answers" / ".staging" / request.answer_id
+        target.rename(orphan)
+        real_rename = terminal.os.rename
+
+        def rename_then_report_failure(source: object, destination: object) -> None:
+            real_rename(source, destination)
+            raise PermissionError("forced uncertain completion")
+
+        monkeypatch.setattr(terminal.os, "rename", rename_then_report_failure)
+        recovery_owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert recovery_owner is not None
+        with recovery_owner, pytest.raises(terminal.AnswerCommitIndeterminateV1):
+            terminal.scan_answer_staging_v1(root, recovery_owner)
+
+    assert target.is_dir()
+    assert not orphan.exists()
+
+
+def test_current_publish_staging_cannot_reenter_orphan_recovery_on_same_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+    rename_calls = 0
+
+    def fail_rename(_source: object, _destination: object) -> None:
+        nonlocal rename_calls
+        rename_calls += 1
+        raise PermissionError("forced determinate no-commit")
+
+    monkeypatch.setattr(terminal.os, "rename", fail_rename)
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner:
+            with pytest.raises(terminal.AnswerCommitFailedV1):
+                terminal.publish_answer_v1(root, owner, request)
+            with pytest.raises(terminal.AnswerWriterOwnershipInvalidV1):
+                terminal.scan_answer_staging_v1(root, owner)
+
+    assert rename_calls == 1
+    assert (knowledge_root / "answers" / ".staging" / request.answer_id).is_dir()
 
 
 def test_terminal_writer_rejects_success_with_a_timeout_attempt() -> None:

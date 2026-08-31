@@ -61,9 +61,127 @@ def test_local_file_is_opened_no_follow_and_streamed_from_one_held_handle(
         assert opened.identity == original_identity
 
     assert b"".join(chunks) == payload
-    assert hashlib.sha256(b"".join(chunks)).hexdigest() == hashlib.sha256(
-        payload
-    ).hexdigest()
+    assert (
+        hashlib.sha256(b"".join(chunks)).hexdigest()
+        == hashlib.sha256(payload).hexdigest()
+    )
+
+
+def test_bounded_file_read_continues_after_short_reads_until_explicit_eof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "answer.md"
+    payload = b"abcdef"
+    source.write_bytes(payload)
+    monkeypatch.setattr(
+        windows_root,
+        "_reject_hidden_short_alias",
+        lambda _parent, _component: None,
+    )
+    offset = 0
+    requested: list[int] = []
+
+    def short_read(
+        _handle: int,
+        buffer: object,
+        requested_count: int,
+        completed: object,
+        _overlapped: object,
+    ) -> int:
+        nonlocal offset
+        requested.append(requested_count)
+        count = min(2, requested_count, len(payload) - offset)
+        if count:
+            ctypes.memmove(buffer, payload[offset : offset + count], count)
+            offset += count
+        ctypes.cast(completed, ctypes.POINTER(ctypes.c_ulong)).contents.value = count
+        return 1
+
+    with open_validated_local_file_v1(str(source)) as opened:
+        monkeypatch.setattr(windows_root, "_READ_FILE", short_read)
+
+        observed = opened.read_bytes_v1(limit=len(payload))
+
+    assert observed == payload
+    assert requested == [7, 5, 3, 1]
+
+
+def test_bounded_file_read_stops_on_the_first_cap_plus_one_witness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "answer.md"
+    payload = b"abcdefg"
+    source.write_bytes(payload)
+    monkeypatch.setattr(
+        windows_root,
+        "_reject_hidden_short_alias",
+        lambda _parent, _component: None,
+    )
+    offset = 0
+    requested: list[int] = []
+
+    def short_read(
+        _handle: int,
+        buffer: object,
+        requested_count: int,
+        completed: object,
+        _overlapped: object,
+    ) -> int:
+        nonlocal offset
+        requested.append(requested_count)
+        count = min(2, requested_count, len(payload) - offset)
+        ctypes.memmove(buffer, payload[offset : offset + count], count)
+        offset += count
+        ctypes.cast(completed, ctypes.POINTER(ctypes.c_ulong)).contents.value = count
+        return 1
+
+    with open_validated_local_file_v1(str(source)) as opened:
+        monkeypatch.setattr(windows_root, "_READ_FILE", short_read)
+
+        with pytest.raises(ValueError, match="read limit"):
+            opened.read_bytes_v1(limit=len(payload) - 1)
+
+    assert offset == len(payload)
+    assert requested == [7, 5, 3, 1]
+
+
+def test_bounded_file_read_rejects_metadata_and_stream_length_disagreement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "answer.md"
+    payload = b"abcdef"
+    source.write_bytes(payload)
+    monkeypatch.setattr(
+        windows_root,
+        "_reject_hidden_short_alias",
+        lambda _parent, _component: None,
+    )
+    stream = b"abc"
+    offset = 0
+
+    def truncated_read(
+        _handle: int,
+        buffer: object,
+        requested_count: int,
+        completed: object,
+        _overlapped: object,
+    ) -> int:
+        nonlocal offset
+        count = min(requested_count, len(stream) - offset)
+        if count:
+            ctypes.memmove(buffer, stream[offset : offset + count], count)
+            offset += count
+        ctypes.cast(completed, ctypes.POINTER(ctypes.c_ulong)).contents.value = count
+        return 1
+
+    with open_validated_local_file_v1(str(source)) as opened:
+        monkeypatch.setattr(windows_root, "_READ_FILE", truncated_read)
+
+        with pytest.raises(windows_root.DataRootOpenErrorV1):
+            opened.read_bytes_v1(limit=len(payload))
 
 
 @pytest.mark.parametrize(
@@ -385,6 +503,7 @@ def test_an_extra_directory_mount_for_the_same_volume_is_unsafe(
         "_GET_LOGICAL_DRIVES",
         lambda: 1 << (ord("X") - ord("A")),
     )
+
     def volume_name(_root: str, buffer: Any, _size: int) -> int:
         buffer.value = r"\\?\Volume{00000000-0000-0000-0000-000000000000}\\"
         return 1
@@ -487,8 +606,7 @@ def test_relative_open_probes_reparse_before_applying_a_type_constraint(
     assert raised.value.status == "unsafe"
     assert len(calls) == 1
     assert not calls[0][1] & (
-        windows_root._FILE_DIRECTORY_FILE
-        | windows_root._FILE_NON_DIRECTORY_FILE
+        windows_root._FILE_DIRECTORY_FILE | windows_root._FILE_NON_DIRECTORY_FILE
     )
 
 
@@ -499,6 +617,56 @@ def test_file_id_info_keeps_all_128_identifier_bits() -> None:
     value.FileId.Identifier[:] = raw.to_bytes(16, "little")
 
     assert windows_root._identity_from_file_id_info(value) == (7, raw)
+
+
+def test_exclusive_relative_create_holds_zero_sharing_while_writing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root = tmp_path / "knowledge"
+    data_root.mkdir()
+    target = data_root / "manifest.json"
+    real_write = windows_root._WRITE_FILE
+    sharing_witnesses: list[str] = []
+
+    def write_with_sharing_witness(*args: Any) -> int:
+        with pytest.raises(PermissionError):
+            target.open("r+b")
+        sharing_witnesses.append("exclusive")
+        return real_write(*args)
+
+    monkeypatch.setattr(windows_root, "_WRITE_FILE", write_with_sharing_witness)
+
+    with open_validated_data_root_v1(str(data_root)) as root:
+        windows_root.create_exclusive_file_bytes_v1(
+            root,
+            "manifest.json",
+            b'{"schema_version":"test.v1"}\n',
+        )
+
+    assert sharing_witnesses
+    assert target.read_bytes() == b'{"schema_version":"test.v1"}\n'
+
+
+def test_exclusive_relative_create_never_opens_or_overwrites_an_existing_leaf(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "knowledge"
+    data_root.mkdir()
+    target = data_root / "manifest.json"
+    target.write_bytes(b"authority\n")
+
+    with (
+        open_validated_data_root_v1(str(data_root)) as root,
+        pytest.raises(windows_root.DataRootOpenErrorV1),
+    ):
+        windows_root.create_exclusive_file_bytes_v1(
+            root,
+            "manifest.json",
+            b"replacement\n",
+        )
+
+    assert target.read_bytes() == b"authority\n"
 
 
 def test_directory_enumeration_preserves_an_8dot3_short_name(
@@ -591,8 +759,7 @@ def test_data_root_revalidates_short_alias_evidence_for_every_component(
         pass
 
     components = tuple(
-        ntpath.basename(path)
-        for path in windows_root._parent_chain(str(data_root))[1:]
+        ntpath.basename(path) for path in windows_root._parent_chain(str(data_root))[1:]
     )
     assert checked == [*components, *components]
 

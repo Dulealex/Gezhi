@@ -4,6 +4,7 @@ import hashlib
 import math
 import re
 import sqlite3
+import unicodedata
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -30,6 +31,7 @@ from gezhi._knowledge_registry import (
     canonical_json_bytes_v1,
     decode_canonical_json_blob_v1,
     fts_literal_query_v1,
+    normalize_search_query_v1,
     search_document_fields_v1,
     validate_normalized_search_text_v1,
 )
@@ -47,6 +49,9 @@ _VIEW_SCHEMA_VERSION = "gezhi.retrieval_view.v1"
 _VIEW_LIMIT_BYTES = 262_144
 _AUDIT_LIMIT_BYTES = 2_097_152
 _ZERO_VIEW_SHA256 = "51aebe839e0caa991344efe4c0a19518b93a1d59aaa9bccbd1c6220a367641ec"
+_WITNESS_ACCEPT_PAYLOAD_SHA256ES = frozenset(
+    {"3a421e895f79e2c167e2ef4b4f42ece44839ca487c11e6659870904f268eabf1"}
+)
 _CANDIDATE_ID = re.compile(r"^cand_[0-9a-f]{24}$", re.ASCII)
 _HANDOFF_ID = re.compile(r"^hnd_[0-9a-f]{24}$", re.ASCII)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
@@ -710,6 +715,434 @@ def _rank_candidates_v1(
     )
 
 
+def _terminal_json_object_v1(payload: bytes, *, label: str) -> dict[str, object]:
+    if (
+        type(payload) is not bytes
+        or not payload.endswith(b"\n")
+        or payload.startswith(b"\xef\xbb\xbf")
+        or b"\r" in payload
+    ):
+        raise RetrievalMaterializationFailedV1(f"{label} framing is invalid")
+    try:
+        value = decode_canonical_json_blob_v1(payload[:-1])
+    except ValueError as error:
+        raise RetrievalMaterializationFailedV1(f"{label} JSON is invalid") from error
+    if type(value) is not dict or _canonical_json_file_v1(value) != payload:
+        raise RetrievalMaterializationFailedV1(f"{label} identity differs")
+    return cast(dict[str, object], value)
+
+
+def _terminal_question_and_query_v1(
+    question_bytes: bytes,
+    retrieval_query_bytes: bytes | None,
+) -> SearchTextV1 | None:
+    question_asset = _terminal_json_object_v1(question_bytes, label="Question asset")
+    question = question_asset.get("question")
+    if (
+        set(question_asset) != {"question", "schema_version"}
+        or question_asset.get("schema_version") != "gezhi.question.v1"
+        or type(question) is not str
+        or len(question) > 2_000
+        or len(question.encode("utf-8")) > 8_192
+        or "\x00" in question
+        or any(unicodedata.category(character) == "Cs" for character in question)
+        or any(
+            unicodedata.category(character) == "Cc" and character not in {"\t", "\n"}
+            for character in question
+        )
+        or unicodedata.normalize(
+            "NFC",
+            question.replace("\r\n", "\n").replace("\r", "\n"),
+        ).strip()
+        != question
+    ):
+        raise RetrievalMaterializationFailedV1("Question asset is invalid")
+    try:
+        search_text = normalize_search_query_v1(question)
+    except (ValueError, UnicodeError) as error:
+        raise RetrievalMaterializationFailedV1(
+            "Question search projection is invalid"
+        ) from error
+    if retrieval_query_bytes is None:
+        return None
+    query_asset = _terminal_json_object_v1(
+        retrieval_query_bytes,
+        label="Retrieval Query asset",
+    )
+    expected_query: dict[str, object] = {
+        "normalized_text": search_text.normalized_text,
+        "schema_version": "gezhi.retrieval_query.v1",
+        "trigram_atoms": list(search_text.trigram_atoms),
+        "unicode61_atoms": list(search_text.unicode61_atoms),
+    }
+    if query_asset != expected_query:
+        raise RetrievalMaterializationFailedV1(
+            "Retrieval Query does not match the Question"
+        )
+    return search_text
+
+
+def _terminal_branch_v1(
+    raw_branch: object,
+    *,
+    label: str,
+) -> tuple[
+    tuple[_BranchHitV1, ...],
+    dict[str, tuple[str, int, str]],
+]:
+    if type(raw_branch) is not list or len(raw_branch) > 48:
+        raise RetrievalMaterializationFailedV1(f"Retrieval {label} branch is invalid")
+    hits: list[_BranchHitV1] = []
+    identities: dict[str, tuple[str, int, str]] = {}
+    previous: tuple[float, bytes] | None = None
+    for rank, raw_item in enumerate(raw_branch, start=1):
+        if type(raw_item) is not dict or set(raw_item) != {
+            "bm25_float64_hex",
+            "candidate_id",
+            "payload_sha256",
+            "rank",
+            "review_revision",
+            "search_projection_sha256",
+        }:
+            raise RetrievalMaterializationFailedV1(
+                f"Retrieval {label} branch item is invalid"
+            )
+        candidate_id = raw_item.get("candidate_id")
+        payload_sha256 = raw_item.get("payload_sha256")
+        revision = raw_item.get("review_revision")
+        projection_sha256 = raw_item.get("search_projection_sha256")
+        score_hex = raw_item.get("bm25_float64_hex")
+        if (
+            type(candidate_id) is not str
+            or _CANDIDATE_ID.fullmatch(candidate_id) is None
+            or candidate_id in identities
+            or not _is_hash_v1(payload_sha256)
+            or candidate_id != "cand_" + payload_sha256[:24]
+            or type(revision) is not int
+            or not 1 <= revision <= _MAX_INT64
+            or not _is_hash_v1(projection_sha256)
+            or raw_item.get("rank") != rank
+            or type(raw_item.get("rank")) is not int
+            or type(score_hex) is not str
+        ):
+            raise RetrievalMaterializationFailedV1(
+                f"Retrieval {label} branch identity is invalid"
+            )
+        try:
+            score = float.fromhex(score_hex)
+        except ValueError as error:
+            raise RetrievalMaterializationFailedV1(
+                f"Retrieval {label} branch score is invalid"
+            ) from error
+        order_key = (score, candidate_id.encode("ascii"))
+        if (
+            not math.isfinite(score)
+            or score.hex() != score_hex
+            or previous is not None
+            and previous >= order_key
+        ):
+            raise RetrievalMaterializationFailedV1(
+                f"Retrieval {label} branch order is invalid"
+            )
+        hits.append(_BranchHitV1(candidate_id, rank, score_hex))
+        identities[candidate_id] = (
+            payload_sha256,
+            revision,
+            projection_sha256,
+        )
+        previous = order_key
+    return tuple(hits), identities
+
+
+def _terminal_final_selection_v1(
+    raw_selection: object,
+    *,
+    unicode_hits: tuple[_BranchHitV1, ...],
+    trigram_hits: tuple[_BranchHitV1, ...],
+    identities: dict[str, tuple[str, int, str]],
+) -> tuple[str, ...]:
+    if type(raw_selection) is not list or len(raw_selection) > 12:
+        raise RetrievalMaterializationFailedV1("Retrieval final selection is invalid")
+    expected = _rank_candidates_v1(unicode_hits, trigram_hits)
+    if len(raw_selection) != len(expected):
+        raise RetrievalMaterializationFailedV1(
+            "Retrieval final selection count differs"
+        )
+    selected: list[str] = []
+    for raw_item, expected_item in zip(raw_selection, expected, strict=True):
+        if type(raw_item) is not dict or set(raw_item) != {
+            "candidate_id",
+            "final_rank",
+            "payload_sha256",
+            "review_revision",
+            "rrf_denominator",
+            "rrf_numerator",
+            "search_projection_sha256",
+            "trigram_rank",
+            "unicode61_rank",
+        }:
+            raise RetrievalMaterializationFailedV1(
+                "Retrieval final selection item is invalid"
+            )
+        candidate_id = raw_item.get("candidate_id")
+        if type(candidate_id) is not str:
+            raise RetrievalMaterializationFailedV1(
+                "Retrieval final selection identity is invalid"
+            )
+        identity = identities.get(candidate_id)
+        if identity is None:
+            raise RetrievalMaterializationFailedV1(
+                "Retrieval final selection has no branch identity"
+            )
+        payload_sha256, revision, projection_sha256 = identity
+        integer_values = (
+            raw_item.get("final_rank"),
+            raw_item.get("review_revision"),
+            raw_item.get("rrf_denominator"),
+            raw_item.get("rrf_numerator"),
+        )
+        optional_ranks = (
+            raw_item.get("trigram_rank"),
+            raw_item.get("unicode61_rank"),
+        )
+        if (
+            any(type(value) is not int for value in integer_values)
+            or any(
+                value is not None and type(value) is not int for value in optional_ranks
+            )
+            or candidate_id != expected_item.candidate_id
+            or raw_item.get("final_rank") != expected_item.final_rank
+            or raw_item.get("payload_sha256") != payload_sha256
+            or raw_item.get("review_revision") != revision
+            or raw_item.get("search_projection_sha256") != projection_sha256
+            or raw_item.get("rrf_denominator") != expected_item.rrf_denominator
+            or raw_item.get("rrf_numerator") != expected_item.rrf_numerator
+            or raw_item.get("trigram_rank") != expected_item.trigram_rank
+            or raw_item.get("unicode61_rank") != expected_item.unicode61_rank
+        ):
+            raise RetrievalMaterializationFailedV1(
+                "Retrieval final selection differs from dual-branch RRF"
+            )
+        selected.append(candidate_id)
+    return tuple(selected)
+
+
+def _terminal_retrieval_view_v1(
+    retrieval_view_bytes: bytes,
+    *,
+    selected_candidate_ids: tuple[str, ...],
+    identities: dict[str, tuple[str, int, str]],
+) -> None:
+    view = _terminal_json_object_v1(
+        retrieval_view_bytes,
+        label="Retrieval View asset",
+    )
+    items = view.get("items")
+    if (
+        set(view) != {"answer_kind", "candidate_count", "items", "schema_version"}
+        or view.get("answer_kind") != "candidate_backed"
+        or view.get("schema_version") != _VIEW_SCHEMA_VERSION
+        or type(view.get("candidate_count")) is not int
+        or view.get("candidate_count") != len(selected_candidate_ids)
+        or type(items) is not list
+        or len(items) != len(selected_candidate_ids)
+    ):
+        raise RetrievalMaterializationFailedV1("Retrieval View is invalid")
+    for rank, (raw_item, selected_candidate_id) in enumerate(
+        zip(items, selected_candidate_ids, strict=True),
+        start=1,
+    ):
+        if (
+            type(raw_item) is not dict
+            or set(raw_item)
+            != {
+                "candidate",
+                "citation",
+                "descriptor_snapshots",
+                "evidence_snapshots",
+                "governance",
+                "rank",
+            }
+            or raw_item.get("rank") != rank
+            or type(raw_item.get("rank")) is not int
+            or raw_item.get("governance")
+            != {
+                "intake_status": "active",
+                "promotion_status": "not_promoted",
+                "review_status": "accepted",
+            }
+            or type(raw_item.get("candidate")) is not dict
+            or type(raw_item.get("citation")) is not dict
+            or type(raw_item.get("descriptor_snapshots")) is not list
+            or type(raw_item.get("evidence_snapshots")) is not list
+        ):
+            raise RetrievalMaterializationFailedV1("Retrieval View item is invalid")
+        synthetic_record: dict[str, object] = {
+            "action": "accept",
+            "candidate": raw_item["candidate"],
+            "citation": raw_item["citation"],
+            "descriptor_snapshots": raw_item["descriptor_snapshots"],
+            "evidence_snapshots": raw_item["evidence_snapshots"],
+            "review_receipt": {},
+            "schema_version": "gezhi.reviewed_candidate_action.v1",
+        }
+        try:
+            raw_candidate = cast(dict[str, object], raw_item["candidate"])
+            candidate_id, payload_sha256 = _validate_accept_record(
+                synthetic_record,
+                exact_witness=(
+                    raw_candidate.get("payload_sha256")
+                    in _WITNESS_ACCEPT_PAYLOAD_SHA256ES
+                ),
+            )
+        except (KeyError, TypeError, ValueError, _HandoffInvalidV1) as error:
+            raise RetrievalMaterializationFailedV1(
+                "Retrieval View Candidate snapshot is invalid"
+            ) from error
+        identity = identities.get(selected_candidate_id)
+        if (
+            identity is None
+            or candidate_id != selected_candidate_id
+            or payload_sha256 != identity[0]
+        ):
+            raise RetrievalMaterializationFailedV1(
+                "Retrieval View Candidate identity differs"
+            )
+
+
+def validate_terminal_retrieval_assets_v1(
+    *,
+    question_bytes: bytes,
+    retrieval_query_bytes: bytes | None,
+    retrieval_audit_bytes: bytes | None,
+    retrieval_view_bytes: bytes | None,
+) -> None:
+    """Re-run retrieval adapters for a persisted Answer terminal prefix."""
+
+    search_text = _terminal_question_and_query_v1(
+        question_bytes,
+        retrieval_query_bytes,
+    )
+    if retrieval_query_bytes is None:
+        if retrieval_audit_bytes is not None or retrieval_view_bytes is not None:
+            raise RetrievalMaterializationFailedV1(
+                "Retrieval asset prefix is discontinuous"
+            )
+        return
+    if search_text is None:
+        raise RetrievalMaterializationFailedV1("Retrieval Query is invalid")
+    if retrieval_audit_bytes is None:
+        if retrieval_view_bytes is not None:
+            raise RetrievalMaterializationFailedV1(
+                "Retrieval asset prefix is discontinuous"
+            )
+        return
+    audit = _terminal_json_object_v1(
+        retrieval_audit_bytes,
+        label="Retrieval Audit asset",
+    )
+    if len(retrieval_audit_bytes) > _AUDIT_LIMIT_BYTES or set(audit) != {
+        "algorithm_version",
+        "branch_results",
+        "final_selection",
+        "query_atoms",
+        "question_asset_sha256",
+        "registry_snapshot_sha256",
+        "retrieval_query_asset_sha256",
+        "retrieval_view_measurement",
+        "schema_version",
+    }:
+        raise RetrievalMaterializationFailedV1("Retrieval Audit is invalid")
+    branch_results = audit.get("branch_results")
+    if type(branch_results) is not dict or set(branch_results) != {
+        "trigram",
+        "unicode61",
+    }:
+        raise RetrievalMaterializationFailedV1(
+            "Retrieval Audit branch results are invalid"
+        )
+    trigram_hits, trigram_identities = _terminal_branch_v1(
+        branch_results["trigram"],
+        label="trigram",
+    )
+    unicode_hits, unicode_identities = _terminal_branch_v1(
+        branch_results["unicode61"],
+        label="unicode61",
+    )
+    if (not search_text.trigram_atoms and trigram_hits) or (
+        not search_text.unicode61_atoms and unicode_hits
+    ):
+        raise RetrievalMaterializationFailedV1(
+            "Retrieval branch has no matching query atoms"
+        )
+    identities = dict(trigram_identities)
+    for candidate_id, identity in unicode_identities.items():
+        observed = identities.setdefault(candidate_id, identity)
+        if observed != identity:
+            raise RetrievalMaterializationFailedV1(
+                "Retrieval branch Candidate identities differ"
+            )
+    selected_candidate_ids = _terminal_final_selection_v1(
+        audit.get("final_selection"),
+        unicode_hits=unicode_hits,
+        trigram_hits=trigram_hits,
+        identities=identities,
+    )
+    if (
+        audit.get("algorithm_version") != _ALGORITHM_VERSION
+        or audit.get("schema_version") != _AUDIT_SCHEMA_VERSION
+        or audit.get("query_atoms")
+        != {
+            "trigram": list(search_text.trigram_atoms),
+            "unicode61": list(search_text.unicode61_atoms),
+        }
+        or audit.get("question_asset_sha256")
+        != hashlib.sha256(question_bytes).hexdigest()
+        or audit.get("retrieval_query_asset_sha256")
+        != hashlib.sha256(retrieval_query_bytes).hexdigest()
+        or not _is_hash_v1(audit.get("registry_snapshot_sha256"))
+    ):
+        raise RetrievalMaterializationFailedV1("Retrieval Audit identity differs")
+    measurement = audit.get("retrieval_view_measurement")
+    if type(measurement) is not dict or set(measurement) != {
+        "byte_length",
+        "limit_bytes",
+        "sha256",
+        "status",
+    }:
+        raise RetrievalMaterializationFailedV1("Retrieval View measurement is invalid")
+    byte_length = measurement.get("byte_length")
+    status = measurement.get("status")
+    if (
+        type(byte_length) is not int
+        or byte_length < 1
+        or measurement.get("limit_bytes") != _VIEW_LIMIT_BYTES
+        or type(measurement.get("limit_bytes")) is not int
+        or not _is_hash_v1(measurement.get("sha256"))
+        or status not in {"within_limit", "too_large"}
+        or status == "within_limit"
+        and byte_length > _VIEW_LIMIT_BYTES
+        or status == "too_large"
+        and byte_length <= _VIEW_LIMIT_BYTES
+    ):
+        raise RetrievalMaterializationFailedV1("Retrieval View measurement differs")
+    if retrieval_view_bytes is None:
+        return
+    if (
+        status != "within_limit"
+        or byte_length != len(retrieval_view_bytes)
+        or measurement.get("sha256") != hashlib.sha256(retrieval_view_bytes).hexdigest()
+    ):
+        raise RetrievalMaterializationFailedV1(
+            "Retrieval View bytes differ from their measurement"
+        )
+    _terminal_retrieval_view_v1(
+        retrieval_view_bytes,
+        selected_candidate_ids=selected_candidate_ids,
+        identities=identities,
+    )
+
+
 def _branch_audit_items_v1(
     hits: tuple[_BranchHitV1, ...],
     snapshots: dict[str, _CandidateSnapshotV1],
@@ -1083,4 +1516,5 @@ __all__ = [
     "RetrievalMaterializationFailedV1",
     "RetrievalQueryFailedV1",
     "ZeroCandidateRetrievalV1",
+    "validate_terminal_retrieval_assets_v1",
 ]

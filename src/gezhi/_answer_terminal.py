@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import ntpath
 import os
 import re
 import time
@@ -11,14 +12,24 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, TypeAlias, cast
 
+from gezhi._knowledge_answerer import (
+    KnowledgeAnswererInputInvalidV1,
+    validate_terminal_answer_content_v1,
+)
 from gezhi._knowledge_attempt_events import (
     KNOWLEDGE_ATTEMPT_EVENTS_CAP_V1,
     parse_knowledge_attempt_events_v1,
     project_knowledge_attempt_usage_v1,
 )
+from gezhi._knowledge_retrieval import (
+    RetrievalMaterializationFailedV1,
+    validate_terminal_retrieval_assets_v1,
+)
 from gezhi._windows_data_root import (
+    DataRootLifecycleErrorV1,
     DataRootOpenErrorV1,
     ValidatedDataRootV1,
+    create_exclusive_file_bytes_v1,
     open_validated_data_root_v1,
     open_validated_local_file_v1,
 )
@@ -37,6 +48,7 @@ _UTC_MILLISECONDS = re.compile(
 )
 _GIT_REVISION = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_JSON_NUMBER = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
 _INT64_MAX = 9_223_372_036_854_775_807
 
 ANSWER_MANIFEST_MAX_BYTES = 65_536
@@ -96,6 +108,23 @@ _ROOT_ASSET_SPECS = (
 
 _ATTEMPT_EVENTS_CAP = KNOWLEDGE_ATTEMPT_EVENTS_CAP_V1
 _ATTEMPT_FINAL_CAP = 1_048_576
+_ASSET_READ_ORDER = (
+    "effective_config.json",
+    "question.json",
+    "retrieval_query.json",
+    "retrieval_audit.json",
+    "retrieval_view.json",
+    "prompt.txt",
+    "schema.json",
+    "attempts/01/events.jsonl",
+    "attempts/01/final_message.txt",
+    "attempts/02/events.jsonl",
+    "attempts/02/final_message.txt",
+    "attempts/03/events.jsonl",
+    "attempts/03/final_message.txt",
+    "answer_output.json",
+    "answer.md",
+)
 _ERROR_MATRIX = {
     "fts5_unavailable": ("blocked", "retrieval"),
     "retrieval_view_too_large": ("blocked", "retrieval"),
@@ -121,7 +150,7 @@ _EXPECTED_EFFECTIVE_CONFIG = {
     "schema_version": "gezhi.knowledge_answerer_effective_config.v1",
 }
 
-StagingScanStatusV1: TypeAlias = Literal["empty", "recovery_unsupported"]
+StagingScanStatusV1: TypeAlias = Literal["empty", "complete"]
 
 
 class AnswerTerminalErrorV1(RuntimeError):
@@ -168,6 +197,10 @@ class AnswerCommitIndeterminateV1(AnswerTerminalErrorV1):
 class AnswerStagingScanV1:
     status: StagingScanStatusV1
     entry_count: int
+    quarantined_count: int = 0
+    recovered_count: int = 0
+    recovery_failed_count: int = 0
+    target_conflict_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,6 +245,26 @@ class CommittedAnswerProofV1:
 
 
 @dataclass(frozen=True, slots=True)
+class TerminalAnswerBytesReadyV1:
+    """One fully revalidated committed Answer and its Human projection."""
+
+    answer_id: str
+    manifest_sha256: str
+    status: Literal["succeeded", "blocked", "failed", "interrupted"]
+    error: dict[str, object] | None
+    answer_output_bytes: bytes | None
+    answer_markdown_bytes: bytes | None
+    answer_markdown_text: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalAnswerBytesRejectedV1:
+    """The requested formal target failed closed as one indivisible Answer."""
+
+    answer_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class _VerifiedAssetV1:
     path: str
     byte_length: int
@@ -226,6 +279,32 @@ class _VerifiedAssetV1:
             "sha256": self.sha256,
             self.identity_key: self.identity_value,
         }
+
+
+class _TerminalCandidateRejectedV1(ValueError):
+    """Internal whole-candidate rejection; no partial facts may escape."""
+
+
+@dataclass(frozen=True, slots=True)
+class _InspectedAnswerOrphanV1:
+    answer_id: str
+    candidate_identity: tuple[int, int]
+    terminal: TerminalAnswerBytesReadyV1
+
+
+@dataclass(frozen=True, slots=True)
+class _ManifestTerminalFactsV1:
+    status: Literal["succeeded", "blocked", "failed", "interrupted"]
+    error: dict[str, object] | None
+    provenance: dict[str, object]
+    attempts: tuple[dict[str, object], ...]
+
+
+@dataclass(slots=True)
+class _JsonContainerFrameV1:
+    kind: Literal["object", "array"]
+    state: str
+    item_count: int = 0
 
 
 def _root_facts(root: ValidatedDataRootV1) -> tuple[str, tuple[int, int]]:
@@ -274,15 +353,34 @@ def _case_insensitive_name_present(names: tuple[str, ...], expected: str) -> boo
     return any(name.lower() == expected_ascii for name in names)
 
 
+def _case_insensitive_entry_present(
+    parent: ValidatedDataRootV1,
+    expected: str,
+) -> bool:
+    return _case_insensitive_name_present(
+        tuple(entry.name for entry in parent.relative_entries_v1()),
+        expected,
+    )
+
+
 def _open_existing_child(
     parent: ValidatedDataRootV1,
     child: str,
 ) -> ValidatedDataRootV1 | None:
-    names = parent.relative_entry_names_v1()
-    aliases = tuple(name for name in names if name.lower() == child.lower())
+    aliases = tuple(
+        entry
+        for entry in parent.relative_entries_v1()
+        if entry.name.lower() == child.lower()
+    )
     if not aliases:
         return None
-    if aliases != (child,):
+    if (
+        len(aliases) != 1
+        or aliases[0].name != child
+        or not aliases[0].is_directory
+        or aliases[0].is_reparse
+        or aliases[0].short_name is not None
+    ):
         raise DataRootOpenErrorV1("unsafe")
     return parent.open_relative_data_root_v1((child,))
 
@@ -291,7 +389,7 @@ def scan_answer_staging_v1(
     root: ValidatedDataRootV1,
     ownership: WriterOwnershipV1,
 ) -> AnswerStagingScanV1:
-    """Read-only pre-ID scan; recovery itself is deliberately deferred to T23."""
+    """Inspect and, when fully proved, complete historical terminal commits."""
 
     _assert_writer_ownership(root, ownership)
     _root_checkpoint(root)
@@ -306,7 +404,7 @@ def scan_answer_staging_v1(
                 _root_checkpoint(root)
                 return AnswerStagingScanV1(status="empty", entry_count=0)
             with staging:
-                names = staging.relative_entry_names_v1()
+                entries = staging.relative_entries_v1()
     except AnswerRootIntegrityLostV1:
         raise
     except (DataRootOpenErrorV1, OSError, ValueError) as error:
@@ -315,12 +413,187 @@ def scan_answer_staging_v1(
             "Answer staging could not be safely enumerated"
         ) from error
     _root_checkpoint(root)
-    if names:
-        return AnswerStagingScanV1(
-            status="recovery_unsupported",
-            entry_count=len(names),
+    if not entries:
+        return AnswerStagingScanV1(status="empty", entry_count=0)
+
+    quarantined_count = 0
+    recovered_count = 0
+    recovery_failed_count = 0
+    target_conflict_count = 0
+    for entry in entries:
+        name = entry.name
+        if (
+            _ANSWER_ID.fullmatch(name) is None
+            or entry.is_reparse
+            or not entry.is_directory
+            or entry.short_name is not None
+        ):
+            quarantined_count += 1
+            continue
+        try:
+            inspected = _inspect_answer_orphan_v1(root, ownership, name)
+        except _TerminalCandidateRejectedV1:
+            quarantined_count += 1
+            continue
+        outcome = _complete_answer_orphan_v1(root, ownership, inspected)
+        if outcome == "recovered":
+            recovered_count += 1
+        elif outcome == "target_conflict":
+            target_conflict_count += 1
+        elif outcome == "recovery_failed":
+            recovery_failed_count += 1
+        else:
+            raise RuntimeError("Answer orphan completion outcome is invalid")
+    _root_checkpoint(root)
+    return AnswerStagingScanV1(
+        status="complete",
+        entry_count=len(entries),
+        quarantined_count=quarantined_count,
+        recovered_count=recovered_count,
+        recovery_failed_count=recovery_failed_count,
+        target_conflict_count=target_conflict_count,
+    )
+
+
+def _consume_current_publish_v1(
+    root: ValidatedDataRootV1,
+    ownership: WriterOwnershipV1,
+) -> None:
+    _, identity = _root_facts(root)
+    if type(ownership) is not WriterOwnershipV1:
+        raise TypeError("Knowledge Answer writer ownership type is invalid")
+    try:
+        ownership.consume_knowledge_answer_publish_v1(identity)
+    except (WriterOwnershipLifecycleErrorV1, ValueError) as error:
+        raise AnswerWriterOwnershipInvalidV1(
+            "Knowledge Answer current publication is unavailable"
+        ) from error
+
+
+def _bind_current_staging_v1(
+    root: ValidatedDataRootV1,
+    ownership: WriterOwnershipV1,
+    answer_id: str,
+) -> None:
+    _, identity = _root_facts(root)
+    try:
+        ownership.bind_knowledge_answer_active_staging_v1(identity, answer_id)
+    except (WriterOwnershipLifecycleErrorV1, ValueError) as error:
+        raise AnswerWriterOwnershipInvalidV1(
+            "Knowledge Answer current staging could not be bound"
+        ) from error
+
+
+def _inspect_answer_orphan_v1(
+    root: ValidatedDataRootV1,
+    ownership: WriterOwnershipV1,
+    answer_id: str,
+) -> _InspectedAnswerOrphanV1:
+    _assert_writer_ownership(root, ownership)
+    if _ANSWER_ID.fullmatch(answer_id) is None:
+        raise _TerminalCandidateRejectedV1("Answer orphan basename is invalid")
+    _, identity = _root_facts(root)
+    try:
+        ownership.assert_knowledge_answer_orphan_ownership_v1(identity, answer_id)
+    except (WriterOwnershipLifecycleErrorV1, ValueError) as error:
+        raise AnswerWriterOwnershipInvalidV1(
+            "current Answer staging cannot enter orphan recovery"
+        ) from error
+    terminal = _validate_terminal_candidate_v1(
+        root,
+        ("answers", ".staging", answer_id),
+        answer_id,
+    )
+    try:
+        with root.open_relative_data_root_v1(
+            ("answers", ".staging", answer_id)
+        ) as candidate:
+            candidate_identity = candidate.inspection.identity
+    except (DataRootOpenErrorV1, OSError, ValueError) as error:
+        raise _TerminalCandidateRejectedV1(
+            "Answer orphan identity could not be proved"
+        ) from error
+    if candidate_identity is None:
+        raise _TerminalCandidateRejectedV1("Answer orphan identity could not be proved")
+    return _InspectedAnswerOrphanV1(
+        answer_id=answer_id,
+        candidate_identity=candidate_identity,
+        terminal=terminal,
+    )
+
+
+def _classify_existing_answer_target_v1(
+    root: ValidatedDataRootV1,
+    answer_id: str,
+) -> Literal["committed", "quarantined"]:
+    try:
+        _validate_terminal_candidate_v1(
+            root,
+            ("answers", answer_id),
+            answer_id,
         )
-    return AnswerStagingScanV1(status="empty", entry_count=0)
+    except _TerminalCandidateRejectedV1:
+        return "quarantined"
+    return "committed"
+
+
+def _complete_answer_orphan_v1(
+    root: ValidatedDataRootV1,
+    ownership: WriterOwnershipV1,
+    inspected: _InspectedAnswerOrphanV1,
+) -> Literal["recovered", "target_conflict", "recovery_failed"]:
+    _assert_writer_ownership(root, ownership)
+    if type(inspected) is not _InspectedAnswerOrphanV1:
+        raise TypeError("Inspected Answer orphan type is invalid")
+    answer_id = inspected.answer_id
+    root_path_text, root_identity = _root_facts(root)
+    _root_checkpoint(root)
+    try:
+        with root.open_relative_data_root_v1(
+            ("answers", ".staging", answer_id)
+        ) as candidate:
+            if (
+                candidate.inspection.identity != inspected.candidate_identity
+                or candidate.inspection.identity is None
+                or candidate.inspection.identity[0] != root_identity[0]
+            ):
+                raise AnswerRootIntegrityLostV1("Answer orphan identity changed")
+        with root.open_relative_data_root_v1(("answers",)) as answers:
+            target_present = _case_insensitive_entry_present(answers, answer_id)
+        if target_present:
+            target_state = _classify_existing_answer_target_v1(root, answer_id)
+            if target_state not in {"committed", "quarantined"}:
+                raise RuntimeError("Answer target classification is invalid")
+            return "target_conflict"
+    except AnswerRootIntegrityLostV1:
+        raise
+    except (DataRootOpenErrorV1, OSError, ValueError) as error:
+        _root_checkpoint(root)
+        raise AnswerRootIntegrityLostV1(
+            "Answer orphan final checkpoint could not be proved"
+        ) from error
+
+    _root_checkpoint(root)
+    root_path = Path(root_path_text)
+    stage_path = root_path / "answers" / ".staging" / answer_id
+    target_path = root_path / "answers" / answer_id
+    try:
+        os.rename(stage_path, target_path)
+    except OSError as error:
+        _root_checkpoint(root)
+        staging_present, target_present = _namespace_state(root, answer_id)
+        if staging_present and target_present and isinstance(error, FileExistsError):
+            target_state = _classify_existing_answer_target_v1(root, answer_id)
+            if target_state not in {"committed", "quarantined"}:
+                raise RuntimeError("Answer target classification is invalid")
+            return "target_conflict"
+        if staging_present and not target_present:
+            return "recovery_failed"
+        raise AnswerCommitIndeterminateV1(
+            "Answer orphan rename outcome is indeterminate"
+        ) from error
+    _root_checkpoint(root)
+    return "recovered"
 
 
 def _validate_timestamp(value: object) -> str:
@@ -393,8 +666,216 @@ def _decode_canonical_json_asset(payload: bytes) -> dict[str, object]:
         )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise AnswerTerminalRequestInvalidV1("Answer JSON asset is invalid") from error
-    if type(decoded) is not dict or _canonical_json_file(decoded) != payload:
+    if type(decoded) is not dict:
         raise AnswerTerminalRequestInvalidV1("Answer JSON asset is not canonical")
+    try:
+        canonical = _canonical_json_file(decoded)
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer JSON asset is not canonical"
+        ) from error
+    if canonical != payload:
+        raise AnswerTerminalRequestInvalidV1("Answer JSON asset is not canonical")
+    return cast(dict[str, object], decoded)
+
+
+def _skip_json_string_v1(value: str, offset: int) -> int:
+    if offset >= len(value) or value[offset] != '"':
+        raise ValueError("JSON string is absent")
+    index = offset + 1
+    while index < len(value):
+        character = value[index]
+        if character == '"':
+            return index + 1
+        if ord(character) < 0x20:
+            raise ValueError("JSON string contains a control character")
+        if character != "\\":
+            index += 1
+            continue
+        index += 1
+        if index >= len(value) or value[index] not in '"\\/bfnrtu':
+            raise ValueError("JSON string escape is invalid")
+        if value[index] == "u":
+            digits = value[index + 1 : index + 5]
+            if len(digits) != 4 or any(
+                digit not in "0123456789abcdefABCDEF" for digit in digits
+            ):
+                raise ValueError("JSON Unicode escape is invalid")
+            index += 5
+        else:
+            index += 1
+    raise ValueError("JSON string is unterminated")
+
+
+def _manifest_structural_preflight_v1(value: str) -> None:
+    stack: list[_JsonContainerFrameV1] = []
+    root_state = "value"
+    total_pairs = 0
+    total_array_items = 0
+    total_containers = 0
+    total_nodes = 0
+    index = 0
+
+    def skip_space(offset: int) -> int:
+        while offset < len(value) and value[offset] in " \t\r\n":
+            offset += 1
+        return offset
+
+    def begin_value(offset: int) -> int:
+        nonlocal total_containers, total_nodes
+        offset = skip_space(offset)
+        if offset >= len(value):
+            raise ValueError("JSON value is absent")
+        total_nodes += 1
+        if total_nodes > 256:
+            raise ValueError("JSON node limit is exceeded")
+        character = value[offset]
+        if character in "{[":
+            total_containers += 1
+            if total_containers > 32 or len(stack) + 1 > 8:
+                raise ValueError("JSON container limit is exceeded")
+            stack.append(
+                _JsonContainerFrameV1(
+                    kind="object" if character == "{" else "array",
+                    state="key_or_end" if character == "{" else "value_or_end",
+                )
+            )
+            return offset + 1
+        if character == '"':
+            return _skip_json_string_v1(value, offset)
+        for literal in ("true", "false", "null"):
+            if value.startswith(literal, offset):
+                return offset + len(literal)
+        match = _JSON_NUMBER.match(value, offset)
+        if match is None:
+            raise ValueError("JSON scalar is invalid")
+        return match.end()
+
+    while True:
+        index = skip_space(index)
+        if not stack:
+            if root_state == "value":
+                root_state = "done"
+                index = begin_value(index)
+                continue
+            if index != len(value):
+                raise ValueError("JSON has trailing content")
+            return
+
+        frame = stack[-1]
+        if frame.kind == "object":
+            if frame.state in {"key_or_end", "key"}:
+                if (
+                    frame.state == "key_or_end"
+                    and index < len(value)
+                    and value[index] == "}"
+                ):
+                    stack.pop()
+                    index += 1
+                    continue
+                if index >= len(value) or value[index] != '"':
+                    raise ValueError("JSON object key is invalid")
+                index = _skip_json_string_v1(value, index)
+                frame.item_count += 1
+                total_pairs += 1
+                if frame.item_count > 16 or total_pairs > 128:
+                    raise ValueError("JSON object pair limit is exceeded")
+                frame.state = "colon"
+                continue
+            if frame.state == "colon":
+                if index >= len(value) or value[index] != ":":
+                    raise ValueError("JSON object colon is absent")
+                frame.state = "value"
+                index += 1
+                continue
+            if frame.state == "value":
+                frame.state = "comma_or_end"
+                index = begin_value(index)
+                continue
+            if index < len(value) and value[index] == ",":
+                frame.state = "key"
+                index += 1
+                continue
+            if index < len(value) and value[index] == "}":
+                stack.pop()
+                index += 1
+                continue
+            raise ValueError("JSON object terminator is invalid")
+
+        if frame.state in {"value_or_end", "value"}:
+            if (
+                frame.state == "value_or_end"
+                and index < len(value)
+                and value[index] == "]"
+            ):
+                stack.pop()
+                index += 1
+                continue
+            frame.item_count += 1
+            total_array_items += 1
+            if frame.item_count > 16 or total_array_items > 32:
+                raise ValueError("JSON array item limit is exceeded")
+            frame.state = "comma_or_end"
+            index = begin_value(index)
+            continue
+        if index < len(value) and value[index] == ",":
+            frame.state = "value"
+            index += 1
+            continue
+        if index < len(value) and value[index] == "]":
+            stack.pop()
+            index += 1
+            continue
+        raise ValueError("JSON array terminator is invalid")
+
+
+def _parse_manifest_int_v1(value: str) -> int:
+    digits = value.removeprefix("-")
+    if len(digits) > 19 or not digits or not digits.isascii():
+        raise ValueError("JSON integer digit limit is exceeded")
+    return int(value)
+
+
+def _decode_terminal_manifest_v1(payload: bytes) -> dict[str, object]:
+    if (
+        len(payload) > ANSWER_MANIFEST_MAX_BYTES
+        or payload.startswith(b"\xef\xbb\xbf")
+        or not payload.endswith(b"\n")
+        or b"\r" in payload
+        or b"\n" in payload[:-1]
+    ):
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer terminal manifest framing is invalid"
+        )
+    try:
+        decoded_text = payload[:-1].decode("utf-8", errors="strict")
+        _manifest_structural_preflight_v1(decoded_text)
+        decoded = json.loads(
+            decoded_text,
+            strict=True,
+            object_pairs_hook=_closed_object,
+            parse_int=_parse_manifest_int_v1,
+            parse_float=_reject_json_float,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer terminal manifest parser rejected the input"
+        ) from error
+    if type(decoded) is not dict:
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer terminal manifest is not canonical"
+        )
+    try:
+        canonical = _canonical_json_file(decoded)
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer terminal manifest is not canonical"
+        ) from error
+    if canonical != payload:
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer terminal manifest is not canonical"
+        )
     return cast(dict[str, object], decoded)
 
 
@@ -952,6 +1433,32 @@ def _request_assets(
         candidate_count=candidate_count,
         attempts=attempt_records,
     )
+    if request.question_bytes is not None:
+        try:
+            validate_terminal_retrieval_assets_v1(
+                question_bytes=request.question_bytes,
+                retrieval_query_bytes=request.retrieval_query_bytes,
+                retrieval_audit_bytes=request.retrieval_audit_bytes,
+                retrieval_view_bytes=request.retrieval_view_bytes,
+            )
+        except RetrievalMaterializationFailedV1 as error:
+            raise AnswerTerminalRequestInvalidV1(
+                "Answer retrieval assets are invalid"
+            ) from error
+    if request.question_bytes is not None and request.retrieval_view_bytes is not None:
+        try:
+            validate_terminal_answer_content_v1(
+                question_bytes=request.question_bytes,
+                retrieval_view_bytes=request.retrieval_view_bytes,
+                prompt_bytes=request.prompt_bytes,
+                schema_bytes=request.schema_bytes,
+                answer_output_bytes=request.answer_output_bytes,
+                answer_markdown_bytes=request.answer_markdown_bytes,
+            )
+        except KnowledgeAnswererInputInvalidV1 as error:
+            raise AnswerTerminalRequestInvalidV1(
+                "Answer synthesis assets are invalid"
+            ) from error
     return tuple(assets), tuple(attempt_records)
 
 
@@ -1001,14 +1508,525 @@ def _ensure_child_directory(
 def _read_safe_file(path: Path, *, cap: int) -> bytes:
     try:
         with open_validated_local_file_v1(str(path)) as source:
-            if source.size > cap:
-                raise ValueError("Answer asset exceeds its capacity")
-            payload = b"".join(source.iter_verified_chunks_v1())
+            payload = source.read_bytes_v1(limit=cap)
     except (DataRootOpenErrorV1, OSError, ValueError) as error:
         raise AnswerStagingFailedV1("Answer asset readback failed") from error
     if len(payload) > cap:
         raise AnswerStagingFailedV1("Answer asset exceeds its capacity")
     return payload
+
+
+def _asset_contract_v1(
+    path: str,
+) -> tuple[Literal["schema_id", "media_type"], str, int]:
+    for expected_path, identity_key, identity_value, cap in _ROOT_ASSET_SPECS:
+        if path == expected_path:
+            return (
+                cast(Literal["schema_id", "media_type"], identity_key),
+                identity_value,
+                cap,
+            )
+    match = re.fullmatch(
+        r"attempts/(0[1-3])/(events\.jsonl|final_message\.txt)",
+        path,
+    )
+    if match is None:
+        raise _TerminalCandidateRejectedV1("Answer asset path is not recognized")
+    if match.group(2) == "events.jsonl":
+        return "media_type", "application/octet-stream", _ATTEMPT_EVENTS_CAP
+    return "media_type", "application/octet-stream", _ATTEMPT_FINAL_CAP
+
+
+def _manifest_assets_v1(value: object) -> tuple[_VerifiedAssetV1, ...]:
+    if type(value) is not list or not 1 <= len(value) <= 15:
+        raise _TerminalCandidateRejectedV1("Answer asset inventory is invalid")
+    observed: list[_VerifiedAssetV1] = []
+    previous_path_bytes: bytes | None = None
+    for raw_item in value:
+        if type(raw_item) is not dict:
+            raise _TerminalCandidateRejectedV1("Answer asset item is invalid")
+        item = cast(dict[str, object], raw_item)
+        path = item.get("path")
+        byte_length = item.get("byte_length")
+        digest = item.get("sha256")
+        if type(path) is not str:
+            raise _TerminalCandidateRejectedV1("Answer asset path is invalid")
+        identity_key, identity_value, cap = _asset_contract_v1(path)
+        if set(item) != {"path", "byte_length", "sha256", identity_key}:
+            raise _TerminalCandidateRejectedV1("Answer asset identity is invalid")
+        if item.get(identity_key) != identity_value:
+            raise _TerminalCandidateRejectedV1("Answer asset identity is invalid")
+        if (
+            type(byte_length) is not int
+            or not 0 <= byte_length <= _INT64_MAX
+            or byte_length > cap
+            or type(digest) is not str
+            or _SHA256.fullmatch(digest) is None
+        ):
+            raise _TerminalCandidateRejectedV1("Answer asset metadata is invalid")
+        path_bytes = path.encode("utf-8")
+        if previous_path_bytes is not None and path_bytes <= previous_path_bytes:
+            raise _TerminalCandidateRejectedV1("Answer assets are not ordered")
+        previous_path_bytes = path_bytes
+        observed.append(
+            _VerifiedAssetV1(
+                path=path,
+                byte_length=byte_length,
+                sha256=digest,
+                identity_key=identity_key,
+                identity_value=identity_value,
+            )
+        )
+    return tuple(observed)
+
+
+def _read_candidate_file_v1(
+    candidate: ValidatedDataRootV1,
+    path: str,
+    *,
+    cap: int,
+) -> bytes:
+    try:
+        with candidate.open_relative_file_v1(tuple(path.split("/"))) as source:
+            source.validate_streams_v1()
+            payload = source.read_bytes_v1(limit=cap)
+    except _TerminalCandidateRejectedV1:
+        raise
+    except (DataRootOpenErrorV1, OSError, ValueError) as error:
+        raise _TerminalCandidateRejectedV1(
+            "Answer asset could not be read safely"
+        ) from error
+    if len(payload) > cap:
+        raise _TerminalCandidateRejectedV1("Answer asset exceeds its capacity")
+    return payload
+
+
+def _expected_usage_totals_v1(
+    attempts: tuple[dict[str, object], ...],
+) -> dict[str, int | None]:
+    totals: dict[str, int | None] = {}
+    for name in (
+        "cached_input_tokens",
+        "input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+    ):
+        values = [attempt[name] for attempt in attempts]
+        if any(type(value) is not int for value in values):
+            totals[name] = None
+            continue
+        total = sum(cast(int, value) for value in values)
+        totals[name] = total if total <= _INT64_MAX else None
+    return totals
+
+
+def _candidate_has_exact_answer_basename_v1(
+    candidate: ValidatedDataRootV1,
+    answer_id: str,
+) -> bool:
+    canonical_path = candidate.inspection.canonical_path
+    return canonical_path is not None and ntpath.basename(canonical_path) == answer_id
+
+
+def _validate_manifest_terminal_facts_v1(
+    manifest: dict[str, object],
+    assets: tuple[_VerifiedAssetV1, ...],
+    answer_id: str,
+) -> _ManifestTerminalFactsV1:
+    if set(manifest) != {
+        "schema_version",
+        "answer_id",
+        "status",
+        "error",
+        "started_at",
+        "finished_at",
+        "elapsed_ms",
+        "provenance",
+        "attempts",
+        "usage_totals",
+        "assets",
+    }:
+        raise AnswerTerminalRequestInvalidV1("Answer terminal manifest is not closed")
+    if (
+        manifest.get("schema_version") != "gezhi.answer_manifest.v1"
+        or manifest.get("answer_id") != answer_id
+    ):
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer terminal manifest identity differs"
+        )
+    elapsed_ms = manifest.get("elapsed_ms")
+    if type(elapsed_ms) is not int or not 0 <= elapsed_ms <= _INT64_MAX:
+        raise AnswerTerminalRequestInvalidV1("Answer elapsed time is invalid")
+    _validate_timestamp(manifest.get("started_at"))
+    _validate_timestamp(manifest.get("finished_at"))
+
+    raw_status = manifest.get("status")
+    raw_error = manifest.get("error")
+    if raw_status not in {"succeeded", "blocked", "failed", "interrupted"}:
+        raise AnswerTerminalRequestInvalidV1("Answer terminal status is invalid")
+    status = cast(
+        Literal["succeeded", "blocked", "failed", "interrupted"],
+        raw_status,
+    )
+    error: dict[str, object] | None
+    if status in {"succeeded", "interrupted"}:
+        if raw_error is not None:
+            raise AnswerTerminalRequestInvalidV1(
+                "Answer terminal error presence is invalid"
+            )
+        error = None
+    else:
+        if type(raw_error) is not dict or set(raw_error) != {"code", "stage"}:
+            raise AnswerTerminalRequestInvalidV1(
+                "Answer terminal error presence is invalid"
+            )
+        code = raw_error.get("code")
+        stage = raw_error.get("stage")
+        if (
+            type(code) is not str
+            or type(stage) is not str
+            or _ERROR_MATRIX.get(code) != (status, stage)
+        ):
+            raise AnswerTerminalRequestInvalidV1("Answer terminal error is invalid")
+        error = dict(raw_error)
+
+    raw_provenance = manifest.get("provenance")
+    if type(raw_provenance) is not dict:
+        raise AnswerTerminalRequestInvalidV1("Answer provenance is invalid")
+    provenance = _validate_provenance(raw_provenance)
+    raw_attempts = manifest.get("attempts")
+    if type(raw_attempts) is not list or not 0 <= len(raw_attempts) <= 3:
+        raise AnswerTerminalRequestInvalidV1("Answer attempts are invalid")
+    attempt_items: list[dict[str, object]] = []
+    for raw_record in raw_attempts:
+        if type(raw_record) is not dict:
+            raise AnswerTerminalRequestInvalidV1("Answer attempt record is invalid")
+        attempt_items.append(_validate_attempt_record_v1(raw_record))
+    attempts = tuple(attempt_items)
+    if manifest.get("usage_totals") != _expected_usage_totals_v1(attempts):
+        raise AnswerTerminalRequestInvalidV1("Answer usage totals differ")
+
+    asset_paths = {asset.path for asset in assets}
+    stage_paths = tuple(spec[0] for spec in _ROOT_ASSET_SPECS[:5])
+    stage_presence = tuple(path in asset_paths for path in stage_paths)
+    if not stage_presence[0] or any(
+        stage_presence[index] and not stage_presence[index - 1]
+        for index in range(1, len(stage_presence))
+    ):
+        raise AnswerTerminalRequestInvalidV1("Answer root asset prefix differs")
+    prefix_level = sum(stage_presence) - 1
+    has_prompt = "prompt.txt" in asset_paths
+    has_schema = "schema.json" in asset_paths
+    if has_prompt is not has_schema or has_prompt and prefix_level != 4:
+        raise AnswerTerminalRequestInvalidV1("Answer synthesis pair differs")
+    has_output = "answer_output.json" in asset_paths
+    has_markdown = "answer.md" in asset_paths
+    if has_output is not has_markdown or has_output is not (status == "succeeded"):
+        raise AnswerTerminalRequestInvalidV1("Answer result pair differs")
+    expected_attempt_paths = {
+        f"attempts/{ordinal:02d}/{leaf}"
+        for ordinal in range(1, len(attempts) + 1)
+        for leaf in ("events.jsonl", "final_message.txt")
+    }
+    observed_attempt_paths = {
+        path for path in asset_paths if path.startswith("attempts/")
+    }
+    if observed_attempt_paths != expected_attempt_paths or attempts and not has_prompt:
+        raise AnswerTerminalRequestInvalidV1("Answer attempt asset pair differs")
+
+    error_code = None if error is None else error.get("code")
+    if has_prompt or prefix_level == 4 and error_code == "synthesis_input_invalid":
+        candidate_count = 1
+    elif prefix_level == 4:
+        candidate_count = 0
+    else:
+        candidate_count = None
+    _validate_root_terminal_matrix_v1(
+        status=status,
+        error=error,
+        prefix_level=prefix_level,
+        has_call_pair=has_prompt,
+        candidate_count=candidate_count,
+        attempt_count=len(attempts),
+    )
+    _validate_attempt_terminal_matrix_v1(
+        status=status,
+        error=error,
+        candidate_count=candidate_count,
+        attempts=list(attempts),
+    )
+    return _ManifestTerminalFactsV1(
+        status=status,
+        error=error,
+        provenance=provenance,
+        attempts=attempts,
+    )
+
+
+def _validate_candidate_namespace_v1(
+    candidate: ValidatedDataRootV1,
+    assets: tuple[_VerifiedAssetV1, ...],
+) -> None:
+    asset_paths = tuple(asset.path for asset in assets)
+    try:
+        root_profile = {
+            name: name == "attempts"
+            for name in {"attempts" if "/" in path else path for path in asset_paths}
+        }
+        root_profile["manifest.json"] = False
+        candidate.validate_relative_entry_profile_v1(root_profile)
+        ordinals = tuple(
+            dict.fromkeys(
+                path.split("/")[1]
+                for path in asset_paths
+                if path.startswith("attempts/")
+            )
+        )
+        if ordinals:
+            with candidate.open_relative_data_root_v1(("attempts",)) as attempts:
+                attempts.validate_streams_v1()
+                attempts.validate_relative_entry_profile_v1(
+                    {ordinal: True for ordinal in ordinals}
+                )
+            for ordinal in ordinals:
+                with candidate.open_relative_data_root_v1(
+                    ("attempts", ordinal)
+                ) as attempt:
+                    attempt.validate_streams_v1()
+                    attempt.validate_relative_entry_profile_v1(
+                        {"events.jsonl": False, "final_message.txt": False}
+                    )
+    except _TerminalCandidateRejectedV1:
+        raise
+    except (DataRootOpenErrorV1, OSError, ValueError) as error:
+        raise _TerminalCandidateRejectedV1(
+            "Answer terminal namespace could not be proved"
+        ) from error
+
+
+def _validate_terminal_candidate_v1(
+    root: ValidatedDataRootV1,
+    parts: tuple[str, ...],
+    answer_id: str,
+) -> TerminalAnswerBytesReadyV1:
+    try:
+        candidate = root.open_relative_data_root_v1(parts)
+    except (DataRootOpenErrorV1, OSError, ValueError) as error:
+        raise _TerminalCandidateRejectedV1(
+            "Answer terminal candidate is unavailable"
+        ) from error
+    with candidate:
+        if not _candidate_has_exact_answer_basename_v1(candidate, answer_id):
+            raise _TerminalCandidateRejectedV1(
+                "Answer terminal basename differs from its identity"
+            )
+        candidate_identity = candidate.inspection.identity
+        if candidate_identity is None:
+            raise _TerminalCandidateRejectedV1(
+                "Answer terminal identity is unavailable"
+            )
+        try:
+            candidate.validate_streams_v1()
+        except (DataRootOpenErrorV1, OSError, ValueError) as error:
+            raise _TerminalCandidateRejectedV1(
+                "Answer terminal root streams are invalid"
+            ) from error
+        manifest_bytes = _read_candidate_file_v1(
+            candidate,
+            "manifest.json",
+            cap=ANSWER_MANIFEST_MAX_BYTES,
+        )
+        try:
+            manifest = _decode_terminal_manifest_v1(manifest_bytes)
+        except AnswerTerminalRequestInvalidV1 as error:
+            raise _TerminalCandidateRejectedV1(
+                "Answer terminal manifest is invalid"
+            ) from error
+        try:
+            assets = _manifest_assets_v1(manifest.get("assets"))
+            terminal_facts = _validate_manifest_terminal_facts_v1(
+                manifest,
+                assets,
+                answer_id,
+            )
+        except AnswerTerminalRequestInvalidV1 as error:
+            raise _TerminalCandidateRejectedV1(
+                "Answer terminal manifest facts are invalid"
+            ) from error
+        declared_aggregate = len(manifest_bytes)
+        for asset in assets:
+            declared_aggregate += asset.byte_length
+            if (
+                declared_aggregate > _INT64_MAX
+                or declared_aggregate > ANSWER_TERMINAL_MAX_BYTES
+            ):
+                raise _TerminalCandidateRejectedV1(
+                    "Answer terminal aggregate exceeds its capacity"
+                )
+        _validate_candidate_namespace_v1(candidate, assets)
+
+        asset_by_path = {asset.path: asset for asset in assets}
+        payload_by_path: dict[str, bytes] = {}
+        actual_aggregate = len(manifest_bytes)
+        for path in _ASSET_READ_ORDER:
+            current_asset = asset_by_path.get(path)
+            if current_asset is None:
+                continue
+            _identity_key, _identity_value, cap = _asset_contract_v1(path)
+            remaining = ANSWER_TERMINAL_MAX_BYTES - actual_aggregate
+            payload = _read_candidate_file_v1(
+                candidate,
+                path,
+                cap=min(cap, current_asset.byte_length, remaining),
+            )
+            if (
+                len(payload) != current_asset.byte_length
+                or hashlib.sha256(payload).hexdigest() != current_asset.sha256
+            ):
+                raise _TerminalCandidateRejectedV1(
+                    "Answer asset bytes differ from the manifest"
+                )
+            actual_aggregate += len(payload)
+            if actual_aggregate > ANSWER_TERMINAL_MAX_BYTES:
+                raise _TerminalCandidateRejectedV1(
+                    "Answer terminal aggregate exceeds its capacity"
+                )
+            payload_by_path[path] = payload
+        if set(payload_by_path) != set(asset_by_path):
+            raise _TerminalCandidateRejectedV1(
+                "Answer asset dependency order is incomplete"
+            )
+
+        attempts: list[AnswerAttemptPublishV1] = []
+        for ordinal, raw_record in enumerate(terminal_facts.attempts, start=1):
+            prefix = f"attempts/{ordinal:02d}"
+            try:
+                events_bytes = payload_by_path[prefix + "/events.jsonl"]
+                final_message_bytes = payload_by_path[prefix + "/final_message.txt"]
+            except KeyError as error:
+                raise _TerminalCandidateRejectedV1(
+                    "Answer attempt evidence is incomplete"
+                ) from error
+            attempts.append(
+                AnswerAttemptPublishV1(
+                    record=raw_record,
+                    events_bytes=events_bytes,
+                    final_message_bytes=final_message_bytes,
+                )
+            )
+        raw_provenance = terminal_facts.provenance
+        raw_error = terminal_facts.error
+        raw_status = terminal_facts.status
+        effective_config_bytes = payload_by_path.get("effective_config.json")
+        if type(effective_config_bytes) is not bytes:
+            raise _TerminalCandidateRejectedV1(
+                "Answer effective configuration is absent"
+            )
+        request = AnswerPublishRequestV1(
+            answer_id=answer_id,
+            started_at=cast(str, manifest["started_at"]),
+            started_monotonic_ns=0,
+            provenance=raw_provenance,
+            effective_config_bytes=effective_config_bytes,
+            question_bytes=payload_by_path.get("question.json"),
+            retrieval_query_bytes=payload_by_path.get("retrieval_query.json"),
+            retrieval_audit_bytes=payload_by_path.get("retrieval_audit.json"),
+            retrieval_view_bytes=payload_by_path.get("retrieval_view.json"),
+            status=raw_status,
+            error=raw_error,
+            prompt_bytes=payload_by_path.get("prompt.txt"),
+            schema_bytes=payload_by_path.get("schema.json"),
+            attempts=tuple(attempts),
+            answer_output_bytes=payload_by_path.get("answer_output.json"),
+            answer_markdown_bytes=payload_by_path.get("answer.md"),
+        )
+        try:
+            provenance, request_assets, attempt_records = _validate_request(request)
+        except AnswerTerminalRequestInvalidV1 as error:
+            raise _TerminalCandidateRejectedV1(
+                "Answer terminal cross-asset validation failed"
+            ) from error
+        expected_items = sorted(
+            (
+                {
+                    "path": path,
+                    "byte_length": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    identity_key: identity_value,
+                }
+                for path, payload, identity_key, identity_value, _cap in request_assets
+            ),
+            key=lambda item: cast(str, item["path"]).encode("utf-8"),
+        )
+        if expected_items != manifest["assets"]:
+            raise _TerminalCandidateRejectedV1(
+                "Answer manifest asset inventory differs"
+            )
+        if (
+            provenance != manifest["provenance"]
+            or list(attempt_records) != manifest["attempts"]
+            or _expected_usage_totals_v1(attempt_records) != manifest["usage_totals"]
+        ):
+            raise _TerminalCandidateRejectedV1("Answer manifest terminal facts differ")
+        answer_markdown_bytes = payload_by_path.get("answer.md")
+        answer_markdown_text = (
+            None
+            if answer_markdown_bytes is None
+            else answer_markdown_bytes.decode("utf-8", errors="strict")
+        )
+
+    _root_checkpoint(root)
+    try:
+        with root.open_relative_data_root_v1(parts) as observed_candidate:
+            if (
+                observed_candidate.inspection.identity != candidate_identity
+                or not _candidate_has_exact_answer_basename_v1(
+                    observed_candidate,
+                    answer_id,
+                )
+            ):
+                raise _TerminalCandidateRejectedV1("Answer terminal identity changed")
+    except _TerminalCandidateRejectedV1:
+        raise
+    except (DataRootOpenErrorV1, OSError, ValueError) as error:
+        raise _TerminalCandidateRejectedV1(
+            "Answer terminal post-validation failed"
+        ) from error
+    return TerminalAnswerBytesReadyV1(
+        answer_id=answer_id,
+        manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+        status=cast(
+            Literal["succeeded", "blocked", "failed", "interrupted"],
+            raw_status,
+        ),
+        error=None if raw_error is None else dict(raw_error),
+        answer_output_bytes=payload_by_path.get("answer_output.json"),
+        answer_markdown_bytes=answer_markdown_bytes,
+        answer_markdown_text=answer_markdown_text,
+    )
+
+
+def read_committed_answer_v1(
+    root: ValidatedDataRootV1,
+    answer_id: str,
+) -> TerminalAnswerBytesReadyV1 | TerminalAnswerBytesRejectedV1:
+    """Read one exact formal target or reject it without returning partial facts."""
+
+    if type(answer_id) is not str:
+        raise TypeError("Answer ID type is invalid")
+    if _ANSWER_ID.fullmatch(answer_id) is None:
+        return TerminalAnswerBytesRejectedV1(answer_id=answer_id)
+    try:
+        return _validate_terminal_candidate_v1(
+            root,
+            ("answers", answer_id),
+            answer_id,
+        )
+    except (
+        _TerminalCandidateRejectedV1,
+        AnswerRootIntegrityLostV1,
+    ):
+        return TerminalAnswerBytesRejectedV1(answer_id=answer_id)
 
 
 def _write_new_file(path: Path, payload: bytes) -> None:
@@ -1120,19 +2138,7 @@ def _manifest_bytes(
         (asset.manifest_item() for asset in assets),
         key=lambda item: cast(str, item["path"]).encode("utf-8"),
     )
-    usage_totals: dict[str, int | None] = {}
-    for name in (
-        "cached_input_tokens",
-        "input_tokens",
-        "output_tokens",
-        "reasoning_output_tokens",
-    ):
-        values = [attempt[name] for attempt in attempts]
-        if any(type(value) is not int for value in values):
-            usage_totals[name] = None
-            continue
-        total = sum(cast(int, value) for value in values)
-        usage_totals[name] = total if total <= _INT64_MAX else None
+    usage_totals = _expected_usage_totals_v1(attempts)
     manifest = {
         "schema_version": "gezhi.answer_manifest.v1",
         "answer_id": request.answer_id,
@@ -1156,6 +2162,11 @@ def _manifest_bytes(
         raise AnswerManifestFailedV1("Answer manifest exceeds its capacity")
     aggregate = len(payload)
     for asset in assets:
+        if (
+            type(asset.byte_length) is not int
+            or not 0 <= asset.byte_length <= _INT64_MAX
+        ):
+            raise AnswerManifestFailedV1("Answer terminal tree exceeds its capacity")
         aggregate += asset.byte_length
         if aggregate > _INT64_MAX or aggregate > ANSWER_TERMINAL_MAX_BYTES:
             raise AnswerManifestFailedV1("Answer terminal tree exceeds its capacity")
@@ -1166,43 +2177,45 @@ def _install_and_validate_manifest(
     root: ValidatedDataRootV1,
     stage_path: Path,
     manifest_bytes: bytes,
-    assets: tuple[_VerifiedAssetV1, ...],
+    answer_id: str,
 ) -> None:
     manifest_path = stage_path / "manifest.json"
     try:
-        _write_new_file(manifest_path, manifest_bytes)
+        with open_validated_data_root_v1(str(stage_path)) as stage:
+            create_exclusive_file_bytes_v1(
+                stage,
+                "manifest.json",
+                manifest_bytes,
+            )
         observed = _read_safe_file(
             manifest_path,
             cap=ANSWER_MANIFEST_MAX_BYTES,
         )
-    except AnswerStagingFailedV1 as error:
+    except (
+        AnswerStagingFailedV1,
+        DataRootLifecycleErrorV1,
+        DataRootOpenErrorV1,
+        OSError,
+        ValueError,
+    ) as error:
         raise AnswerManifestFailedV1(
             "Answer manifest write or readback failed"
         ) from error
     if observed != manifest_bytes:
         raise AnswerManifestFailedV1("Answer manifest readback differs")
     try:
-        decoded = _decode_canonical_json_asset(observed)
-    except AnswerTerminalRequestInvalidV1 as error:
-        raise AnswerManifestFailedV1("Answer manifest is invalid") from error
-    if decoded.get("schema_version") != "gezhi.answer_manifest.v1":
-        raise AnswerManifestFailedV1("Answer manifest identity is invalid")
-    try:
-        with open_validated_data_root_v1(str(stage_path)) as stage:
-            names = stage.relative_entry_names_v1()
-    except (DataRootOpenErrorV1, OSError) as error:
-        raise AnswerManifestFailedV1(
-            "Answer terminal tree closure could not be proved"
-        ) from error
-    expected_names = tuple(
-        sorted(
-            {"attempts" if "/" in asset.path else asset.path for asset in assets}
-            | {"manifest.json"}
+        validated = _validate_terminal_candidate_v1(
+            root,
+            ("answers", ".staging", answer_id),
+            answer_id,
         )
-    )
-    if names != expected_names:
+    except _TerminalCandidateRejectedV1 as error:
         raise AnswerManifestFailedV1(
-            "Answer terminal tree contains an unexpected entry"
+            "Answer terminal tree failed complete readback"
+        ) from error
+    if validated.manifest_sha256 != hashlib.sha256(manifest_bytes).hexdigest():
+        raise AnswerManifestFailedV1(
+            "Answer terminal manifest readback identity differs"
         )
     _root_checkpoint(root)
 
@@ -1214,14 +2227,10 @@ def _namespace_state(
     try:
         answers = root.open_relative_data_root_v1(("answers",))
         with answers:
-            target_present = _case_insensitive_name_present(
-                answers.relative_entry_names_v1(), answer_id
-            )
+            target_present = _case_insensitive_entry_present(answers, answer_id)
             staging = answers.open_relative_data_root_v1((".staging",))
             with staging:
-                staging_present = _case_insensitive_name_present(
-                    staging.relative_entry_names_v1(), answer_id
-                )
+                staging_present = _case_insensitive_entry_present(staging, answer_id)
     except (DataRootOpenErrorV1, OSError, ValueError) as error:
         _root_checkpoint(root)
         raise AnswerCommitIndeterminateV1(
@@ -1237,8 +2246,9 @@ def publish_answer_v1(
 ) -> CommittedAnswerProofV1:
     """Create, validate, and non-replacingly publish one terminal Answer."""
 
-    _assert_writer_ownership(root, ownership)
+    _consume_current_publish_v1(root, ownership)
     provenance, request_assets, attempt_records = _validate_request(request)
+    _bind_current_staging_v1(root, ownership, request.answer_id)
     root_path_text, root_identity = _root_facts(root)
     root_path = Path(root_path_text)
     _root_checkpoint(root)
@@ -1259,11 +2269,9 @@ def publish_answer_v1(
             _root_checkpoint(root)
             raise
         with staging:
-            answer_names = answers.relative_entry_names_v1()
-            if _case_insensitive_name_present(answer_names, request.answer_id):
+            if _case_insensitive_entry_present(answers, request.answer_id):
                 raise AnswerTargetConflictV1("Answer target already exists")
-            staging_names = staging.relative_entry_names_v1()
-            if _case_insensitive_name_present(staging_names, request.answer_id):
+            if _case_insensitive_entry_present(staging, request.answer_id):
                 raise AnswerStagingFailedV1("Answer staging already exists")
             stage_path = root_path / "answers" / ".staging" / request.answer_id
             try:
@@ -1290,7 +2298,12 @@ def publish_answer_v1(
             installed,
             attempt_records,
         )
-        _install_and_validate_manifest(root, stage_path, manifest_bytes, installed)
+        _install_and_validate_manifest(
+            root,
+            stage_path,
+            manifest_bytes,
+            request.answer_id,
+        )
     except AnswerManifestFailedV1:
         _root_checkpoint(root)
         raise
@@ -1303,9 +2316,7 @@ def publish_answer_v1(
             if final_stage.inspection.identity != stage_identity:
                 raise AnswerRootIntegrityLostV1("Answer staging identity changed")
         with root.open_relative_data_root_v1(("answers",)) as final_answers:
-            if _case_insensitive_name_present(
-                final_answers.relative_entry_names_v1(), request.answer_id
-            ):
+            if _case_insensitive_entry_present(final_answers, request.answer_id):
                 raise AnswerTargetConflictV1("Answer target already exists")
     except AnswerTerminalErrorV1:
         raise
@@ -1357,6 +2368,9 @@ __all__ = [
     "AnswerTerminalRequestInvalidV1",
     "AnswerWriterOwnershipInvalidV1",
     "CommittedAnswerProofV1",
+    "TerminalAnswerBytesReadyV1",
+    "TerminalAnswerBytesRejectedV1",
     "publish_answer_v1",
+    "read_committed_answer_v1",
     "scan_answer_staging_v1",
 ]

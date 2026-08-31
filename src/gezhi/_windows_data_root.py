@@ -4,7 +4,7 @@ import ctypes
 import hashlib
 import ntpath
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import Literal, Self, TypeAlias
 
@@ -24,6 +24,7 @@ _FILE_ATTRIBUTE_DIRECTORY = 0x10
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _FILE_LIST_DIRECTORY = 0x0001
 _FILE_READ_DATA = 0x0001
+_FILE_WRITE_DATA = 0x0002
 _FILE_TRAVERSE = 0x0020
 _FILE_READ_ATTRIBUTES = 0x0080
 _SYNCHRONIZE = 0x00100000
@@ -33,6 +34,7 @@ _OPEN_EXISTING = 3
 _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 _FILE_OPEN = 1
+_FILE_CREATE = 2
 _FILE_DIRECTORY_FILE = 0x00000001
 _FILE_NON_DIRECTORY_FILE = 0x00000040
 _FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
@@ -42,11 +44,13 @@ _FILE_ATTRIBUTE_TAG_INFO_CLASS = 9
 _FILE_ID_BOTH_DIR_INFO_CLASS = 10
 _FILE_ID_BOTH_DIR_RESTART_INFO_CLASS = 11
 _FILE_ID_INFO_CLASS = 18
+_FILE_NAMED_STREAMS = 0x00040000
 _DRIVE_UNKNOWN = 0
 _DRIVE_NO_ROOT_DIR = 1
 _DRIVE_FIXED = 3
 _ERROR_MORE_DATA = 234
 _ERROR_NO_MORE_FILES = 18
+_ERROR_HANDLE_EOF = 38
 _BUFFER_SIZE = 32_768
 _DIRECTORY_QUERY_BUFFER = 65_536
 _MAX_VOLUME_PATH_BUFFER = 1_048_576
@@ -125,6 +129,13 @@ class _FILE_ID_BOTH_DIR_INFO(ctypes.Structure):
     )
 
 
+class _WIN32_FIND_STREAM_DATA(ctypes.Structure):
+    _fields_ = (
+        ("StreamSize", ctypes.c_longlong),
+        ("cStreamName", ctypes.c_wchar * 296),
+    )
+
+
 _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _NTDLL = ctypes.WinDLL("ntdll", use_last_error=True)
 
@@ -141,18 +152,14 @@ _QUERY_DOS_DEVICE.argtypes = [
     ctypes.c_ulong,
 ]
 _QUERY_DOS_DEVICE.restype = ctypes.c_ulong
-_GET_VOLUME_NAME_FOR_VOLUME_MOUNT_POINT = (
-    _KERNEL32.GetVolumeNameForVolumeMountPointW
-)
+_GET_VOLUME_NAME_FOR_VOLUME_MOUNT_POINT = _KERNEL32.GetVolumeNameForVolumeMountPointW
 _GET_VOLUME_NAME_FOR_VOLUME_MOUNT_POINT.argtypes = [
     ctypes.c_wchar_p,
     ctypes.c_wchar_p,
     ctypes.c_ulong,
 ]
 _GET_VOLUME_NAME_FOR_VOLUME_MOUNT_POINT.restype = ctypes.c_int
-_GET_VOLUME_PATH_NAMES_FOR_VOLUME_NAME = (
-    _KERNEL32.GetVolumePathNamesForVolumeNameW
-)
+_GET_VOLUME_PATH_NAMES_FOR_VOLUME_NAME = _KERNEL32.GetVolumePathNamesForVolumeNameW
 _GET_VOLUME_PATH_NAMES_FOR_VOLUME_NAME.argtypes = [
     ctypes.c_wchar_p,
     ctypes.c_void_p,
@@ -205,6 +212,44 @@ _READ_FILE.argtypes = [
     ctypes.c_void_p,
 ]
 _READ_FILE.restype = ctypes.c_int
+_WRITE_FILE = _KERNEL32.WriteFile
+_WRITE_FILE.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.c_ulong,
+    ctypes.POINTER(ctypes.c_ulong),
+    ctypes.c_void_p,
+]
+_WRITE_FILE.restype = ctypes.c_int
+_GET_VOLUME_INFORMATION_BY_HANDLE = _KERNEL32.GetVolumeInformationByHandleW
+_GET_VOLUME_INFORMATION_BY_HANDLE.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_wchar_p,
+    ctypes.c_ulong,
+    ctypes.POINTER(ctypes.c_ulong),
+    ctypes.POINTER(ctypes.c_ulong),
+    ctypes.POINTER(ctypes.c_ulong),
+    ctypes.c_wchar_p,
+    ctypes.c_ulong,
+]
+_GET_VOLUME_INFORMATION_BY_HANDLE.restype = ctypes.c_int
+_FIND_FIRST_STREAM = _KERNEL32.FindFirstStreamW
+_FIND_FIRST_STREAM.argtypes = [
+    ctypes.c_wchar_p,
+    ctypes.c_int,
+    ctypes.POINTER(_WIN32_FIND_STREAM_DATA),
+    ctypes.c_ulong,
+]
+_FIND_FIRST_STREAM.restype = ctypes.c_void_p
+_FIND_NEXT_STREAM = _KERNEL32.FindNextStreamW
+_FIND_NEXT_STREAM.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(_WIN32_FIND_STREAM_DATA),
+]
+_FIND_NEXT_STREAM.restype = ctypes.c_int
+_FIND_CLOSE = _KERNEL32.FindClose
+_FIND_CLOSE.argtypes = [ctypes.c_void_p]
+_FIND_CLOSE.restype = ctypes.c_int
 _NT_CREATE_FILE = _NTDLL.NtCreateFile
 _NT_CREATE_FILE.argtypes = [
     ctypes.POINTER(ctypes.c_void_p),
@@ -230,6 +275,14 @@ class DataRootInspectionV1:
     canonical_path: str | None = None
     identity: FileIdentity | None = None
     ancestor_identities: tuple[FileIdentity, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DataRootEntryV1:
+    name: str
+    is_directory: bool
+    is_reparse: bool
+    short_name: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,12 +353,27 @@ class ValidatedFileV1:
         return self._handles[-1]
 
     def read_bytes_v1(self, *, limit: int) -> bytes:
-        if type(limit) is not int or limit < 0 or self.size > limit:
+        if type(limit) is not int or limit < 0:
             raise ValueError("validated file exceeds its read limit")
         handle = self.borrowed_handle()
-        chunks = list(_read_handle_chunks(handle, self.size))
+        try:
+            payload = _read_handle_bounded_bytes(handle, limit)
+        except ValueError:
+            self._revalidate(handle)
+            raise
         self._revalidate(handle)
-        return b"".join(chunks)
+        if len(payload) != self.size:
+            raise DataRootOpenErrorV1("unavailable")
+        return payload
+
+    def validate_streams_v1(self) -> None:
+        handle = self.borrowed_handle()
+        _validate_stream_profile_v1(
+            handle,
+            self.canonical_path,
+            directory=False,
+        )
+        self._revalidate(handle)
 
     def sha256_v1(self) -> str:
         handle = self.borrowed_handle()
@@ -327,9 +395,8 @@ class ValidatedFileV1:
 
         handle = self.borrowed_handle()
         facts = _handle_facts(handle, directory=False)
-        if (
-            facts.identity != self.identity
-            or _key(facts.canonical_path) != _key(self.canonical_path)
+        if facts.identity != self.identity or _key(facts.canonical_path) != _key(
+            self.canonical_path
         ):
             raise DataRootOpenErrorV1("unavailable")
 
@@ -513,6 +580,73 @@ class ValidatedDataRootV1:
                 raise DataRootOpenErrorV1("unsafe")
             observed.append(entry.name)
         return tuple(sorted(observed))
+
+    def relative_entries_v1(self) -> tuple[DataRootEntryV1, ...]:
+        """Describe immediate entries without following candidate-local reparses."""
+
+        if self._closed:
+            raise RuntimeError("validated Data Root is closed")
+        observed: list[DataRootEntryV1] = []
+        for entry in _enumerate_directory(self.borrowed_handle()):
+            if len(observed) >= _MAX_ENUMERATED_ENTRIES:
+                raise DataRootOpenErrorV1("unavailable")
+            observed.append(
+                DataRootEntryV1(
+                    name=entry.name,
+                    is_directory=bool(entry.attributes & _FILE_ATTRIBUTE_DIRECTORY),
+                    is_reparse=bool(entry.attributes & _FILE_ATTRIBUTE_REPARSE_POINT),
+                    short_name=entry.short_name,
+                )
+            )
+        return tuple(sorted(observed, key=lambda item: item.name.encode("utf-8")))
+
+    def validate_relative_entry_profile_v1(
+        self,
+        expected: Mapping[str, bool],
+    ) -> None:
+        """Fail on the first unexpected immediate entry without descending."""
+
+        if self._closed:
+            raise RuntimeError("validated Data Root is closed")
+        if type(expected) is not dict or any(
+            type(name) is not str
+            or not _is_safe_component(name)
+            or type(is_directory) is not bool
+            for name, is_directory in expected.items()
+        ):
+            raise TypeError("relative entry profile is invalid")
+        observed: set[str] = set()
+        for entry in _enumerate_directory(self.borrowed_handle()):
+            if len(observed) >= _MAX_ENUMERATED_ENTRIES:
+                raise DataRootOpenErrorV1("unavailable")
+            expected_directory = expected.get(entry.name)
+            if (
+                expected_directory is None
+                or entry.name in observed
+                or bool(entry.attributes & _FILE_ATTRIBUTE_DIRECTORY)
+                is not expected_directory
+                or bool(entry.attributes & _FILE_ATTRIBUTE_REPARSE_POINT)
+                or entry.short_name is not None
+            ):
+                raise DataRootOpenErrorV1("unsafe")
+            observed.add(entry.name)
+        if observed != set(expected):
+            raise DataRootOpenErrorV1("unavailable")
+
+    def validate_streams_v1(self) -> None:
+        if self._closed:
+            raise RuntimeError("validated Data Root is closed")
+        canonical_path = self.inspection.canonical_path
+        identity = self.inspection.identity
+        if canonical_path is None or identity is None:
+            raise RuntimeError("validated Data Root facts are incomplete")
+        handle = self.borrowed_handle()
+        _validate_stream_profile_v1(handle, canonical_path, directory=True)
+        facts = _handle_facts(handle, directory=True)
+        if facts.identity != identity or _key(facts.canonical_path) != _key(
+            canonical_path
+        ):
+            raise DataRootOpenErrorV1("unavailable")
 
     def relative_file_paths_v1(self) -> tuple[str, ...]:
         if self._closed:
@@ -716,9 +850,7 @@ def _volume_path_names(volume_name: str) -> tuple[str, ...] | None:
     if not 2 <= returned.value <= required.value:
         return None
     return tuple(
-        item
-        for item in "".join(buffer[: returned.value]).split("\x00")
-        if item
+        item for item in "".join(buffer[: returned.value]).split("\x00") if item
     )
 
 
@@ -734,9 +866,10 @@ def _volume_is_supported(path: str) -> DataRootStatus | None:
     device_targets = _query_dos_device_targets(drive)
     if device_targets is None:
         return "unavailable"
-    if len(device_targets) != 1 or _HARD_DISK_VOLUME.fullmatch(
-        device_targets[0]
-    ) is None:
+    if (
+        len(device_targets) != 1
+        or _HARD_DISK_VOLUME.fullmatch(device_targets[0]) is None
+    ):
         return "unsafe"
 
     logical_drives = _GET_LOGICAL_DRIVES()
@@ -783,10 +916,7 @@ def _parent_chain(path: str) -> tuple[str, ...]:
 def _open_drive_root(path: str) -> int:
     handle = _CREATE_FILE(
         "\\\\?\\" + path,
-        _FILE_LIST_DIRECTORY
-        | _FILE_TRAVERSE
-        | _FILE_READ_ATTRIBUTES
-        | _SYNCHRONIZE,
+        _FILE_LIST_DIRECTORY | _FILE_TRAVERSE | _FILE_READ_ATTRIBUTES | _SYNCHRONIZE,
         _FILE_SHARE_READ | _FILE_SHARE_WRITE,
         None,
         _OPEN_EXISTING,
@@ -798,12 +928,13 @@ def _open_drive_root(path: str) -> int:
     return int(handle)
 
 
-def _nt_open_relative(
+def _nt_relative_file(
     parent: int,
     component: str,
     *,
     desired_access: int,
     share: int,
+    disposition: int,
     options: int,
 ) -> int:
     if not _is_safe_component(component):
@@ -833,7 +964,7 @@ def _nt_open_relative(
         None,
         0,
         share,
-        _FILE_OPEN,
+        disposition,
         options,
         None,
         0,
@@ -841,6 +972,39 @@ def _nt_open_relative(
     if status < 0 or handle.value in {None, 0, _INVALID_HANDLE_VALUE}:
         raise DataRootOpenErrorV1("unavailable")
     return int(handle.value)
+
+
+def _nt_open_relative(
+    parent: int,
+    component: str,
+    *,
+    desired_access: int,
+    share: int,
+    options: int,
+) -> int:
+    return _nt_relative_file(
+        parent,
+        component,
+        desired_access=desired_access,
+        share=share,
+        disposition=_FILE_OPEN,
+        options=options,
+    )
+
+
+def _nt_create_exclusive_relative(parent: int, component: str) -> int:
+    return _nt_relative_file(
+        parent,
+        component,
+        desired_access=_FILE_WRITE_DATA | _FILE_READ_ATTRIBUTES | _SYNCHRONIZE,
+        share=0,
+        disposition=_FILE_CREATE,
+        options=(
+            _FILE_SYNCHRONOUS_IO_NONALERT
+            | _FILE_OPEN_REPARSE_POINT
+            | _FILE_NON_DIRECTORY_FILE
+        ),
+    )
 
 
 def _open_relative_handle(
@@ -883,10 +1047,9 @@ def _open_relative_handle(
         )
         opened.append(handle)
         typed_facts = _handle_facts(handle, directory=directory)
-        if (
-            typed_facts.identity != probe_facts.identity
-            or _key(typed_facts.canonical_path) != _key(probe_facts.canonical_path)
-        ):
+        if typed_facts.identity != probe_facts.identity or _key(
+            typed_facts.canonical_path
+        ) != _key(probe_facts.canonical_path):
             raise DataRootOpenErrorV1("unavailable")
     except BaseException as error:
         try:
@@ -1001,6 +1164,81 @@ def _read_handle_chunks(handle: int, expected_size: int):  # type: ignore[no-unt
         raise DataRootOpenErrorV1("unavailable")
 
 
+def _read_handle_bounded_bytes(handle: int, limit: int) -> bytes:
+    buffer = ctypes.create_string_buffer(min(1024 * 1024, max(1, limit + 1)))
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        requested = min(len(buffer), limit + 1 - total)
+        read = ctypes.c_ulong()
+        if not _READ_FILE(
+            handle,
+            buffer,
+            requested,
+            ctypes.byref(read),
+            None,
+        ):
+            raise DataRootOpenErrorV1("unavailable")
+        count = int(read.value)
+        if not 0 <= count <= requested:
+            raise DataRootOpenErrorV1("unavailable")
+        if count == 0:
+            return b"".join(chunks)
+        chunks.append(buffer.raw[:count])
+        total += count
+        if total > limit:
+            raise ValueError("validated file exceeds its read limit")
+
+
+def _validate_stream_profile_v1(
+    handle: int,
+    canonical_path: str,
+    *,
+    directory: bool,
+) -> None:
+    filesystem_flags = ctypes.c_ulong()
+    if not _GET_VOLUME_INFORMATION_BY_HANDLE(
+        handle,
+        None,
+        0,
+        None,
+        None,
+        ctypes.byref(filesystem_flags),
+        None,
+        0,
+    ):
+        raise DataRootOpenErrorV1("unavailable")
+    if not filesystem_flags.value & _FILE_NAMED_STREAMS:
+        return
+
+    stream_data = _WIN32_FIND_STREAM_DATA()
+    ctypes.set_last_error(0)
+    search = _FIND_FIRST_STREAM(
+        "\\\\?\\" + canonical_path,
+        0,
+        ctypes.byref(stream_data),
+        0,
+    )
+    if search in {None, 0, _INVALID_HANDLE_VALUE}:
+        if ctypes.get_last_error() == _ERROR_HANDLE_EOF and directory:
+            return
+        raise DataRootOpenErrorV1("unavailable")
+
+    close_failed = False
+    try:
+        if directory or stream_data.cStreamName != "::$DATA":
+            raise DataRootOpenErrorV1("unsafe")
+        ctypes.set_last_error(0)
+        if _FIND_NEXT_STREAM(search, ctypes.byref(stream_data)):
+            raise DataRootOpenErrorV1("unsafe")
+        if ctypes.get_last_error() != _ERROR_HANDLE_EOF:
+            raise DataRootOpenErrorV1("unavailable")
+    finally:
+        close_failed = not bool(_FIND_CLOSE(search))
+    if close_failed:
+        raise DataRootOpenErrorV1("unavailable")
+
+
 def _enumerate_directory(handle: int) -> tuple[_DirectoryEntryV1, ...]:
     observed: list[_DirectoryEntryV1] = []
     information_class = _FILE_ID_BOTH_DIR_RESTART_INFO_CLASS
@@ -1091,9 +1329,7 @@ def _close_handles(handles: tuple[int, ...]) -> None:
         if not _CLOSE_HANDLE(handle) and first_error is None:
             first_error = ctypes.get_last_error()
     if first_error is not None:
-        raise DataRootLifecycleErrorV1(
-            f"CloseHandle failed (Win32 {first_error})"
-        )
+        raise DataRootLifecycleErrorV1(f"CloseHandle failed (Win32 {first_error})")
 
 
 def _close_handles_best_effort(handles: tuple[int, ...]) -> None:
@@ -1263,6 +1499,70 @@ def open_validated_mutable_local_file_v1(value: str) -> ValidatedFileV1:
     """Hold one no-follow local file while a cooperating writer mutates it."""
 
     return _open_validated_local_file_v1(value, share_writes=True)
+
+
+def create_exclusive_file_bytes_v1(
+    parent: ValidatedDataRootV1,
+    component: str,
+    payload: bytes,
+) -> None:
+    """CREATE_NEW one ordinary child with zero sharing and synchronous writes."""
+
+    if type(parent) is not ValidatedDataRootV1:
+        raise TypeError("exclusive file parent type is invalid")
+    if not _is_safe_component(component):
+        raise DataRootOpenErrorV1("unsafe")
+    if type(payload) is not bytes:
+        raise TypeError("exclusive file payload must be immutable bytes")
+    parent_path = parent.inspection.canonical_path
+    parent_identity = parent.inspection.identity
+    if parent_path is None or parent_identity is None:
+        raise DataRootOpenErrorV1("unavailable")
+    parent.validate_streams_v1()
+    handle = _nt_create_exclusive_relative(parent.borrowed_handle(), component)
+    try:
+        expected_path = ntpath.join(parent_path, component)
+        initial_facts = _handle_facts(handle, directory=False)
+        _validate_expected_facts(initial_facts, expected_path, parent_identity[0])
+        _reject_hidden_short_alias(parent.borrowed_handle(), component)
+
+        if payload:
+            base = ctypes.c_char_p(payload)
+            base_address = ctypes.cast(base, ctypes.c_void_p).value
+            if base_address is None:
+                raise DataRootOpenErrorV1("unavailable")
+            offset = 0
+            while offset < len(payload):
+                requested = min(len(payload) - offset, 0xFFFFFFFF)
+                completed = ctypes.c_ulong()
+                if not _WRITE_FILE(
+                    handle,
+                    ctypes.c_void_p(base_address + offset),
+                    requested,
+                    ctypes.byref(completed),
+                    None,
+                ):
+                    raise DataRootOpenErrorV1("unavailable")
+                count = int(completed.value)
+                if not 1 <= count <= requested:
+                    raise DataRootOpenErrorV1("unavailable")
+                offset += count
+
+        final_facts = _handle_facts(handle, directory=False)
+        if (
+            final_facts.identity != initial_facts.identity
+            or _key(final_facts.canonical_path) != _key(initial_facts.canonical_path)
+            or _file_size(handle) != len(payload)
+        ):
+            raise DataRootOpenErrorV1("unavailable")
+    except BaseException as error:
+        try:
+            _close_handles((handle,))
+        except Exception as close_error:
+            raise close_error from error
+        raise
+    _close_handles((handle,))
+    parent.validate_streams_v1()
 
 
 def inspect_data_root_v1(value: str) -> DataRootInspectionV1:

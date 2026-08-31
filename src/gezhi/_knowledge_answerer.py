@@ -80,6 +80,10 @@ _GOVERNANCE_DISCLOSURE = (
     "Candidate Knowledge，不代表已晋升知识、已验证事实或自动蕴含证明。"
 )
 _INSUFFICIENCY_TEXT = {
+    "no_matching_candidates": (
+        "本次检索未找到与该问题匹配、且当前可参与检索的已审核 Candidate Knowledge，"
+        "因此无法形成候选知识支持的回答。"
+    ),
     "retrieved_candidates_not_responsive": (
         "已检索到 Candidate Knowledge，但其内容不能实质回应该问题，因此无法形成候选知识支持的回答。"
     ),
@@ -311,26 +315,20 @@ def _question_value_v1(question_bytes: bytes) -> str:
     return cast(str, value["question"])
 
 
-def _view_candidates_v1(
-    retrieval: NonZeroCandidatesV1,
+def _validated_view_candidates_v1(
+    view: dict[str, object],
+    *,
+    allow_zero: bool,
 ) -> dict[str, dict[str, object]]:
-    if type(retrieval) is not NonZeroCandidatesV1:
-        raise TypeError("Knowledge Answerer retrieval type is invalid")
-    measured = retrieval.measured_retrieval_view
-    view = measured.value
+    minimum = 0 if allow_zero else 1
     if (
-        measured.status != "within_limit"
-        or not 1 <= measured.byte_length <= _PROMPT_MAX_BYTES
-        or measured.byte_length != len(measured.buffer)
-        or hashlib.sha256(measured.buffer).hexdigest() != measured.sha256
-        or _canonical_file_bytes_v1(view) != measured.buffer
-        or set(view) != {"answer_kind", "candidate_count", "items", "schema_version"}
+        set(view) != {"answer_kind", "candidate_count", "items", "schema_version"}
         or view.get("answer_kind") != "candidate_backed"
         or view.get("schema_version") != "gezhi.retrieval_view.v1"
         or type(view.get("candidate_count")) is not int
         or type(view.get("items")) is not list
         or view["candidate_count"] != len(cast(list[object], view["items"]))
-        or not 1 <= cast(int, view["candidate_count"]) <= 12
+        or not minimum <= cast(int, view["candidate_count"]) <= 12
     ):
         raise KnowledgeAnswererInputInvalidV1("Retrieval View is invalid")
     candidates: dict[str, dict[str, object]] = {}
@@ -370,6 +368,25 @@ def _view_candidates_v1(
                 "Retrieval View Candidate identity is invalid"
             )
         candidates[candidate_id] = cast(dict[str, object], raw_item)
+    return candidates
+
+
+def _view_candidates_v1(
+    retrieval: NonZeroCandidatesV1,
+) -> dict[str, dict[str, object]]:
+    if type(retrieval) is not NonZeroCandidatesV1:
+        raise TypeError("Knowledge Answerer retrieval type is invalid")
+    measured = retrieval.measured_retrieval_view
+    view = measured.value
+    if (
+        measured.status != "within_limit"
+        or not 1 <= measured.byte_length <= _PROMPT_MAX_BYTES
+        or measured.byte_length != len(measured.buffer)
+        or hashlib.sha256(measured.buffer).hexdigest() != measured.sha256
+        or _canonical_file_bytes_v1(view) != measured.buffer
+    ):
+        raise KnowledgeAnswererInputInvalidV1("Retrieval View is invalid")
+    candidates = _validated_view_candidates_v1(view, allow_zero=False)
     if tuple(candidates) != retrieval.selected_candidate_ids:
         raise KnowledgeAnswererInputInvalidV1(
             "Retrieval View selection identity differs"
@@ -848,7 +865,7 @@ def _arxiv_link_v1(arxiv_id: str) -> str:
         ) from error
 
 
-def _render_answer_markdown_v1(
+def render_answer_markdown_v1(
     question: str,
     output: dict[str, object],
     candidates: dict[str, dict[str, object]],
@@ -910,6 +927,90 @@ def _render_answer_markdown_v1(
     ):
         raise ValueError("Answer Markdown is invalid")
     return payload
+
+
+def validate_terminal_answer_content_v1(
+    *,
+    question_bytes: bytes,
+    retrieval_view_bytes: bytes,
+    prompt_bytes: bytes | None,
+    schema_bytes: bytes | None,
+    answer_output_bytes: bytes | None,
+    answer_markdown_bytes: bytes | None,
+) -> None:
+    """Re-run the Answerer content adapters for one terminal P4 tree."""
+
+    question = _question_value_v1(question_bytes)
+    try:
+        view = _decode_single_json_object_v1(retrieval_view_bytes)
+    except ValueError as error:
+        raise KnowledgeAnswererInputInvalidV1("Retrieval View is invalid") from error
+    if (
+        not 1 <= len(retrieval_view_bytes) <= _PROMPT_MAX_BYTES
+        or _canonical_file_bytes_v1(view) != retrieval_view_bytes
+    ):
+        raise KnowledgeAnswererInputInvalidV1("Retrieval View is invalid")
+    candidates = _validated_view_candidates_v1(view, allow_zero=True)
+
+    if (prompt_bytes is None) is not (schema_bytes is None):
+        raise KnowledgeAnswererInputInvalidV1("Answerer call pair is partial")
+    if prompt_bytes is not None:
+        if not candidates:
+            raise KnowledgeAnswererInputInvalidV1(
+                "zero-candidate Answer cannot have an Answerer call pair"
+            )
+        if (
+            prompt_bytes != _effective_prompt_v1(question_bytes, retrieval_view_bytes)
+            or schema_bytes != answer_output_schema_bytes_v1()
+        ):
+            raise KnowledgeAnswererInputInvalidV1("Answerer call pair identity differs")
+
+    if (answer_output_bytes is None) is not (answer_markdown_bytes is None):
+        raise KnowledgeAnswererInputInvalidV1("Answer result pair is partial")
+    if answer_output_bytes is None:
+        return
+    try:
+        value = _decode_single_json_object_v1(answer_output_bytes)
+        output = AnswerOutputV1.model_validate(value, strict=True)
+    except (ValidationError, ValueError) as error:
+        raise KnowledgeAnswererInputInvalidV1(
+            "Answer output does not match its Schema"
+        ) from error
+    normalized = cast(dict[str, object], output.model_dump(mode="json"))
+    if _canonical_file_bytes_v1(normalized) != answer_output_bytes:
+        raise KnowledgeAnswererInputInvalidV1("Answer output bytes differ")
+    candidate_ids = frozenset(candidates)
+    if candidate_ids:
+        if output.insufficiency_reason == "no_matching_candidates":
+            raise KnowledgeAnswererInputInvalidV1(
+                "non-zero Retrieval View used the zero-match reason"
+            )
+        if (
+            output.insufficiency_reason == "unresolved_evidence_conflict"
+            and len(candidate_ids) < 2
+        ):
+            raise KnowledgeAnswererInputInvalidV1(
+                "evidence conflict requires at least two Candidates"
+            )
+    elif output.insufficiency_reason != "no_matching_candidates":
+        raise KnowledgeAnswererInputInvalidV1(
+            "zero-candidate Answer used a non-zero reason"
+        )
+    if any(
+        unit.candidate_id not in candidate_ids
+        for unit in (*output.answer_units, *output.qualification_units)
+    ):
+        raise KnowledgeAnswererInputInvalidV1(
+            "Answer output cites outside the Retrieval View"
+        )
+    try:
+        rendered = render_answer_markdown_v1(question, normalized, candidates)
+    except (CitationLinkConstructionFailedV1, KeyError, ValueError) as error:
+        raise KnowledgeAnswererInputInvalidV1(
+            "Answer Markdown could not be deterministically rendered"
+        ) from error
+    if rendered != answer_markdown_bytes:
+        raise KnowledgeAnswererInputInvalidV1("Answer Markdown identity differs")
 
 
 def _stopped_answerer_v1(
@@ -1337,7 +1438,7 @@ def answer_nonzero_v1(
             attempts=tuple(attempts),
         )
     try:
-        answer_markdown_bytes = _render_answer_markdown_v1(
+        answer_markdown_bytes = render_answer_markdown_v1(
             question,
             answer_output,
             candidates,
@@ -1427,4 +1528,5 @@ __all__ = [
     "KnowledgeAnswererVerdictV1",
     "answer_nonzero_v1",
     "answer_output_schema_bytes_v1",
+    "validate_terminal_answer_content_v1",
 ]

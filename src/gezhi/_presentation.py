@@ -32,6 +32,10 @@ class CliJsonOutputTooLargeV1(ValueError):
     pass
 
 
+class CliJsonSerializationFailedV1(ValueError):
+    pass
+
+
 def _canonical_json_bytes(value: object) -> bytes:
     return json.dumps(
         value,
@@ -40,6 +44,15 @@ def _canonical_json_bytes(value: object) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def _serialize_canonical_json_bytes_v1(value: object) -> bytes:
+    try:
+        return _canonical_json_bytes(value)
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
+        raise CliJsonSerializationFailedV1(
+            "CLI canonical JSON serialization failed"
+        ) from error
 
 
 def cli_json_buffer_v1(
@@ -68,7 +81,7 @@ def cli_json_buffer_v1(
             or type(diagnostic["context"]) is not dict
         ):
             raise TypeError("CLI diagnostic item is invalid")
-    if len(_canonical_json_bytes(diagnostics)) > _DIAGNOSTICS_OUTPUT_CAP:
+    if len(_serialize_canonical_json_bytes_v1(diagnostics)) > _DIAGNOSTICS_OUTPUT_CAP:
         raise ValueError("CLI diagnostics exceed their byte limit")
 
     envelope = {
@@ -78,7 +91,7 @@ def cli_json_buffer_v1(
         "result": result,
         "diagnostics": diagnostics,
     }
-    payload = _canonical_json_bytes(envelope) + b"\n"
+    payload = _serialize_canonical_json_bytes_v1(envelope) + b"\n"
     if len(payload) > output_cap:
         raise CliJsonOutputTooLargeV1("CLI output exceeds its byte limit")
     return payload
@@ -176,6 +189,75 @@ def write_binary_buffer_v1(
             raise RuntimeError("CLI write view invariant failed")
         try:
             count = os.write(fd, current)
+        except OSError:
+            os._exit(1)
+        if type(count) is not int or not 1 <= count <= requested:
+            os._exit(1)
+        offset += count
+
+
+def write_knowledge_ask_human_buffer_v1(buffer: bytes) -> None:
+    """Write Human bytes without inheriting the JSON hard-fail terminal seam."""
+
+    if type(buffer) is not bytes or not buffer:
+        raise TypeError("Knowledge ask Human buffer must be non-empty bytes")
+    msvcrt.setmode(1, os.O_BINARY)
+    view = memoryview(buffer)
+    offset = 0
+    while offset < len(buffer):
+        current = view[offset:]
+        if current.obj is not buffer or current.nbytes != len(buffer) - offset:
+            raise RuntimeError("Knowledge ask Human write view invariant failed")
+        count = os.write(1, current)
+        if type(count) is not int or not 1 <= count <= len(current):
+            raise OSError("Knowledge ask Human write did not complete")
+        offset += count
+
+
+def write_knowledge_ask_json_buffer_v1(buffer: bytes) -> None:
+    """Publish one sealed Knowledge Ask JSON receipt through binary fd 1."""
+
+    if (
+        type(buffer) is not bytes
+        or not 1 <= len(buffer) <= 65_536
+        or not buffer.endswith(b"\n")
+    ):
+        raise ValueError("Knowledge ask JSON buffer proof is invalid")
+    base_view = memoryview(buffer)
+    if (
+        base_view.obj is not buffer
+        or base_view.nbytes != len(buffer)
+        or not base_view.readonly
+        or base_view.ndim != 1
+        or not base_view.c_contiguous
+        or base_view.itemsize != 1
+        or base_view.format != "B"
+    ):
+        raise RuntimeError("Knowledge ask JSON base view invariant failed")
+    try:
+        msvcrt.setmode(1, os.O_BINARY)
+    except OSError:
+        os._exit(1)
+
+    offset = 0
+    while offset < len(buffer):
+        remaining = len(buffer) - offset
+        current = base_view[offset:]
+        requested = len(current)
+        if (
+            current.obj is not buffer
+            or current.nbytes != remaining
+            or not current.readonly
+            or current.ndim != 1
+            or not current.c_contiguous
+            or current.itemsize != 1
+            or current.format != "B"
+            or requested != remaining
+            or not 1 <= requested <= 65_536
+        ):
+            raise RuntimeError("Knowledge ask JSON write view invariant failed")
+        try:
+            count = os.write(1, current)
         except OSError:
             os._exit(1)
         if type(count) is not int or not 1 <= count <= requested:
