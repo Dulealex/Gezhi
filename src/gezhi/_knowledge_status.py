@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from collections import Counter
 from typing import cast
 
@@ -154,78 +153,15 @@ def _import_facts(
 def _answer_work_ids(retrieval_view_bytes: bytes | None) -> frozenset[str]:
     if retrieval_view_bytes is None:
         return frozenset()
-    from gezhi._knowledge_intake import _HandoffInvalidV1, _validate_accept_record
-    from gezhi._knowledge_retrieval import _WITNESS_ACCEPT_PAYLOAD_SHA256ES
+    from gezhi._knowledge_retrieval import (
+        RetrievalMaterializationFailedV1,
+        validate_retrieval_view_candidate_snapshots_v1,
+    )
 
     try:
-        value = json.loads(retrieval_view_bytes)
-        items = value.get("items") if type(value) is dict else None
-        if (
-            type(value) is not dict
-            or set(value)
-            != {"answer_kind", "candidate_count", "items", "schema_version"}
-            or value.get("answer_kind") != "candidate_backed"
-            or value.get("schema_version") != "gezhi.retrieval_view.v1"
-            or type(value.get("candidate_count")) is not int
-            or not 0 <= cast(int, value["candidate_count"]) <= 12
-            or type(items) is not list
-            or value["candidate_count"] != len(items)
-        ):
-            raise ValueError("Retrieval View shape is invalid")
-        observed: set[str] = set()
-        candidate_ids: set[str] = set()
-        for rank, item in enumerate(items, start=1):
-            if (
-                type(item) is not dict
-                or set(item)
-                != {
-                    "candidate",
-                    "citation",
-                    "descriptor_snapshots",
-                    "evidence_snapshots",
-                    "governance",
-                    "rank",
-                }
-                or type(item.get("rank")) is not int
-                or item["rank"] != rank
-                or item.get("governance")
-                != {
-                    "intake_status": "active",
-                    "promotion_status": "not_promoted",
-                    "review_status": "accepted",
-                }
-                or type(item.get("candidate")) is not dict
-                or type(item.get("citation")) is not dict
-                or type(item.get("descriptor_snapshots")) is not list
-                or type(item.get("evidence_snapshots")) is not list
-            ):
-                raise ValueError("Retrieval View Candidate is invalid")
-            candidate = cast(dict[str, object], item["candidate"])
-            synthetic_record: dict[str, object] = {
-                "action": "accept",
-                "candidate": candidate,
-                "citation": item["citation"],
-                "descriptor_snapshots": item["descriptor_snapshots"],
-                "evidence_snapshots": item["evidence_snapshots"],
-                "review_receipt": {},
-                "schema_version": "gezhi.reviewed_candidate_action.v1",
-            }
-            candidate_id, _payload_sha256 = _validate_accept_record(
-                synthetic_record,
-                exact_witness=(
-                    candidate.get("payload_sha256") in _WITNESS_ACCEPT_PAYLOAD_SHA256ES
-                ),
-            )
-            if candidate_id in candidate_ids:
-                raise ValueError("Retrieval View Candidate is duplicated")
-            candidate_ids.add(candidate_id)
-            payload = candidate.get("payload")
-            if type(payload) is not dict or not is_work_id_v1(payload.get("work_id")):
-                raise ValueError("Retrieval View Work binding is invalid")
-            work_id = cast(str, payload["work_id"])
-            observed.add(work_id)
-        return frozenset(observed)
-    except (KeyError, TypeError, ValueError, _HandoffInvalidV1) as error:
+        snapshots = validate_retrieval_view_candidate_snapshots_v1(retrieval_view_bytes)
+        return frozenset(snapshot.work_id for snapshot in snapshots)
+    except RetrievalMaterializationFailedV1 as error:
         raise KnowledgeStatusProjectionFailedV1(
             "validated Answer relation is unavailable"
         ) from error

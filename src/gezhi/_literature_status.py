@@ -14,6 +14,7 @@ from gezhi._windows_data_root import (
     ValidatedDataRootV1,
     open_validated_data_root_v1,
 )
+from gezhi._windows_ownership import work_writer_is_active_v1
 from gezhi._work_id import is_work_id_v1
 
 if TYPE_CHECKING:
@@ -295,6 +296,8 @@ def _project_reader_v1(
     canonical: CurrentCanonicalAssetV1,
     stages: list[dict[str, str]],
     recovery: dict[str, int],
+    *,
+    writer_active: bool,
 ) -> ReaderAdvanceV1 | None:
     from gezhi import _literature_reader as reader
 
@@ -302,7 +305,8 @@ def _project_reader_v1(
     if not semantic_dir.exists():
         return None
     runs_dir = semantic_dir / "runs"
-    recovery["staging_count"] += _safe_staging_entry_count(semantic_dir / ".staging")
+    reader_staging = _safe_staging_entry_count(semantic_dir / ".staging")
+    recovery["staging_count"] += reader_staging
     current_path = semantic_dir / "current.json"
     if not current_path.exists():
         if runs_dir.exists():
@@ -314,20 +318,29 @@ def _project_reader_v1(
                     "Reader runs cannot be bounded"
                 ) from error
             valid_successes = 0
+            terminal_statuses: set[str] = set()
             for name in run_names:
                 try:
-                    manifest = reader._validated_success_manifest_sha256(
+                    status = reader.validated_terminal_reader_status_v1(
                         runs_dir / name,
                         name,
                         authority,
                         canonical,
-                        expected_sha256=None,
                     )
                 except Exception:  # noqa: BLE001 - isolate one Reader run.
                     recovery["inconsistent_count"] += 1
                 else:
-                    valid_successes += manifest is not None
+                    if status == "succeeded":
+                        valid_successes += 1
+                    else:
+                        terminal_statuses.add(status)
             recovery["orphaned_count"] += valid_successes
+            for status in ("failed", "blocked", "interrupted"):
+                if status in terminal_statuses:
+                    _set_stage(stages, "read", status)
+                    break
+        if writer_active and reader_staging:
+            _set_stage(stages, "read", "running")
         return None
     try:
         current = reader._load_current(semantic_dir, authority, canonical)
@@ -336,6 +349,8 @@ def _project_reader_v1(
         _set_stage(stages, "read", "failed")
         return None
     if current is None:
+        if writer_active and reader_staging:
+            _set_stage(stages, "read", "running")
         return None
     return current
 
@@ -576,6 +591,12 @@ def project_literature_work_status_v1(
     if include_intake_staging:
         recovery["staging_count"] = _work_intake_staging_count(root, work_id)
     stages = _base_stages(authority)
+    root_identity = root.inspection.identity
+    if root_identity is None:
+        raise LiteratureStatusProjectionFailedV1(
+            "Literature root identity is unavailable"
+        )
+    writer_active = work_writer_is_active_v1(root_identity, work_id)
     review_counts = {
         "pending": 0,
         "accepted": 0,
@@ -588,7 +609,13 @@ def project_literature_work_status_v1(
         if ocr is not None:
             canonical = _project_canonical_v1(authority, ocr, stages, recovery)
             if canonical is not None:
-                reader = _project_reader_v1(authority, canonical, stages, recovery)
+                reader = _project_reader_v1(
+                    authority,
+                    canonical,
+                    stages,
+                    recovery,
+                    writer_active=writer_active,
+                )
                 if reader is not None:
                     pending_candidate_ids = _project_materialization_v1(
                         authority,

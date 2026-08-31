@@ -2,25 +2,37 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
-import re
 import threading
 from dataclasses import dataclass
 from typing import Literal, Self, TypeAlias
 
 from gezhi._windows_data_root import FileIdentity
+from gezhi._work_id import is_work_id_v1
 
-_WORK_ID = re.compile(
-    r"^wrk_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
-)
 _WAIT_OBJECT_0 = 0x00000000
 _WAIT_ABANDONED = 0x00000080
 _WAIT_TIMEOUT = 0x00000102
 _WAIT_FAILED = 0xFFFFFFFF
+_ERROR_FILE_NOT_FOUND = 2
+_MUTANT_QUERY_STATE = 0x0001
+
+
+class _MutantBasicInformationV1(ctypes.Structure):
+    _fields_ = (
+        ("current_count", ctypes.c_long),
+        ("owned_by_caller", ctypes.c_ubyte),
+        ("abandoned_state", ctypes.c_ubyte),
+    )
+
 
 _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_NTDLL = ctypes.WinDLL("ntdll", use_last_error=True)
 _CREATE_MUTEX = _KERNEL32.CreateMutexW
 _CREATE_MUTEX.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
 _CREATE_MUTEX.restype = ctypes.c_void_p
+_OPEN_MUTEX = _KERNEL32.OpenMutexW
+_OPEN_MUTEX.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_wchar_p]
+_OPEN_MUTEX.restype = ctypes.c_void_p
 _WAIT_FOR_SINGLE_OBJECT = _KERNEL32.WaitForSingleObject
 _WAIT_FOR_SINGLE_OBJECT.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
 _WAIT_FOR_SINGLE_OBJECT.restype = ctypes.c_ulong
@@ -30,6 +42,15 @@ _RELEASE_MUTEX.restype = ctypes.c_int
 _CLOSE_HANDLE = _KERNEL32.CloseHandle
 _CLOSE_HANDLE.argtypes = [ctypes.c_void_p]
 _CLOSE_HANDLE.restype = ctypes.c_int
+_NT_QUERY_MUTANT = _NTDLL.NtQueryMutant
+_NT_QUERY_MUTANT.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_int,
+    ctypes.c_void_p,
+    ctypes.c_ulong,
+    ctypes.POINTER(ctypes.c_ulong),
+]
+_NT_QUERY_MUTANT.restype = ctypes.c_long
 
 WriterScope: TypeAlias = Literal[
     "identity_intake",
@@ -74,7 +95,7 @@ class WriterOwnershipV1:
         """Prove this live token owns one exact Work on the current thread."""
 
         identity = _validated_root_identity(root_identity)
-        if type(work_id) is not str or _WORK_ID.fullmatch(work_id) is None:
+        if not is_work_id_v1(work_id):
             raise ValueError("Work ID is invalid")
         expected_name = _mutex_name(identity, scope="work", work_id=work_id)
         thread_id = threading.get_ident()
@@ -318,13 +339,58 @@ def try_acquire_work_writer_v1(
     root_identity: FileIdentity,
     work_id: str,
 ) -> WriterOwnershipV1 | None:
-    if type(work_id) is not str or _WORK_ID.fullmatch(work_id) is None:
+    if not is_work_id_v1(work_id):
         raise ValueError("Work ID is invalid")
     return _try_acquire(
         root_identity,
         scope="work",
         work_id=work_id,
     )
+
+
+def work_writer_is_active_v1(
+    root_identity: FileIdentity,
+    work_id: str,
+) -> bool:
+    """Observe one named Work mutex without acquiring or creating it."""
+
+    identity = _validated_root_identity(root_identity)
+    if not is_work_id_v1(work_id):
+        raise ValueError("Work ID is invalid")
+    name = _mutex_name(identity, scope="work", work_id=work_id)
+    handle = _OPEN_MUTEX(_MUTANT_QUERY_STATE, False, name)
+    if handle in {None, 0}:
+        if ctypes.get_last_error() == _ERROR_FILE_NOT_FOUND:
+            return False
+        raise WriterOwnershipLifecycleErrorV1("OpenMutexW query failed")
+    numeric_handle = int(handle)
+    information = _MutantBasicInformationV1()
+    returned = ctypes.c_ulong(0)
+    try:
+        status = int(
+            _NT_QUERY_MUTANT(
+                numeric_handle,
+                0,
+                ctypes.byref(information),
+                ctypes.sizeof(information),
+                ctypes.byref(returned),
+            )
+        )
+        if status != 0:
+            raise WriterOwnershipLifecycleErrorV1("NtQueryMutant failed")
+        if (
+            information.current_count > 1
+            or information.owned_by_caller not in {0, 1}
+            or information.abandoned_state not in {0, 1}
+        ):
+            raise WriterOwnershipLifecycleErrorV1(
+                "Work writer activity observation is invalid"
+            )
+        active = information.current_count <= 0 and information.abandoned_state == 0
+    finally:
+        if not _CLOSE_HANDLE(numeric_handle):
+            raise WriterOwnershipLifecycleErrorV1("CloseHandle failed")
+    return active
 
 
 def try_acquire_catalog_projection_v1(

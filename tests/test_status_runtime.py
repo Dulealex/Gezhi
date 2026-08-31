@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -14,6 +15,7 @@ from launcher_support import (
     run_both_launchers,
     run_launcher,
 )
+from literature_pdf_support import write_text_pdf
 
 
 @pytest.fixture
@@ -188,6 +190,58 @@ def _run_add(literature: Path, pdf_path: Path) -> dict[str, object]:
     return json.loads(result.stdout)["result"]
 
 
+def _run_resume(
+    literature: Path,
+    work_id: str,
+    *,
+    pythonpath_roots: tuple[Path, ...] = (SOURCE_ROOT,),
+) -> subprocess.CompletedProcess[bytes]:
+    return run_launcher(
+        launcher_commands(
+            (
+                "--literature-data-root",
+                str(literature),
+                "literature",
+                "resume",
+                work_id,
+                "--json",
+            )
+        )[1],
+        pythonpath_roots=pythonpath_roots,
+    )
+
+
+def _canonical_json_line(value: object) -> bytes:
+    return (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
+def _stop_before_reader_sitecustomize(site_root: Path) -> None:
+    (site_root / "sitecustomize.py").write_text(
+        """
+import gezhi._literature_reader as reader
+
+
+def stop_before_reader(*_args, **_kwargs):
+    raise reader.ReaderStageStoppedV1(
+        "blocked", "codex_runtime_unavailable"
+    )
+
+
+reader.advance_reader_v1 = stop_before_reader
+""",
+        encoding="utf-8",
+    )
+
+
 @pytest.mark.parametrize("launcher_index", [0, 1])
 def test_ingested_work_projects_only_ingest_as_succeeded(
     status_roots: tuple[Path, Path, Path],
@@ -252,6 +306,155 @@ def test_valid_absent_work_is_blocked_only_after_literature_is_readable(
             "context": {"work_id": work_id},
         }
     ]
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "reason"),
+    [
+        pytest.param("blocked", "codex_runtime_unavailable", id="blocked"),
+        pytest.param("failed", "codex_process_failed", id="failed"),
+        pytest.param("interrupted", "interrupted", id="interrupted"),
+    ],
+)
+def test_reader_terminal_run_projects_its_historical_stage_state(
+    status_roots: tuple[Path, Path, Path],
+    terminal_status: str,
+    reason: str,
+) -> None:
+    from gezhi._literature_status import project_literature_work_status_v1
+    from gezhi._windows_data_root import open_validated_data_root_v1
+
+    base, literature, _knowledge = status_roots
+    pdf_path = base / "reader-terminal.pdf"
+    write_text_pdf(
+        pdf_path,
+        "This native PDF has enough searchable text for Reader status projection.",
+    )
+    added = _run_add(literature, pdf_path)
+    work_id = str(added["work_id"])
+    resumed = _run_resume(literature, work_id)
+    assert resumed.returncode == 2
+
+    semantic_runs = (
+        literature
+        / "works"
+        / work_id
+        / "sources"
+        / str(added["source_id"])
+        / "semantic"
+        / "runs"
+    )
+    run_directories = [path for path in semantic_runs.iterdir() if path.is_dir()]
+    assert len(run_directories) == 1
+    manifest_path = run_directories[0] / "manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    assert manifest["status"] == "blocked"
+    if terminal_status == "failed":
+        from gezhi import _literature_reader as reader
+
+        attempt = {
+            "attempt_ordinal": 1,
+            "cached_input_tokens": None,
+            "elapsed_ms": 1,
+            "exit_code": 71,
+            "failure_class": "process_error",
+            "finished_at": "2026-08-31T12:00:01.000Z",
+            "input_tokens": None,
+            "output_tokens": None,
+            "reasoning_output_tokens": None,
+            "resource_ledger_count": 0,
+            "schema_version": "gezhi.literature_codex_attempt.v1",
+            "started_at": "2026-08-31T12:00:00.000Z",
+            "usage_unavailable": True,
+        }
+        attempt_dir = run_directories[0] / "attempts" / "01"
+        attempt_dir.mkdir()
+        (attempt_dir / "attempt.json").write_bytes(_canonical_json_line(attempt))
+        (attempt_dir / "events.jsonl").write_bytes(b"not-json\n")
+        manifest["attempt_count"] = 1
+        manifest["attempts"] = [attempt]
+        manifest["usage_totals"] = {
+            "cached_input_tokens": None,
+            "input_tokens": None,
+            "output_tokens": None,
+            "reasoning_output_tokens": None,
+        }
+        manifest["assets"] = reader._asset_entries(run_directories[0])
+    if terminal_status != "blocked":
+        manifest["status"] = terminal_status
+        manifest["reason"] = reason
+        manifest_path.write_bytes(_canonical_json_line(manifest))
+    before = _tree_snapshot(literature)
+
+    with open_validated_data_root_v1(str(literature)) as root:
+        report = project_literature_work_status_v1(
+            root,
+            work_id,
+            include_intake_staging=True,
+        )
+
+    assert report is not None
+    assert report["stages"][3] == {
+        "stage": "read",
+        "status": terminal_status,
+    }
+    assert before == _tree_snapshot(literature)
+
+
+def test_live_work_writer_and_reader_staging_project_read_as_running(
+    status_roots: tuple[Path, Path, Path],
+    tmp_path: Path,
+) -> None:
+    from gezhi._literature_status import project_literature_work_status_v1
+    from gezhi._windows_data_root import open_validated_data_root_v1
+    from gezhi._windows_ownership import try_acquire_work_writer_v1
+
+    base, literature, _knowledge = status_roots
+    pdf_path = base / "reader-running.pdf"
+    write_text_pdf(
+        pdf_path,
+        "This native PDF has enough searchable text for live Reader projection.",
+    )
+    added = _run_add(literature, pdf_path)
+    work_id = str(added["work_id"])
+    _stop_before_reader_sitecustomize(tmp_path)
+    resumed = _run_resume(
+        literature,
+        work_id,
+        pythonpath_roots=(tmp_path, SOURCE_ROOT),
+    )
+    assert resumed.returncode == 2
+
+    semantic_staging = (
+        literature
+        / "works"
+        / work_id
+        / "sources"
+        / str(added["source_id"])
+        / "semantic"
+        / ".staging"
+    )
+    semantic_staging.mkdir(parents=True)
+    (semantic_staging / "semrun_00000000-0000-4000-8000-000000000086").mkdir()
+    before = _tree_snapshot(literature)
+
+    with open_validated_data_root_v1(str(literature)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_work_writer_v1(identity, work_id)
+        assert owner is not None
+        try:
+            report = project_literature_work_status_v1(
+                root,
+                work_id,
+                include_intake_staging=True,
+            )
+        finally:
+            owner.close()
+
+    assert report is not None
+    assert report["stages"][3] == {"stage": "read", "status": "running"}
+    assert before == _tree_snapshot(literature)
 
 
 def test_real_candidate_registry_projects_the_same_candidate_for_overall_and_work(
