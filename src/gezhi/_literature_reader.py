@@ -92,6 +92,44 @@ _READER_INSTRUCTIONS = (
 _READER_INPUT_SUFFIX = b"--- END READER INPUT JSONL ---\n"
 
 ReaderOutcome: TypeAlias = Literal["blocked", "failed"]
+ReaderTerminalStatusV1: TypeAlias = Literal[
+    "succeeded",
+    "blocked",
+    "failed",
+    "interrupted",
+]
+_READER_MANIFEST_KEYS_V1 = frozenset(
+    {
+        "assets",
+        "attempt_count",
+        "attempts",
+        "candidate_count",
+        "candidate_draft_count",
+        "canonical_content_sha256",
+        "canonical_manifest_sha256",
+        "canonical_run_id",
+        "codex_cli_version",
+        "finished_at",
+        "git_revision",
+        "input_block_count",
+        "input_block_limit",
+        "input_byte_length",
+        "input_byte_limit",
+        "input_sha256",
+        "model",
+        "prompt_sha256",
+        "reasoning_effort",
+        "role",
+        "run_id",
+        "schema_sha256",
+        "schema_version",
+        "source_id",
+        "source_sha256",
+        "status",
+        "usage_totals",
+        "work_id",
+    }
+)
 ReaderReason: TypeAlias = Literal[
     "reader_input_invalid",
     "reader_input_too_large",
@@ -428,9 +466,7 @@ def _prepare_role_invocation_v1() -> FrozenCodexRuntimeV1:
     try:
         return resolve_codex_runtime_v1(_PROJECT_ROOT)
     except (CodexRuntimeResolutionErrorV1, OSError, ValueError) as error:
-        raise ReaderStageStoppedV1(
-            "blocked", "codex_runtime_unavailable"
-        ) from error
+        raise ReaderStageStoppedV1("blocked", "codex_runtime_unavailable") from error
 
 
 def _reader_metadata(
@@ -499,8 +535,7 @@ def _reader_input(
                 or (
                     value.get("page_index") is not None
                     and (
-                        type(value["page_index"]) is not int
-                        or value["page_index"] < 0
+                        type(value["page_index"]) is not int or value["page_index"] < 0
                     )
                 )
                 or type(value.get("text")) is not str
@@ -604,14 +639,9 @@ def _validate_evidence(
         ):
             raise ReaderStageStoppedV1("failed", "reader_output_invalid")
     for descriptor in descriptor_values:
-        if any(
-            block_id not in evidence
-            for block_id in descriptor.evidence_block_ids
-        ):
+        if any(block_id not in evidence for block_id in descriptor.evidence_block_ids):
             raise ReaderStageStoppedV1("failed", "reader_output_invalid")
-        cited_blocks = [
-            evidence[item_id] for item_id in descriptor.evidence_block_ids
-        ]
+        cited_blocks = [evidence[item_id] for item_id in descriptor.evidence_block_ids]
         if any(
             not any(term in block_text for block_text in cited_blocks)
             for term in descriptor.source_terms
@@ -918,9 +948,7 @@ def _usage(
     ):
         value = None if usage is None else usage.get(name)
         values.append(
-            value
-            if type(value) is int and 0 <= value <= _MAX_AUDIT_INTEGER
-            else None
+            value if type(value) is int and 0 <= value <= _MAX_AUDIT_INTEGER else None
         )
     return (values[0], values[1], values[2], values[3]), True
 
@@ -937,9 +965,7 @@ def _attempt_document(
     usage, events_valid = _usage(events)
     input_tokens, cached_tokens, output_tokens, reasoning_tokens = usage
     effective_failure_class = (
-        "process_error"
-        if not events_valid and failure_class is None
-        else failure_class
+        "process_error" if not events_valid and failure_class is None else failure_class
     )
     elapsed_ns = (
         None
@@ -1127,10 +1153,8 @@ def _attempt_documents_from_run_v1(
         if (
             set(document) != expected_keys
             or document.get("attempt_ordinal") != expected_ordinal
-            or document.get("schema_version")
-            != "gezhi.literature_codex_attempt.v1"
-            or document.get("failure_class")
-            not in {None, "timeout", "process_error"}
+            or document.get("schema_version") != "gezhi.literature_codex_attempt.v1"
+            or document.get("failure_class") not in {None, "timeout", "process_error"}
             or type(document.get("resource_ledger_count")) is not int
             or document["resource_ledger_count"] != 0
             or type(document.get("usage_unavailable")) is not bool
@@ -1140,26 +1164,15 @@ def _attempt_documents_from_run_v1(
             or not document["finished_at"]
             or (
                 elapsed_ms is not None
-                and (
-                    type(elapsed_ms) is not int
-                    or elapsed_ms < 0
-                )
+                and (type(elapsed_ms) is not int or elapsed_ms < 0)
             )
-            or (
-                exit_code is not None
-                and type(exit_code) is not int
-            )
+            or (exit_code is not None and type(exit_code) is not int)
             or any(
                 (value := document.get(name)) is not None
-                and (
-                    type(value) is not int or value < 0
-                )
+                and (type(value) is not int or value < 0)
                 for name in token_names
             )
-            or any(
-                document.get(name) != expected_usage[name]
-                for name in token_names
-            )
+            or any(document.get(name) != expected_usage[name] for name in token_names)
             or document["usage_unavailable"]
             is not any(value is None for value in usage)
             or (
@@ -1173,10 +1186,7 @@ def _attempt_documents_from_run_v1(
         ):
             raise ValueError("Reader attempt document is invalid")
         documents.append(document)
-    if any(
-        document.get("failure_class") != "timeout"
-        for document in documents[:-1]
-    ):
+    if any(document.get("failure_class") != "timeout" for document in documents[:-1]):
         raise ValueError("Reader retry sequence is invalid")
     return documents
 
@@ -1279,9 +1289,7 @@ def _recover_staging_v1(
     _checkpoint(authority, root)
     try:
         if _name_exists(runs_dir, run_id):
-            raise ReaderRecoveryUncertainV1(
-                "semantic interrupted run target conflicts"
-            )
+            raise ReaderRecoveryUncertainV1("semantic interrupted run target conflicts")
     except ValueError as error:
         raise ReaderRecoveryUncertainV1(
             "semantic interrupted run target cannot be proven"
@@ -1302,6 +1310,103 @@ def _recover_staging_v1(
         ) from error
 
 
+@dataclass(frozen=True, slots=True)
+class _ValidatedReaderTerminalPrefixV1:
+    manifest_sha256: str
+    status: ReaderTerminalStatusV1
+    attempt_count: int
+    attempts: list[dict[str, object]]
+    evidence: dict[str, str]
+
+
+def _validated_reader_terminal_prefix_v1(
+    run_dir: Path,
+    run_id: str,
+    authority: ActiveSourceAuthorityV1,
+    canonical: CurrentCanonicalAssetV1,
+    *,
+    manifest: dict[str, object],
+    manifest_bytes: bytes,
+    expected_sha256: str | None,
+) -> _ValidatedReaderTerminalPrefixV1:
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    status = manifest.get("status")
+    if status not in {"succeeded", "blocked", "failed", "interrupted"}:
+        raise ValueError("semantic terminal status is invalid")
+    expected_keys = set(_READER_MANIFEST_KEYS_V1)
+    if status != "succeeded":
+        expected_keys.add("reason")
+    input_bytes, evidence = _reader_input(authority, canonical)
+    schema_bytes = reader_output_schema_bytes_v1()
+    prompt_bytes = _effective_prompt(input_bytes)
+    candidate_draft_count = manifest.get("candidate_draft_count")
+    attempt_count = manifest.get("attempt_count")
+    git_revision = manifest.get("git_revision")
+    if (
+        (expected_sha256 is not None and manifest_sha256 != expected_sha256)
+        or set(manifest) != expected_keys
+        or manifest.get("schema_version") != "gezhi.literature_semantic_run_manifest.v1"
+        or manifest.get("run_id") != run_id
+        or manifest.get("canonical_content_sha256")
+        != canonical.canonical_content_sha256
+        or manifest.get("canonical_manifest_sha256") != canonical.manifest_sha256
+        or manifest.get("canonical_run_id") != canonical.run_id
+        or manifest.get("source_id") != authority.source_id
+        or manifest.get("source_sha256") != authority.source_sha256
+        or manifest.get("work_id") != authority.work_id
+        or manifest.get("candidate_count") != 0
+        or type(candidate_draft_count) is not int
+        or not 0 <= candidate_draft_count <= 12
+        or manifest.get("codex_cli_version") != "0.146.0"
+        or manifest.get("model") != "gpt-5.6-sol"
+        or manifest.get("reasoning_effort") != "high"
+        or manifest.get("role") != "literature_reader_v1"
+        or type(manifest.get("finished_at")) is not str
+        or not manifest["finished_at"]
+        or type(git_revision) is not str
+        or re.fullmatch(r"[0-9a-f]{40}", git_revision) is None
+        or manifest.get("input_block_count") != len(evidence)
+        or manifest.get("input_block_limit") != _INPUT_BLOCK_LIMIT
+        or manifest.get("input_byte_length") != len(input_bytes)
+        or manifest.get("input_byte_limit") != _INPUT_BYTE_LIMIT
+        or manifest.get("input_sha256") != hashlib.sha256(input_bytes).hexdigest()
+        or manifest.get("prompt_sha256") != hashlib.sha256(prompt_bytes).hexdigest()
+        or manifest.get("schema_sha256") != hashlib.sha256(schema_bytes).hexdigest()
+        or _read_safe_bytes(
+            run_dir / "input.jsonl",
+            limit=_INPUT_BYTE_LIMIT,
+        )
+        != input_bytes
+        or _read_safe_bytes(
+            run_dir / "prompt.txt",
+            limit=_MAX_JSON_OR_TEXT_BYTES,
+        )
+        != prompt_bytes
+        or _read_safe_bytes(
+            run_dir / "schema.json",
+            limit=_MAX_JSON_OR_TEXT_BYTES,
+        )
+        != schema_bytes
+        or type(attempt_count) is not int
+        or not 0 <= attempt_count <= 3
+    ):
+        raise ValueError("semantic terminal run prefix is invalid")
+    attempts = _attempt_documents_from_run_v1(run_dir)
+    if (
+        len(attempts) != attempt_count
+        or manifest.get("attempts") != attempts
+        or manifest.get("usage_totals") != _usage_totals(attempts)
+    ):
+        raise ValueError("semantic terminal attempt provenance is invalid")
+    return _ValidatedReaderTerminalPrefixV1(
+        manifest_sha256=manifest_sha256,
+        status=cast(ReaderTerminalStatusV1, status),
+        attempt_count=attempt_count,
+        attempts=attempts,
+        evidence=evidence,
+    )
+
+
 def _validated_success_manifest_sha256(
     run_dir: Path,
     run_id: str,
@@ -1311,15 +1416,11 @@ def _validated_success_manifest_sha256(
     expected_sha256: str | None,
 ) -> str | None:
     try:
-        manifest, manifest_bytes = _read_canonical_object_v1(
-            run_dir / "manifest.json"
-        )
-        manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+        manifest, manifest_bytes = _read_canonical_object_v1(run_dir / "manifest.json")
         identity_matches = (
             manifest.get("canonical_content_sha256")
             == canonical.canonical_content_sha256
-            and manifest.get("canonical_manifest_sha256")
-            == canonical.manifest_sha256
+            and manifest.get("canonical_manifest_sha256") == canonical.manifest_sha256
             and manifest.get("canonical_run_id") == canonical.run_id
             and manifest.get("source_id") == authority.source_id
             and manifest.get("source_sha256") == authority.source_sha256
@@ -1329,102 +1430,24 @@ def _validated_success_manifest_sha256(
             manifest.get("status") != "succeeded" or not identity_matches
         ):
             return None
+        terminal = _validated_reader_terminal_prefix_v1(
+            run_dir,
+            run_id,
+            authority,
+            canonical,
+            manifest=manifest,
+            manifest_bytes=manifest_bytes,
+            expected_sha256=expected_sha256,
+        )
+        manifest_sha256 = terminal.manifest_sha256
+        attempt_count = terminal.attempt_count
+        attempts = terminal.attempts
+        evidence = terminal.evidence
         if (
-            expected_sha256 is not None
-            and manifest_sha256 != expected_sha256
-        ):
-            raise ValueError("semantic manifest identity is invalid")
-        expected_manifest_keys = {
-            "assets",
-            "attempt_count",
-            "attempts",
-            "candidate_count",
-            "candidate_draft_count",
-            "canonical_content_sha256",
-            "canonical_manifest_sha256",
-            "canonical_run_id",
-            "codex_cli_version",
-            "finished_at",
-            "git_revision",
-            "input_block_count",
-            "input_block_limit",
-            "input_byte_length",
-            "input_byte_limit",
-            "input_sha256",
-            "model",
-            "prompt_sha256",
-            "reasoning_effort",
-            "role",
-            "run_id",
-            "schema_sha256",
-            "schema_version",
-            "source_id",
-            "source_sha256",
-            "status",
-            "usage_totals",
-            "work_id",
-        }
-        input_bytes, evidence = _reader_input(authority, canonical)
-        schema_bytes = reader_output_schema_bytes_v1()
-        prompt_bytes = _effective_prompt(input_bytes)
-        candidate_draft_count = manifest.get("candidate_draft_count")
-        git_revision = manifest.get("git_revision")
-        if (
-            set(manifest) != expected_manifest_keys
-            or manifest.get("schema_version")
-            != "gezhi.literature_semantic_run_manifest.v1"
-            or manifest.get("run_id") != run_id
-            or manifest.get("status") != "succeeded"
-            or not identity_matches
-            or manifest.get("candidate_count") != 0
-            or type(candidate_draft_count) is not int
-            or not 0 <= candidate_draft_count <= 12
-            or manifest.get("codex_cli_version") != "0.146.0"
-            or manifest.get("model") != "gpt-5.6-sol"
-            or manifest.get("reasoning_effort") != "high"
-            or manifest.get("role") != "literature_reader_v1"
-            or type(manifest.get("finished_at")) is not str
-            or not manifest["finished_at"]
-            or type(git_revision) is not str
-            or re.fullmatch(r"[0-9a-f]{40}", git_revision) is None
-            or manifest.get("input_block_count") != len(evidence)
-            or manifest.get("input_block_limit") != _INPUT_BLOCK_LIMIT
-            or manifest.get("input_byte_length") != len(input_bytes)
-            or manifest.get("input_byte_limit") != _INPUT_BYTE_LIMIT
-            or manifest.get("input_sha256")
-            != hashlib.sha256(input_bytes).hexdigest()
-            or manifest.get("prompt_sha256")
-            != hashlib.sha256(prompt_bytes).hexdigest()
-            or manifest.get("schema_sha256")
-            != hashlib.sha256(schema_bytes).hexdigest()
-            or _read_safe_bytes(
-                run_dir / "input.jsonl",
-                limit=_INPUT_BYTE_LIMIT,
-            )
-            != input_bytes
-            or _read_safe_bytes(
-                run_dir / "prompt.txt",
-                limit=_MAX_JSON_OR_TEXT_BYTES,
-            )
-            != prompt_bytes
-            or _read_safe_bytes(
-                run_dir / "schema.json",
-                limit=_MAX_JSON_OR_TEXT_BYTES,
-            )
-            != schema_bytes
-        ):
-            raise ValueError("semantic run is invalid")
-        attempt_count = manifest.get("attempt_count")
-        if type(attempt_count) is not int or not 1 <= attempt_count <= 3:
-            raise ValueError("semantic attempt count is invalid")
-        attempts = _attempt_documents_from_run_v1(run_dir)
-        if (
-            len(attempts) != attempt_count
-            or manifest.get("attempts") != attempts
-            or manifest.get("usage_totals") != _usage_totals(attempts)
+            terminal.status != "succeeded"
+            or not 1 <= attempt_count <= 3
             or any(
-                attempt.get("failure_class") != "timeout"
-                for attempt in attempts[:-1]
+                attempt.get("failure_class") != "timeout" for attempt in attempts[:-1]
             )
             or attempts[-1].get("failure_class") is not None
             or attempts[-1].get("exit_code") != 0
@@ -1477,8 +1500,7 @@ def _validated_success_manifest_sha256(
                 limit=_MAX_JSON_OR_TEXT_BYTES,
             )
             != b""
-            or manifest.get("candidate_draft_count")
-            != len(output.candidate_drafts)
+            or manifest.get("candidate_draft_count") != len(output.candidate_drafts)
             or frozenset(_entry_names(run_dir / "result"))
             != {
                 "candidate_drafts.json",
@@ -1507,10 +1529,7 @@ def _validated_success_manifest_sha256(
                 "final_message.txt",
             ):
                 expected_paths.add(prefix + "final_message.txt")
-        if (
-            observed_paths != expected_paths
-            or manifest.get("assets") != assets
-        ):
+        if observed_paths != expected_paths or manifest.get("assets") != assets:
             raise ValueError("semantic asset inventory is invalid")
     except (
         KeyError,
@@ -1522,6 +1541,102 @@ def _validated_success_manifest_sha256(
     ) as error:
         raise ReaderStageStoppedV1("failed", "asset_integrity_lost") from error
     return manifest_sha256
+
+
+def validated_terminal_reader_status_v1(
+    run_dir: Path,
+    run_id: str,
+    authority: ActiveSourceAuthorityV1,
+    canonical: CurrentCanonicalAssetV1,
+) -> ReaderTerminalStatusV1:
+    """Validate one committed Reader run and return only its terminal state."""
+
+    try:
+        manifest, manifest_bytes = _read_canonical_object_v1(run_dir / "manifest.json")
+        status = manifest.get("status")
+        if status == "succeeded":
+            manifest_sha256 = _validated_success_manifest_sha256(
+                run_dir,
+                run_id,
+                authority,
+                canonical,
+                expected_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+            )
+            if manifest_sha256 is None:
+                raise ValueError("semantic success is not attributable")
+            return "succeeded"
+        terminal = _validated_reader_terminal_prefix_v1(
+            run_dir,
+            run_id,
+            authority,
+            canonical,
+            manifest=manifest,
+            manifest_bytes=manifest_bytes,
+            expected_sha256=None,
+        )
+        status = terminal.status
+        attempt_count = terminal.attempt_count
+        attempts = terminal.attempts
+        reason = manifest.get("reason")
+        if status == "succeeded" or manifest.get("candidate_draft_count") != 0:
+            raise ValueError("semantic terminal run is invalid")
+        if status == "blocked":
+            valid_terminal = (
+                reason == "codex_runtime_unavailable" and attempt_count == 0
+            ) or (
+                reason == "codex_timeout_exhausted"
+                and attempt_count == 3
+                and all(
+                    attempt.get("failure_class") == "timeout" for attempt in attempts
+                )
+            )
+        elif status == "failed":
+            valid_terminal = bool(attempts) and (
+                reason == "codex_process_failed"
+                and attempts[-1].get("failure_class") == "process_error"
+                or reason in {"reader_output_invalid", "candidate_validation_failed"}
+                and attempts[-1].get("failure_class") is None
+                and attempts[-1].get("exit_code") == 0
+            )
+        else:
+            valid_terminal = reason == "interrupted"
+        if not valid_terminal:
+            raise ValueError("semantic terminal status matrix is invalid")
+
+        assets = _asset_entries(run_dir)
+        observed_paths = {entry["path"] for entry in assets}
+        expected_paths = {"input.jsonl", "prompt.txt", "schema.json"}
+        for ordinal in range(1, attempt_count + 1):
+            prefix = f"attempts/{ordinal:02d}/"
+            expected_paths.update({prefix + "attempt.json", prefix + "events.jsonl"})
+            if _name_exists(
+                run_dir / "attempts" / f"{ordinal:02d}",
+                "final_message.txt",
+            ):
+                expected_paths.add(prefix + "final_message.txt")
+        if (
+            frozenset(_entry_names(run_dir))
+            != {
+                "attempts",
+                "input.jsonl",
+                "manifest.json",
+                "prompt.txt",
+                "schema.json",
+            }
+            or observed_paths != expected_paths
+            or manifest.get("assets") != assets
+        ):
+            raise ValueError("semantic terminal asset inventory is invalid")
+    except (
+        KeyError,
+        OSError,
+        ReaderStageStoppedV1,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as error:
+        raise ReaderStageStoppedV1("failed", "asset_integrity_lost") from error
+    return cast(ReaderTerminalStatusV1, status)
 
 
 def _replace_semantic_current_v1(
@@ -1552,10 +1667,13 @@ def _replace_semantic_current_v1(
         raise ReaderRecoveryUncertainV1(
             "semantic current replace result is uncertain"
         ) from error
-    if _read_safe_bytes(
-        semantic_dir / "current.json",
-        limit=len(current_bytes),
-    ) != current_bytes:
+    if (
+        _read_safe_bytes(
+            semantic_dir / "current.json",
+            limit=len(current_bytes),
+        )
+        != current_bytes
+    ):
         raise ReaderRecoveryUncertainV1("semantic current readback differs")
 
 
@@ -1788,13 +1906,9 @@ def advance_reader_v1(
                     )
                 )
                 if not isinstance(attempt_result, AttemptTerminalEvidenceV1):
-                    raise ReaderStageStoppedV1(
-                        "blocked", "codex_runtime_unavailable"
-                    )
+                    raise ReaderStageStoppedV1("blocked", "codex_runtime_unavailable")
                 attempt = attempt_result
-                shared_deadline_monotonic_ns = (
-                    attempt.shared_deadline_monotonic_ns
-                )
+                shared_deadline_monotonic_ns = attempt.shared_deadline_monotonic_ns
             except ReaderStageStoppedV1 as error:
                 if (
                     error.outcome == "blocked"
@@ -1819,7 +1933,9 @@ def advance_reader_v1(
                     failure_class=(
                         "timeout"
                         if timed_out
-                        else "process_error" if process_failed else None
+                        else "process_error"
+                        if process_failed
+                        else None
                     ),
                 )
                 if not events_valid and not timed_out:
@@ -1899,16 +2015,12 @@ def advance_reader_v1(
                 limit=_MAX_JSON_OR_TEXT_BYTES,
             )
         )["assets"] != _asset_entries(stage):
-            raise ReaderRecoveryUncertainV1(
-                "semantic manifest readback differs"
-            )
+            raise ReaderRecoveryUncertainV1("semantic manifest readback differs")
         target = runs_dir / run_id
         _checkpoint(authority, root)
         try:
             if _name_exists(runs_dir, run_id):
-                raise ReaderRecoveryUncertainV1(
-                    "semantic run target conflicts"
-                )
+                raise ReaderRecoveryUncertainV1("semantic run target conflicts")
             with (
                 open_validated_data_root_v1(str(staging_dir)),
                 open_validated_data_root_v1(str(runs_dir)),
@@ -1997,9 +2109,7 @@ def advance_reader_v1(
     _checkpoint(authority, root)
     try:
         if _name_exists(runs_dir, run_id):
-            raise ReaderRecoveryUncertainV1(
-                "semantic run target conflicts"
-            )
+            raise ReaderRecoveryUncertainV1("semantic run target conflicts")
         with (
             open_validated_data_root_v1(str(staging_dir)),
             open_validated_data_root_v1(str(runs_dir)),

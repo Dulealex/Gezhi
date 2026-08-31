@@ -41,6 +41,7 @@ from gezhi._windows_data_root import (
     ValidatedDataRootV1,
     ValidatedFileV1,
 )
+from gezhi._work_id import is_work_id_v1
 
 _ALGORITHM_VERSION = "gezhi.fts5_dual_rrf_k12.v1"
 _AUDIT_SCHEMA_VERSION = "gezhi.retrieval_audit.v1"
@@ -116,6 +117,13 @@ class NonZeroCandidatesV1:
 
 
 KnowledgeRetrievalResultV1: TypeAlias = ZeroCandidateRetrievalV1 | NonZeroCandidatesV1
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedRetrievalViewCandidateSnapshotV1:
+    candidate_id: str
+    payload_sha256: str
+    work_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -927,12 +935,9 @@ def _terminal_final_selection_v1(
     return tuple(selected)
 
 
-def _terminal_retrieval_view_v1(
+def validate_retrieval_view_candidate_snapshots_v1(
     retrieval_view_bytes: bytes,
-    *,
-    selected_candidate_ids: tuple[str, ...],
-    identities: dict[str, tuple[str, int, str]],
-) -> None:
+) -> tuple[ValidatedRetrievalViewCandidateSnapshotV1, ...]:
     view = _terminal_json_object_v1(
         retrieval_view_bytes,
         label="Retrieval View asset",
@@ -943,15 +948,14 @@ def _terminal_retrieval_view_v1(
         or view.get("answer_kind") != "candidate_backed"
         or view.get("schema_version") != _VIEW_SCHEMA_VERSION
         or type(view.get("candidate_count")) is not int
-        or view.get("candidate_count") != len(selected_candidate_ids)
+        or not 0 <= cast(int, view["candidate_count"]) <= 12
         or type(items) is not list
-        or len(items) != len(selected_candidate_ids)
+        or view.get("candidate_count") != len(items)
     ):
         raise RetrievalMaterializationFailedV1("Retrieval View is invalid")
-    for rank, (raw_item, selected_candidate_id) in enumerate(
-        zip(items, selected_candidate_ids, strict=True),
-        start=1,
-    ):
+    snapshots: list[ValidatedRetrievalViewCandidateSnapshotV1] = []
+    observed_candidate_ids: set[str] = set()
+    for rank, raw_item in enumerate(items, start=1):
         if (
             type(raw_item) is not dict
             or set(raw_item)
@@ -999,11 +1003,45 @@ def _terminal_retrieval_view_v1(
             raise RetrievalMaterializationFailedV1(
                 "Retrieval View Candidate snapshot is invalid"
             ) from error
+        payload = raw_candidate.get("payload")
+        if (
+            candidate_id in observed_candidate_ids
+            or type(payload) is not dict
+            or not is_work_id_v1(payload.get("work_id"))
+        ):
+            raise RetrievalMaterializationFailedV1(
+                "Retrieval View Candidate identity is invalid"
+            )
+        observed_candidate_ids.add(candidate_id)
+        snapshots.append(
+            ValidatedRetrievalViewCandidateSnapshotV1(
+                candidate_id=candidate_id,
+                payload_sha256=payload_sha256,
+                work_id=cast(str, payload["work_id"]),
+            )
+        )
+    return tuple(snapshots)
+
+
+def _terminal_retrieval_view_v1(
+    retrieval_view_bytes: bytes,
+    *,
+    selected_candidate_ids: tuple[str, ...],
+    identities: dict[str, tuple[str, int, str]],
+) -> None:
+    snapshots = validate_retrieval_view_candidate_snapshots_v1(retrieval_view_bytes)
+    if len(snapshots) != len(selected_candidate_ids):
+        raise RetrievalMaterializationFailedV1("Retrieval View Candidate count differs")
+    for snapshot, selected_candidate_id in zip(
+        snapshots,
+        selected_candidate_ids,
+        strict=True,
+    ):
         identity = identities.get(selected_candidate_id)
         if (
             identity is None
-            or candidate_id != selected_candidate_id
-            or payload_sha256 != identity[0]
+            or snapshot.candidate_id != selected_candidate_id
+            or snapshot.payload_sha256 != identity[0]
         ):
             raise RetrievalMaterializationFailedV1(
                 "Retrieval View Candidate identity differs"
