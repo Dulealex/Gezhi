@@ -36,6 +36,7 @@ _UTC_MILLISECONDS = re.compile(
     r"[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$"
 )
 _GIT_REVISION = re.compile(r"^[0-9a-f]{40}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _INT64_MAX = 9_223_372_036_854_775_807
 
 ANSWER_MANIFEST_MAX_BYTES = 65_536
@@ -497,6 +498,40 @@ def _validate_attempt_record_v1(record: Mapping[str, object]) -> dict[str, objec
     return dict(record)
 
 
+def _validate_retrieval_view_measurement_v1(
+    value: object,
+) -> dict[str, object]:
+    if type(value) is not dict or set(value) != {
+        "byte_length",
+        "limit_bytes",
+        "sha256",
+        "status",
+    }:
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer Retrieval View measurement is invalid"
+        )
+    byte_length = value["byte_length"]
+    status = value["status"]
+    if (
+        type(byte_length) is not int
+        or not 0 <= byte_length <= _INT64_MAX
+        or type(value["limit_bytes"]) is not int
+        or value["limit_bytes"] != 262_144
+        or type(value["sha256"]) is not str
+        or _SHA256.fullmatch(value["sha256"]) is None
+        or type(status) is not str
+        or status not in {"within_limit", "too_large"}
+        or status == "within_limit"
+        and byte_length > 262_144
+        or status == "too_large"
+        and byte_length <= 262_144
+    ):
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer Retrieval View measurement is invalid"
+        )
+    return dict(value)
+
+
 def _validate_attempt_evidence_v1(
     record: Mapping[str, object],
     events: bytes,
@@ -764,11 +799,7 @@ def _request_assets(
         measurement = None
     else:
         raw_measurement = audit.get("retrieval_view_measurement")
-        if type(raw_measurement) is not dict:
-            raise AnswerTerminalRequestInvalidV1(
-                "Answer Retrieval View measurement is invalid"
-            )
-        measurement = raw_measurement
+        measurement = _validate_retrieval_view_measurement_v1(raw_measurement)
     view = decoded.get("retrieval_view.json")
     candidate_count: int | None = None
     if request.retrieval_view_bytes is not None:

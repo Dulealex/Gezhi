@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -32,6 +33,7 @@ from support.reviewed_handoff_witness_v1 import (
 _CODEX_CHILD_DOUBLE = (
     Path(__file__).parent / "support" / "codex_child_executable_double_v1.py"
 )
+_CTRL_C_DRIVER = Path(__file__).parent / "support" / "knowledge_ctrl_c_driver_v1.py"
 _ACTIVE_CANDIDATE_ID = json.loads(ACCEPT_CANDIDATES_V1)["candidate"]["candidate_id"]
 _GOVERNANCE_DISCLOSURE_FOR_TEST = (
     "> 治理说明：本结果为候选知识支持（Candidate-backed）；可用内容仅来自已审核但尚未晋升的 "
@@ -656,6 +658,131 @@ def _run_active_child_cancellation_double(
         assert resolved_runtime.parent == attempt_container.resolve(strict=True)
         assert resolved_runtime.name.startswith("t22-cancel-")
         shutil.rmtree(resolved_runtime)
+
+
+def _install_native_active_child_ctrl_c_double(site_root: Path) -> None:
+    site_root.mkdir()
+    (site_root / "sitecustomize.py").write_text(
+        """
+import os
+import sys
+from pathlib import Path
+
+import gezhi._knowledge_answerer as answerer
+from gezhi._codex_child_process import _run_codex_child_test_double_v1
+from gezhi._codex_role_plan import _freeze_test_double_launch_v1
+
+
+def run_double(request):
+    capture_parent = request.attempt_root / "captures"
+    capture = capture_parent / f"{request.attempt_ordinal:02d}"
+    staging = capture_parent / f".{request.attempt_ordinal:02d}.codex-stage"
+    final_spool = staging / ".final_message.spool"
+    plan = _freeze_test_double_launch_v1(
+        executable=Path(sys.executable),
+        arguments=(
+            "-I", "-B", os.environ["T22_CANCEL_DOUBLE"], "mark-and-hang",
+            "--final", str(final_spool), "--payload-file",
+            os.environ["T22_CANCEL_MARKER"],
+        ),
+        prompt=request.prompt,
+        attempt_ordinal=request.attempt_ordinal,
+        working_directory=request.attempt_root / "working",
+        capture_directory=capture,
+        staging_directory=staging,
+        temporary_directory=request.attempt_root / "temporary",
+        source_environment={"SystemRoot": os.environ["SystemRoot"]},
+        timeout_seconds=20,
+        capture_profile="knowledge",
+        existing_shared_deadline_monotonic_ns=(
+            request.existing_shared_deadline_monotonic_ns
+        ),
+    )
+    return _run_codex_child_test_double_v1(plan, request.cancellation)
+
+
+answerer._run_role_attempt_v1 = run_double
+answerer._prepare_role_invocation_v1 = lambda: object()
+""",
+        encoding="utf-8",
+    )
+
+
+def _run_active_child_native_ctrl_c(
+    knowledge_root: Path,
+    tmp_path: Path,
+) -> tuple[
+    tuple[subprocess.CompletedProcess[bytes], int],
+    tuple[subprocess.CompletedProcess[bytes], int],
+]:
+    site_root = tmp_path / "native-site"
+    _install_native_active_child_ctrl_c_double(site_root)
+    marker = tmp_path / "native-child.pid"
+    attempt_container = Path(r"E:\gztest")
+    attempt_container.mkdir(parents=True, exist_ok=True)
+    runtime_root = attempt_container / ("t22-native-cancel-" + uuid.uuid4().hex[:12])
+    runtime_root.mkdir()
+    arguments = (
+        "--knowledge-data-root",
+        str(knowledge_root),
+        "knowledge",
+        "ask",
+        "示例结论",
+        "--json",
+    )
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 0
+    observed: list[tuple[subprocess.CompletedProcess[bytes], int]] = []
+    try:
+        for command in launcher_commands(arguments):
+            marker.unlink(missing_ok=True)
+            driver = subprocess.run(
+                [
+                    str(PYTHON_EXE),
+                    "-I",
+                    "-B",
+                    str(_CTRL_C_DRIVER),
+                    str(marker),
+                    *command,
+                ],
+                cwd=REPOSITORY_ROOT,
+                env=subprocess_environment(
+                    pythonpath_roots=(site_root, SOURCE_ROOT),
+                    updates={
+                        "TEMP": str(runtime_root),
+                        "TMP": str(runtime_root),
+                        "T22_CANCEL_DOUBLE": str(_CODEX_CHILD_DOUBLE),
+                        "T22_CANCEL_MARKER": str(marker),
+                    },
+                ),
+                capture_output=True,
+                check=False,
+                timeout=45,
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+                startupinfo=startupinfo,
+            )
+            assert driver.returncode == 0, (driver.stdout + driver.stderr).decode(
+                errors="replace"
+            )
+            receipt = json.loads(driver.stdout)
+            observed.append(
+                (
+                    subprocess.CompletedProcess(
+                        command,
+                        receipt["returncode"],
+                        base64.b64decode(receipt["stdout_base64"]),
+                        base64.b64decode(receipt["stderr_base64"]),
+                    ),
+                    receipt["child_pid"],
+                )
+            )
+        return observed[0], observed[1]
+    finally:
+        resolved_runtime = runtime_root.resolve(strict=True)
+        assert resolved_runtime.parent == attempt_container.resolve(strict=True)
+        assert resolved_runtime.name.startswith("t22-native-cancel-")
+        shutil.rmtree(runtime_root)
 
 
 def _process_is_active_v1(process_id: int) -> bool:
@@ -1744,9 +1871,11 @@ def test_ask_retries_two_timeouts_with_fresh_attempts_then_succeeds(
             "timeout",
             None,
         ]
-        assert [
-            path.name for path in sorted((committed / "attempts").iterdir())
-        ] == ["01", "02", "03"]
+        assert [path.name for path in sorted((committed / "attempts").iterdir())] == [
+            "01",
+            "02",
+            "03",
+        ]
         assert manifest["attempts"][2]["input_tokens"] == 10
         assert manifest["attempts"][2]["cached_input_tokens"] == 0
         assert manifest["attempts"][2]["output_tokens"] == 20
@@ -2031,7 +2160,38 @@ def test_ask_ctrl_c_stops_the_active_codex_job_and_keeps_partial_capture(
         assert (
             committed / "attempts" / "01" / "events.jsonl"
         ).read_bytes() == b'{"type":"double.started"}\n'
+        assert (committed / "attempts" / "01" / "final_message.txt").read_bytes() == b""
+        assert not _process_is_active_v1(process_id)
+
+
+def test_real_ctrl_c_stops_the_active_codex_job_through_both_launchers(
+    active_knowledge_ask_root: Path,
+    tmp_path: Path,
+) -> None:
+    results = _run_active_child_native_ctrl_c(
+        active_knowledge_ask_root,
+        tmp_path,
+    )
+
+    for result, process_id in results:
+        assert result.returncode == 130, (result.stdout + result.stderr).decode(
+            errors="replace"
+        )
+        assert result.stderr == b""
+        envelope = json.loads(result.stdout)
+        assert envelope["outcome"] == "interrupted"
+        assert envelope["diagnostics"] == [
+            {"code": "knowledge.ask.user_interrupted.v1", "context": {}}
+        ]
+        answer_id = envelope["result"]["answer_id"]
+        committed = active_knowledge_ask_root / "answers" / answer_id
+        manifest = json.loads((committed / "manifest.json").read_bytes())
+        assert manifest["status"] == "interrupted"
+        assert manifest["error"] is None
+        assert len(manifest["attempts"]) == 1
+        assert manifest["attempts"][0]["failure_class"] == "interrupted"
         assert (
-            committed / "attempts" / "01" / "final_message.txt"
-        ).read_bytes() == b""
+            committed / "attempts" / "01" / "events.jsonl"
+        ).read_bytes() == b'{"type":"double.started"}\n'
+        assert (committed / "attempts" / "01" / "final_message.txt").read_bytes() == b""
         assert not _process_is_active_v1(process_id)

@@ -327,6 +327,149 @@ def test_terminal_writer_accepts_materialization_failure_after_audit() -> None:
     terminal._validate_request(request)
 
 
+@pytest.mark.parametrize(
+    "measurement",
+    (
+        {
+            "byte_length": 109,
+            "limit_bytes": 262_144,
+            "status": "within_limit",
+        },
+        {
+            "byte_length": 109,
+            "extra": None,
+            "limit_bytes": 262_144,
+            "sha256": "0" * 64,
+            "status": "within_limit",
+        },
+        {
+            "byte_length": True,
+            "limit_bytes": 262_144,
+            "sha256": "0" * 64,
+            "status": "within_limit",
+        },
+        {
+            "byte_length": -1,
+            "limit_bytes": 262_144,
+            "sha256": "0" * 64,
+            "status": "within_limit",
+        },
+        {
+            "byte_length": 9_223_372_036_854_775_808,
+            "limit_bytes": 262_144,
+            "sha256": "0" * 64,
+            "status": "too_large",
+        },
+        {
+            "byte_length": 109,
+            "limit_bytes": True,
+            "sha256": "0" * 64,
+            "status": "within_limit",
+        },
+        {
+            "byte_length": 109,
+            "limit_bytes": 262_144,
+            "sha256": "A" * 64,
+            "status": "within_limit",
+        },
+        {
+            "byte_length": 109,
+            "limit_bytes": 262_144,
+            "sha256": "0" * 64,
+            "status": "unknown",
+        },
+        {
+            "byte_length": 109,
+            "limit_bytes": 262_144,
+            "sha256": "0" * 64,
+            "status": [],
+        },
+        {
+            "byte_length": 262_145,
+            "limit_bytes": 262_144,
+            "sha256": "0" * 64,
+            "status": "within_limit",
+        },
+        {
+            "byte_length": 262_144,
+            "limit_bytes": 262_144,
+            "sha256": "0" * 64,
+            "status": "too_large",
+        },
+    ),
+    ids=(
+        "missing-field",
+        "extra-field",
+        "boolean-length",
+        "negative-length",
+        "length-over-int64",
+        "boolean-limit",
+        "non-lowercase-hash",
+        "unknown-status",
+        "non-scalar-status",
+        "within-limit-over-cap",
+        "too-large-at-cap",
+    ),
+)
+def test_terminal_writer_rejects_invalid_interrupted_p3_measurement(
+    measurement: dict[str, object],
+) -> None:
+    request = _request_at_root_prefix(
+        _request_with_terminal_matrix(
+            status="interrupted",
+            error=None,
+            failure_classes=(),
+        ),
+        3,
+    )
+    request = replace(
+        request,
+        retrieval_audit_bytes=_canonical_json_file(
+            {
+                "retrieval_view_measurement": measurement,
+                "schema_version": "gezhi.retrieval_audit.v1",
+            }
+        ),
+    )
+
+    with pytest.raises(
+        terminal.AnswerTerminalRequestInvalidV1,
+        match="Retrieval View measurement",
+    ):
+        terminal._validate_request(request)
+
+
+def test_terminal_writer_rejects_float_measurement_as_noncanonical_json() -> None:
+    request = _request_at_root_prefix(
+        _request_with_terminal_matrix(
+            status="interrupted",
+            error=None,
+            failure_classes=(),
+        ),
+        3,
+    )
+    request = replace(
+        request,
+        retrieval_audit_bytes=_canonical_json_file(
+            {
+                "retrieval_view_measurement": {
+                    "byte_length": 109,
+                    "limit_bytes": 262_144.0,
+                    "sha256": "0" * 64,
+                    "status": "within_limit",
+                },
+                "schema_version": "gezhi.retrieval_audit.v1",
+            }
+        ),
+    )
+
+    with pytest.raises(
+        terminal.AnswerTerminalRequestInvalidV1,
+        match="Answer JSON asset is invalid",
+    ):
+        terminal._validate_request(request)
+
+
 def test_terminal_writer_rejects_materialization_failure_for_over_limit_view() -> None:
     request = _request_at_root_prefix(
         _request_with_terminal_matrix(
