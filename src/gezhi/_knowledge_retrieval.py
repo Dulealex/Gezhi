@@ -1069,6 +1069,12 @@ def validate_terminal_retrieval_assets_v1(
         branch_results["unicode61"],
         label="unicode61",
     )
+    if (not search_text.trigram_atoms and trigram_hits) or (
+        not search_text.unicode61_atoms and unicode_hits
+    ):
+        raise RetrievalMaterializationFailedV1(
+            "Retrieval branch has no matching query atoms"
+        )
     identities = dict(trigram_identities)
     for candidate_id, identity in unicode_identities.items():
         observed = identities.setdefault(candidate_id, identity)

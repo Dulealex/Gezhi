@@ -32,6 +32,10 @@ class CliJsonOutputTooLargeV1(ValueError):
     pass
 
 
+class CliJsonSerializationFailedV1(ValueError):
+    pass
+
+
 def _canonical_json_bytes(value: object) -> bytes:
     return json.dumps(
         value,
@@ -40,6 +44,15 @@ def _canonical_json_bytes(value: object) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def _serialize_canonical_json_bytes_v1(value: object) -> bytes:
+    try:
+        return _canonical_json_bytes(value)
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
+        raise CliJsonSerializationFailedV1(
+            "CLI canonical JSON serialization failed"
+        ) from error
 
 
 def cli_json_buffer_v1(
@@ -68,7 +81,7 @@ def cli_json_buffer_v1(
             or type(diagnostic["context"]) is not dict
         ):
             raise TypeError("CLI diagnostic item is invalid")
-    if len(_canonical_json_bytes(diagnostics)) > _DIAGNOSTICS_OUTPUT_CAP:
+    if len(_serialize_canonical_json_bytes_v1(diagnostics)) > _DIAGNOSTICS_OUTPUT_CAP:
         raise ValueError("CLI diagnostics exceed their byte limit")
 
     envelope = {
@@ -78,7 +91,7 @@ def cli_json_buffer_v1(
         "result": result,
         "diagnostics": diagnostics,
     }
-    payload = _canonical_json_bytes(envelope) + b"\n"
+    payload = _serialize_canonical_json_bytes_v1(envelope) + b"\n"
     if len(payload) > output_cap:
         raise CliJsonOutputTooLargeV1("CLI output exceeds its byte limit")
     return payload

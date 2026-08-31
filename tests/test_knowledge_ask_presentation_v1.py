@@ -31,11 +31,19 @@ def _failed_overflow_report_v1() -> KnowledgeAskReportV1:
     )
 
 
-def test_human_supplemental_precedes_the_next_step() -> None:
-    payload = commands._knowledge_ask_human_buffer_v1(
-        _failed_overflow_report_v1(),
-        answer_markdown_bytes=None,
+def _prepare_human_buffer_v1(report: KnowledgeAskReportV1) -> bytes:
+    prepared = commands._prepare_knowledge_ask_presentation_v1(
+        report,
+        json_output=False,
+        answer_markdown_bytes=report.answer_markdown_bytes,
     )
+    assert prepared.disposition == "ready_bytes"
+    assert type(prepared.buffer) is bytes
+    return prepared.buffer
+
+
+def test_human_supplemental_precedes_the_next_step() -> None:
+    payload = _prepare_human_buffer_v1(_failed_overflow_report_v1())
 
     assert payload.decode("utf-8").splitlines() == [
         "Knowledge ask：失败",
@@ -82,10 +90,7 @@ def test_orphan_recovery_facts_project_to_closed_supplementals() -> None:
             "context": {"count": 5},
         },
     ]
-    human = commands._knowledge_ask_human_buffer_v1(
-        report,
-        answer_markdown_bytes=None,
-    ).decode("utf-8")
+    human = _prepare_human_buffer_v1(report).decode("utf-8")
     assert "提示：发现 2 个无法安全恢复的历史 Answer staging，已原地逻辑隔离\n" in human
     assert "提示：已恢复并提交 3 个完整历史 Answer\n" in human
     assert (
@@ -94,19 +99,25 @@ def test_orphan_recovery_facts_project_to_closed_supplementals() -> None:
     assert "提示：有 5 个历史 Answer 因同身份 target 已存在而未恢复\n" in human
 
 
-def test_diagnostics_are_sorted_by_code_ascii_bytes_after_aggregation() -> None:
+def test_diagnostics_preserve_primary_then_sort_supplementals_by_code_ascii_bytes() -> (
+    None
+):
     report = KnowledgeAskReportV1(
         outcome="interrupted",
         result=None,
         reason="user_interrupted_before_answer",
+        capture_overflow_channels=("final_message",),
+        orphan_quarantined_count=2,
         orphan_recovered_count=1,
     )
 
     diagnostics = commands._knowledge_ask_diagnostics_v1(report)
 
     assert [item["code"] for item in diagnostics] == [
-        "knowledge.ask.orphan_recovered.v1",
         "knowledge.ask.user_interrupted_before_answer.v1",
+        "knowledge.ask.capture_overflow.v1",
+        "knowledge.ask.orphan_quarantined.v1",
+        "knowledge.ask.orphan_recovered.v1",
     ]
 
 
@@ -480,6 +491,30 @@ def test_json_canonical_serialization_failure_forms_a_no_output_candidate(
     assert candidate.envelope is not None
     assert candidate.buffer is None
     assert candidate.byte_length is None
+
+
+def test_json_validation_failure_escapes_without_a_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = KnowledgeAskReportV1(
+        outcome="blocked",
+        result=None,
+        reason="invalid_question",
+    )
+    monkeypatch.setattr(
+        commands,
+        "cli_json_buffer_v1",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            ValueError("outside canonical serialization seam")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="outside canonical serialization seam"):
+        commands._prepare_knowledge_ask_presentation_v1(
+            report,
+            json_output=True,
+            answer_markdown_bytes=None,
+        )
 
 
 def test_json_unknown_serialization_fault_escapes_without_a_candidate(

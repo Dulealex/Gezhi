@@ -213,7 +213,7 @@ def test_render_completion_locks_before_a_later_cancellation_observation(
         cancellation.observation = answerer.time.monotonic_ns() + 1_000_000_000
         return b"# answer\n"
 
-    monkeypatch.setattr(answerer, "_render_answer_markdown_v1", complete_render)
+    monkeypatch.setattr(answerer, "render_answer_markdown_v1", complete_render)
     verdict = _run_synthetic_clean_attempt_v1(
         monkeypatch,
         tmp_path,

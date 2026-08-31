@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import ntpath
 import os
 import re
 import time
@@ -521,6 +522,21 @@ def _inspect_answer_orphan_v1(
     )
 
 
+def _classify_existing_answer_target_v1(
+    root: ValidatedDataRootV1,
+    answer_id: str,
+) -> Literal["committed", "quarantined"]:
+    try:
+        _validate_terminal_candidate_v1(
+            root,
+            ("answers", answer_id),
+            answer_id,
+        )
+    except _TerminalCandidateRejectedV1:
+        return "quarantined"
+    return "committed"
+
+
 def _complete_answer_orphan_v1(
     root: ValidatedDataRootV1,
     ownership: WriterOwnershipV1,
@@ -543,8 +559,12 @@ def _complete_answer_orphan_v1(
             ):
                 raise AnswerRootIntegrityLostV1("Answer orphan identity changed")
         with root.open_relative_data_root_v1(("answers",)) as answers:
-            if _case_insensitive_entry_present(answers, answer_id):
-                return "target_conflict"
+            target_present = _case_insensitive_entry_present(answers, answer_id)
+        if target_present:
+            target_state = _classify_existing_answer_target_v1(root, answer_id)
+            if target_state not in {"committed", "quarantined"}:
+                raise RuntimeError("Answer target classification is invalid")
+            return "target_conflict"
     except AnswerRootIntegrityLostV1:
         raise
     except (DataRootOpenErrorV1, OSError, ValueError) as error:
@@ -563,6 +583,9 @@ def _complete_answer_orphan_v1(
         _root_checkpoint(root)
         staging_present, target_present = _namespace_state(root, answer_id)
         if staging_present and target_present and isinstance(error, FileExistsError):
+            target_state = _classify_existing_answer_target_v1(root, answer_id)
+            if target_state not in {"committed", "quarantined"}:
+                raise RuntimeError("Answer target classification is invalid")
             return "target_conflict"
         if staging_present and not target_present:
             return "recovery_failed"
@@ -643,7 +666,15 @@ def _decode_canonical_json_asset(payload: bytes) -> dict[str, object]:
         )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise AnswerTerminalRequestInvalidV1("Answer JSON asset is invalid") from error
-    if type(decoded) is not dict or _canonical_json_file(decoded) != payload:
+    if type(decoded) is not dict:
+        raise AnswerTerminalRequestInvalidV1("Answer JSON asset is not canonical")
+    try:
+        canonical = _canonical_json_file(decoded)
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer JSON asset is not canonical"
+        ) from error
+    if canonical != payload:
         raise AnswerTerminalRequestInvalidV1("Answer JSON asset is not canonical")
     return cast(dict[str, object], decoded)
 
@@ -831,7 +862,17 @@ def _decode_terminal_manifest_v1(payload: bytes) -> dict[str, object]:
         raise AnswerTerminalRequestInvalidV1(
             "Answer terminal manifest parser rejected the input"
         ) from error
-    if type(decoded) is not dict or _canonical_json_file(decoded) != payload:
+    if type(decoded) is not dict:
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer terminal manifest is not canonical"
+        )
+    try:
+        canonical = _canonical_json_file(decoded)
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer terminal manifest is not canonical"
+        ) from error
+    if canonical != payload:
         raise AnswerTerminalRequestInvalidV1(
             "Answer terminal manifest is not canonical"
         )
@@ -1579,6 +1620,14 @@ def _expected_usage_totals_v1(
     return totals
 
 
+def _candidate_has_exact_answer_basename_v1(
+    candidate: ValidatedDataRootV1,
+    answer_id: str,
+) -> bool:
+    canonical_path = candidate.inspection.canonical_path
+    return canonical_path is not None and ntpath.basename(canonical_path) == answer_id
+
+
 def _validate_manifest_terminal_facts_v1(
     manifest: dict[str, object],
     assets: tuple[_VerifiedAssetV1, ...],
@@ -1767,6 +1816,10 @@ def _validate_terminal_candidate_v1(
             "Answer terminal candidate is unavailable"
         ) from error
     with candidate:
+        if not _candidate_has_exact_answer_basename_v1(candidate, answer_id):
+            raise _TerminalCandidateRejectedV1(
+                "Answer terminal basename differs from its identity"
+            )
         candidate_identity = candidate.inspection.identity
         if candidate_identity is None:
             raise _TerminalCandidateRejectedV1(
@@ -1925,7 +1978,13 @@ def _validate_terminal_candidate_v1(
     _root_checkpoint(root)
     try:
         with root.open_relative_data_root_v1(parts) as observed_candidate:
-            if observed_candidate.inspection.identity != candidate_identity:
+            if (
+                observed_candidate.inspection.identity != candidate_identity
+                or not _candidate_has_exact_answer_basename_v1(
+                    observed_candidate,
+                    answer_id,
+                )
+            ):
                 raise _TerminalCandidateRejectedV1("Answer terminal identity changed")
     except _TerminalCandidateRejectedV1:
         raise
@@ -2079,19 +2138,7 @@ def _manifest_bytes(
         (asset.manifest_item() for asset in assets),
         key=lambda item: cast(str, item["path"]).encode("utf-8"),
     )
-    usage_totals: dict[str, int | None] = {}
-    for name in (
-        "cached_input_tokens",
-        "input_tokens",
-        "output_tokens",
-        "reasoning_output_tokens",
-    ):
-        values = [attempt[name] for attempt in attempts]
-        if any(type(value) is not int for value in values):
-            usage_totals[name] = None
-            continue
-        total = sum(cast(int, value) for value in values)
-        usage_totals[name] = total if total <= _INT64_MAX else None
+    usage_totals = _expected_usage_totals_v1(attempts)
     manifest = {
         "schema_version": "gezhi.answer_manifest.v1",
         "answer_id": request.answer_id,

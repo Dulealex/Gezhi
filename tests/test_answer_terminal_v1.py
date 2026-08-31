@@ -12,6 +12,7 @@ from support.knowledge_handoff_factory_v1 import accepted_handoff_v1
 
 from gezhi import _answer_terminal as terminal
 from gezhi import _knowledge_answerer as answerer
+from gezhi import _knowledge_retrieval as retrieval
 from gezhi import _windows_data_root as windows_root
 from gezhi._knowledge_registry import normalize_search_query_v1
 from gezhi._windows_data_root import open_validated_data_root_v1
@@ -200,7 +201,7 @@ def _succeeded_request_with_timeout_attempt() -> terminal.AnswerPublishRequestV1
             ),
         ),
         answer_output_bytes=_canonical_json_file(answer_output),
-        answer_markdown_bytes=answerer._render_answer_markdown_v1(
+        answer_markdown_bytes=answerer.render_answer_markdown_v1(
             "示例结论",
             answer_output,
             candidates,
@@ -375,6 +376,41 @@ def test_committed_reader_revalidates_a_published_answer(tmp_path) -> None:
     assert observed.answer_markdown_bytes == request.answer_markdown_bytes
 
 
+def _rename_answer_target_to_case_alias_v1(target: Path, answer_id: str) -> Path:
+    intermediate = target.with_name(answer_id + ".case-hop")
+    alias = target.with_name(answer_id.upper())
+    target.rename(intermediate)
+    intermediate.rename(alias)
+    return alias
+
+
+def test_committed_reader_rejects_a_case_alias_target_basename(
+    tmp_path: Path,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner:
+            terminal.publish_answer_v1(root, owner, request)
+        target = knowledge_root / "answers" / request.answer_id
+        alias = _rename_answer_target_to_case_alias_v1(target, request.answer_id)
+
+        observed = terminal.read_committed_answer_v1(root, request.answer_id)
+
+    assert type(observed) is terminal.TerminalAnswerBytesRejectedV1
+    assert alias.is_dir()
+
+
 def _rewrite_terminal_assets(
     target: Path,
     replacements: dict[str, bytes],
@@ -458,6 +494,51 @@ def test_committed_reader_rejects_semantically_invalid_rehashed_assets(
         observed = terminal.read_committed_answer_v1(root, request.answer_id)
 
     assert type(observed) is terminal.TerminalAnswerBytesRejectedV1
+
+
+def test_terminal_retrieval_rejects_hits_for_an_empty_query_atom_branch() -> None:
+    (
+        _question_bytes,
+        _retrieval_query_bytes,
+        retrieval_audit_bytes,
+        retrieval_view_bytes,
+        _answer_output,
+        _candidates,
+    ) = _candidate_retrieval_documents()
+    question_bytes = _canonical_json_file(
+        {"question": "示例", "schema_version": "gezhi.question.v1"}
+    )
+    search_text = normalize_search_query_v1("示例")
+    assert search_text.trigram_atoms == ()
+    retrieval_query_bytes = _canonical_json_file(
+        {
+            "normalized_text": search_text.normalized_text,
+            "schema_version": "gezhi.retrieval_query.v1",
+            "trigram_atoms": [],
+            "unicode61_atoms": list(search_text.unicode61_atoms),
+        }
+    )
+    audit = json.loads(retrieval_audit_bytes)
+    forged_hit = audit["branch_results"]["unicode61"][0]
+    audit["branch_results"] = {"trigram": [forged_hit], "unicode61": []}
+    audit["final_selection"][0]["trigram_rank"] = 1
+    audit["final_selection"][0]["unicode61_rank"] = None
+    audit["query_atoms"] = {
+        "trigram": [],
+        "unicode61": list(search_text.unicode61_atoms),
+    }
+    audit["question_asset_sha256"] = hashlib.sha256(question_bytes).hexdigest()
+    audit["retrieval_query_asset_sha256"] = hashlib.sha256(
+        retrieval_query_bytes
+    ).hexdigest()
+
+    with pytest.raises(retrieval.RetrievalMaterializationFailedV1):
+        retrieval.validate_terminal_retrieval_assets_v1(
+            question_bytes=question_bytes,
+            retrieval_query_bytes=retrieval_query_bytes,
+            retrieval_audit_bytes=_canonical_json_file(audit),
+            retrieval_view_bytes=retrieval_view_bytes,
+        )
 
 
 def test_manifest_cross_field_rejection_precedes_any_asset_read(
@@ -639,6 +720,64 @@ def test_staging_scan_recovers_one_fully_valid_orphan(tmp_path: Path) -> None:
     assert scan.target_conflict_count == 0
     assert target.is_dir()
     assert not orphan.exists()
+
+
+@pytest.mark.parametrize("corruption", ("manifest", "question"))
+def test_staging_scan_quarantines_a_non_scalar_asset_and_continues(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    invalid_request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+    valid_request = replace(
+        invalid_request,
+        answer_id="ans_11111111-1111-4111-8111-111111111111",
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        for request in (invalid_request, valid_request):
+            owner = try_acquire_knowledge_answer_writer_v1(identity)
+            assert owner is not None
+            with owner:
+                terminal.publish_answer_v1(root, owner, request)
+            target = knowledge_root / "answers" / request.answer_id
+            orphan = knowledge_root / "answers" / ".staging" / request.answer_id
+            target.rename(orphan)
+
+        invalid_orphan = (
+            knowledge_root / "answers" / ".staging" / invalid_request.answer_id
+        )
+        if corruption == "manifest":
+            invalid_orphan.joinpath("manifest.json").write_bytes(
+                b'{"schema_version":"\\ud800"}\n'
+            )
+        else:
+            _rewrite_terminal_assets(
+                invalid_orphan,
+                {
+                    "question.json": (
+                        b'{"question":"\\ud800","schema_version":"gezhi.question.v1"}\n'
+                    )
+                },
+            )
+        recovery_owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert recovery_owner is not None
+        with recovery_owner:
+            scan = terminal.scan_answer_staging_v1(root, recovery_owner)
+
+    assert scan.status == "complete"
+    assert scan.entry_count == 2
+    assert scan.quarantined_count == 1
+    assert scan.recovered_count == 1
+    assert invalid_orphan.is_dir()
+    assert (knowledge_root / "answers" / valid_request.answer_id).is_dir()
 
 
 def test_staging_scan_quarantines_one_reparse_candidate_and_continues(
@@ -1143,7 +1282,14 @@ def test_staging_scan_quarantines_an_invalid_candidate_in_place(
     assert invalid.is_dir()
 
 
-def test_staging_scan_does_not_overwrite_an_existing_target(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "valid_target", (True, False), ids=("committed", "quarantined")
+)
+def test_staging_scan_validates_both_existing_target_matrix_rows_without_overwrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    valid_target: bool,
+) -> None:
     knowledge_root = tmp_path / "knowledge"
     knowledge_root.mkdir()
     request = _request_with_terminal_matrix(
@@ -1162,6 +1308,26 @@ def test_staging_scan_does_not_overwrite_an_existing_target(tmp_path: Path) -> N
         target = knowledge_root / "answers" / request.answer_id
         orphan = knowledge_root / "answers" / ".staging" / request.answer_id
         shutil.copytree(target, orphan)
+        if not valid_target:
+            target.joinpath("manifest.json").write_bytes(
+                b'{"schema_version":"\\ud800"}\n'
+            )
+        validated_parts: list[tuple[str, ...]] = []
+        real_validate = terminal._validate_terminal_candidate_v1
+
+        def record_validation(
+            observed_root: windows_root.ValidatedDataRootV1,
+            parts: tuple[str, ...],
+            answer_id: str,
+        ) -> terminal.TerminalAnswerBytesReadyV1:
+            validated_parts.append(parts)
+            return real_validate(observed_root, parts, answer_id)
+
+        monkeypatch.setattr(
+            terminal,
+            "_validate_terminal_candidate_v1",
+            record_validation,
+        )
 
         recovery_owner = try_acquire_knowledge_answer_writer_v1(identity)
         assert recovery_owner is not None
@@ -1171,6 +1337,48 @@ def test_staging_scan_does_not_overwrite_an_existing_target(tmp_path: Path) -> N
     assert scan.target_conflict_count == 1
     assert scan.recovered_count == 0
     assert target.is_dir()
+    assert orphan.is_dir()
+    assert ("answers", ".staging", request.answer_id) in validated_parts
+    assert ("answers", request.answer_id) in validated_parts
+
+
+def test_staging_scan_treats_a_case_alias_target_as_a_quarantined_conflict(
+    tmp_path: Path,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        first_owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert first_owner is not None
+        with first_owner:
+            terminal.publish_answer_v1(root, first_owner, request)
+        target = knowledge_root / "answers" / request.answer_id
+        orphan = knowledge_root / "answers" / ".staging" / request.answer_id
+        shutil.copytree(target, orphan)
+        alias = _rename_answer_target_to_case_alias_v1(target, request.answer_id)
+
+        recovery_owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert recovery_owner is not None
+        with recovery_owner:
+            scan = terminal.scan_answer_staging_v1(root, recovery_owner)
+        observed = terminal.read_committed_answer_v1(root, request.answer_id)
+
+    assert scan.status == "complete"
+    assert scan.entry_count == 1
+    assert scan.quarantined_count == 0
+    assert scan.recovered_count == 0
+    assert scan.recovery_failed_count == 0
+    assert scan.target_conflict_count == 1
+    assert type(observed) is terminal.TerminalAnswerBytesRejectedV1
+    assert alias.is_dir()
     assert orphan.is_dir()
 
 

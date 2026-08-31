@@ -865,7 +865,7 @@ def _arxiv_link_v1(arxiv_id: str) -> str:
         ) from error
 
 
-def _render_answer_markdown_v1(
+def render_answer_markdown_v1(
     question: str,
     output: dict[str, object],
     candidates: dict[str, dict[str, object]],
@@ -1004,7 +1004,7 @@ def validate_terminal_answer_content_v1(
             "Answer output cites outside the Retrieval View"
         )
     try:
-        rendered = _render_answer_markdown_v1(question, normalized, candidates)
+        rendered = render_answer_markdown_v1(question, normalized, candidates)
     except (CitationLinkConstructionFailedV1, KeyError, ValueError) as error:
         raise KnowledgeAnswererInputInvalidV1(
             "Answer Markdown could not be deterministically rendered"
@@ -1438,7 +1438,7 @@ def answer_nonzero_v1(
             attempts=tuple(attempts),
         )
     try:
-        answer_markdown_bytes = _render_answer_markdown_v1(
+        answer_markdown_bytes = render_answer_markdown_v1(
             question,
             answer_output,
             candidates,

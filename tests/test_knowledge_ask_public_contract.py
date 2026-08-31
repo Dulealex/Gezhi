@@ -280,6 +280,55 @@ def test_json_broken_pipe_does_not_roll_back_the_committed_answer(
     assert committed.status == "succeeded"
 
 
+def _install_json_short_write_double(site_root: Path) -> None:
+    site_root.mkdir()
+    (site_root / "sitecustomize.py").write_text(
+        "import os\n"
+        "_gezhi_real_write = os.write\n"
+        "def _gezhi_short_write(fd, value):\n"
+        "    if fd == 1 and len(value) > 1:\n"
+        "        with open(os.environ['T23_SHORT_WRITE_MARKER'], 'ab', buffering=0) as marker:\n"
+        "            marker.write(b'x')\n"
+        "        return _gezhi_real_write(fd, memoryview(value)[:min(7, len(value))])\n"
+        "    return _gezhi_real_write(fd, value)\n"
+        "os.write = _gezhi_short_write\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("launcher_index", (0, 1), ids=("native", "module"))
+def test_json_short_writes_complete_exact_receipt_through_both_launchers(
+    empty_registry_knowledge_ask_root: Path,
+    tmp_path: Path,
+    launcher_index: int,
+) -> None:
+    site_root = tmp_path / "short-write-site"
+    _install_json_short_write_double(site_root)
+    marker = tmp_path / "short-write.marker"
+    arguments = (
+        "--knowledge-data-root",
+        str(empty_registry_knowledge_ask_root),
+        "knowledge",
+        "ask",
+        "Which evidence supports this conclusion?",
+        "--json",
+    )
+
+    result = run_launcher(
+        launcher_commands(arguments)[launcher_index],
+        pythonpath_roots=(site_root, SOURCE_ROOT),
+        environment_updates={"T23_SHORT_WRITE_MARKER": str(marker)},
+    )
+
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    assert result.stderr == b""
+    envelope = json.loads(result.stdout)
+    assert result.stdout == _canonical_json_line(envelope)
+    assert envelope["outcome"] == "succeeded"
+    assert _ANSWER_ID.fullmatch(envelope["result"]["answer_id"]) is not None
+    assert marker.read_bytes().count(b"x") >= 2
+
+
 def _install_codex_launch_guard(site_root: Path) -> Path:
     marker = site_root / "codex-launched.marker"
     site_root.mkdir()
@@ -562,11 +611,11 @@ class ScriptedCancellationV1:
         self.phase = "released"
 
 
-original_zero_candidate_markdown = knowledge_ask._zero_candidate_answer_markdown_v1
+original_zero_candidate_markdown = knowledge_ask.render_answer_markdown_v1
 
 
-def render_zero_candidate_and_cancel(question):
-    payload = original_zero_candidate_markdown(question)
+def render_zero_candidate_and_cancel(question, output, candidates):
+    payload = original_zero_candidate_markdown(question, output, candidates)
     active = ScriptedCancellationV1.active
     if active is not None and active.mode == "zero-render":
         active.observed = time.monotonic_ns()
@@ -574,7 +623,7 @@ def render_zero_candidate_and_cancel(question):
     return payload
 
 
-knowledge_ask._zero_candidate_answer_markdown_v1 = render_zero_candidate_and_cancel
+knowledge_ask.render_answer_markdown_v1 = render_zero_candidate_and_cancel
 commands.activate_knowledge_ask_cancellation_v1 = ScriptedCancellationV1
 """,
         encoding="utf-8",
@@ -2051,11 +2100,11 @@ def test_ask_commits_the_exact_final_overflow_prefix_without_retry(
         )
         envelope = json.loads(result.stdout)
         assert envelope["diagnostics"] == [
+            {"code": "knowledge.ask.codex_process_failed.v1", "context": {}},
             {
                 "code": "knowledge.ask.capture_overflow.v1",
                 "context": {"channels": ["final_message"]},
             },
-            {"code": "knowledge.ask.codex_process_failed.v1", "context": {}},
         ]
         answer_id = envelope["result"]["answer_id"]
         committed = active_knowledge_ask_root / "answers" / answer_id

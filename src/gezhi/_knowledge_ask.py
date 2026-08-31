@@ -28,6 +28,7 @@ from gezhi._answer_terminal import (
     scan_answer_staging_v1,
 )
 from gezhi._configuration import ConfigurationError, resolve_configuration_v1
+from gezhi._knowledge_answerer import render_answer_markdown_v1
 from gezhi._knowledge_cancellation import KnowledgeCancellationBridgeV1
 from gezhi._knowledge_registry import (
     SearchQueryInvalidV1,
@@ -74,14 +75,6 @@ _EFFECTIVE_CONFIG = {
     "retry_backoff_schedule_ms": [10_000, 30_000],
     "schema_version": "gezhi.knowledge_answerer_effective_config.v1",
 }
-_INSUFFICIENT_EVIDENCE = (
-    "本次检索未找到与该问题匹配、且当前可参与检索的已审核 Candidate Knowledge，"
-    "因此无法形成候选知识支持的回答。"
-)
-_GOVERNANCE_DISCLOSURE = (
-    "> 治理说明：本结果为候选知识支持（Candidate-backed）；可用内容仅来自已审核但尚未晋升的 "
-    "Candidate Knowledge，不代表已晋升知识、已验证事实或自动蕴含证明。"
-)
 
 
 class _ProvenanceUnavailableV1(RuntimeError):
@@ -165,37 +158,6 @@ def _question_assets_v1(
     )
 
 
-def _question_block_v1(value: str) -> str:
-    punctuation = frozenset(chr(codepoint) for codepoint in range(0x21, 0x30)) | (
-        frozenset(chr(codepoint) for codepoint in range(0x3A, 0x41))
-        | frozenset(chr(codepoint) for codepoint in range(0x5B, 0x61))
-        | frozenset(chr(codepoint) for codepoint in range(0x7B, 0x7F))
-    )
-    tokens: list[str] = []
-    at_line_start = True
-    for character in value:
-        if character == "\n":
-            tokens.append("\\\n")
-            at_line_start = True
-        elif character == " " and at_line_start:
-            tokens.append("&#32;")
-        elif character == "\t":
-            tokens.append("&#9;")
-        elif character == "\u2028":
-            tokens.append("&#8232;")
-            at_line_start = False
-        elif character == "\u2029":
-            tokens.append("&#8233;")
-            at_line_start = False
-        elif character in punctuation:
-            tokens.append("\\" + character)
-            at_line_start = False
-        else:
-            tokens.append(character)
-            at_line_start = False
-    return "".join(tokens)
-
-
 def _zero_candidate_answer_output_v1() -> dict[str, object]:
     return {
         "answer_status": "insufficient_evidence",
@@ -204,18 +166,6 @@ def _zero_candidate_answer_output_v1() -> dict[str, object]:
         "qualification_units": [],
         "schema_version": "gezhi.answer_output.v1",
     }
-
-
-def _zero_candidate_answer_markdown_v1(question: str) -> bytes:
-    return (
-        "# 回答\n\n"
-        + _GOVERNANCE_DISCLOSURE
-        + "\n\n## 问题\n\n"
-        + _question_block_v1(question)
-        + "\n\n## 证据不足\n\n"
-        + _INSUFFICIENT_EVIDENCE
-        + "\n"
-    ).encode("utf-8")
 
 
 def _utc_now_milliseconds_v1() -> str:
@@ -819,8 +769,10 @@ class KnowledgeAsksV1:
                         terminal_error = None
                         answer_output = _zero_candidate_answer_output_v1()
                         answer_output_bytes = _canonical_json_file_v1(answer_output)
-                        answer_markdown_bytes = _zero_candidate_answer_markdown_v1(
-                            normalized.question
+                        answer_markdown_bytes = render_answer_markdown_v1(
+                            normalized.question,
+                            answer_output,
+                            {},
                         )
                         rendering_completed_ns = time.monotonic_ns()
                         rendering_cancellation_ns = (

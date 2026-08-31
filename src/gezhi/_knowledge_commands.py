@@ -25,6 +25,7 @@ from gezhi._knowledge_read import (
 )
 from gezhi._presentation import (
     CliJsonOutputTooLargeV1,
+    CliJsonSerializationFailedV1,
     cli_json_buffer_v1,
     write_binary_buffer_v1,
     write_knowledge_ask_human_buffer_v1,
@@ -780,8 +781,9 @@ def _knowledge_ask_diagnostics_v1(
         for code, count in orphan_supplementals
         if count
     )
-    return sorted(
-        diagnostics,
+    primary_count = 0 if report.reason is None else 1
+    return diagnostics[:primary_count] + sorted(
+        diagnostics[primary_count:],
         key=lambda item: cast(str, item["code"]).encode("ascii"),
     )
 
@@ -1014,42 +1016,6 @@ def _check_knowledge_ask_human_cap_v1(
     return _HumanSemanticBytesWithinLimitV1(buffer=validated.buffer)
 
 
-def _knowledge_ask_human_buffer_v1(
-    report: KnowledgeAskReportV1,
-    *,
-    answer_markdown_bytes: bytes | None,
-) -> bytes:
-    validate_knowledge_ask_report_v1(report)
-    terminal_answer: _HumanTerminalAnswerReadyV1 | None = None
-    if answer_markdown_bytes is not None:
-        terminal_answer = _HumanTerminalAnswerReadyV1(
-            answer_markdown_bytes=answer_markdown_bytes,
-            answer_markdown_text=answer_markdown_bytes.decode("utf-8", errors="strict"),
-        )
-    rendered = _render_knowledge_ask_human_text_v1(
-        report,
-        terminal_answer=terminal_answer,
-    )
-    if type(rendered) is not _HumanSemanticTextReadyV1:
-        raise ValueError("Knowledge ask Human semantic text is invalid")
-    try:
-        payload = rendered.text.encode("utf-8", errors="strict")
-    except UnicodeEncodeError as error:
-        raise ValueError("Knowledge ask Human semantic text is invalid") from error
-    validated = _validate_knowledge_ask_human_bytes_v1(
-        report,
-        rendered,
-        payload,
-        terminal_answer=terminal_answer,
-    )
-    if type(validated) is not _HumanSemanticBytesValidV1:
-        raise ValueError("Knowledge ask Human semantic bytes are invalid")
-    checked = _check_knowledge_ask_human_cap_v1(validated)
-    if type(checked) is not _HumanSemanticBytesWithinLimitV1:
-        raise ValueError("Knowledge ask Human output exceeds its byte limit")
-    return checked.buffer
-
-
 @dataclass(frozen=True, slots=True)
 class _UnboundKnowledgeAskPresentationV1:
     report: KnowledgeAskReportV1
@@ -1141,7 +1107,7 @@ def _prepare_knowledge_ask_presentation_v1(
                 byte_length=None,
                 json_output=True,
             )
-        except (TypeError, ValueError):
+        except CliJsonSerializationFailedV1:
             return _UnboundKnowledgeAskPresentationV1(
                 report=report,
                 outcome=report.outcome,
