@@ -224,6 +224,25 @@ def _canonical_json_line(value: object) -> bytes:
     )
 
 
+def _run_json_status_both(
+    literature: Path,
+    knowledge: Path,
+    work_id: str,
+) -> dict[str, object]:
+    results = run_both_launchers(
+        _status_arguments(literature, knowledge, work_id, "--json"),
+        pythonpath_roots=(SOURCE_ROOT,),
+        environment_updates={"PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    receipts = [json.loads(result.stdout) for result in results]
+    assert [result.returncode for result in results] == [0, 0]
+    assert all(result.stderr == b"" for result in results)
+    assert results[0].stdout == results[1].stdout
+    assert results[0].stdout == _canonical_json_line(receipts[0])
+    assert receipts[0] == receipts[1]
+    return receipts[0]
+
+
 def _stop_before_reader_sitecustomize(site_root: Path) -> None:
     (site_root / "sitecustomize.py").write_text(
         """
@@ -321,10 +340,7 @@ def test_reader_terminal_run_projects_its_historical_stage_state(
     terminal_status: str,
     reason: str,
 ) -> None:
-    from gezhi._literature_status import project_literature_work_status_v1
-    from gezhi._windows_data_root import open_validated_data_root_v1
-
-    base, literature, _knowledge = status_roots
+    base, literature, knowledge = status_roots
     pdf_path = base / "reader-terminal.pdf"
     write_text_pdf(
         pdf_path,
@@ -384,32 +400,35 @@ def test_reader_terminal_run_projects_its_historical_stage_state(
         manifest["status"] = terminal_status
         manifest["reason"] = reason
         manifest_path.write_bytes(_canonical_json_line(manifest))
-    before = _tree_snapshot(literature)
-
-    with open_validated_data_root_v1(str(literature)) as root:
-        report = project_literature_work_status_v1(
-            root,
-            work_id,
-            include_intake_staging=True,
-        )
-
-    assert report is not None
-    assert report["stages"][3] == {
+    before = (_tree_snapshot(literature), _tree_snapshot(knowledge))
+    receipt = _run_json_status_both(literature, knowledge, work_id)
+    report = receipt["result"]
+    assert type(report) is dict
+    assert report["status"] == terminal_status
+    assert report["literature"]["stages"][3] == {
         "stage": "read",
         "status": terminal_status,
     }
-    assert before == _tree_snapshot(literature)
+    assert report["recovery"] == {
+        "staging_count": 0,
+        "orphaned_count": 0,
+        "quarantined_count": 0,
+        "inconsistent_count": 0,
+    }
+    assert report["next_action"] == "resume_work"
+    assert receipt["outcome"] == "succeeded"
+    assert receipt["diagnostics"] == []
+    assert before == (_tree_snapshot(literature), _tree_snapshot(knowledge))
 
 
 def test_live_work_writer_and_reader_staging_project_read_as_running(
     status_roots: tuple[Path, Path, Path],
     tmp_path: Path,
 ) -> None:
-    from gezhi._literature_status import project_literature_work_status_v1
     from gezhi._windows_data_root import open_validated_data_root_v1
     from gezhi._windows_ownership import try_acquire_work_writer_v1
 
-    base, literature, _knowledge = status_roots
+    base, literature, knowledge = status_roots
     pdf_path = base / "reader-running.pdf"
     write_text_pdf(
         pdf_path,
@@ -435,8 +454,21 @@ def test_live_work_writer_and_reader_staging_project_read_as_running(
         / ".staging"
     )
     semantic_staging.mkdir(parents=True)
-    (semantic_staging / "semrun_00000000-0000-4000-8000-000000000086").mkdir()
-    before = _tree_snapshot(literature)
+    live_stage = semantic_staging / "semrun_00000000-0000-4000-8000-000000000086"
+    live_stage.mkdir()
+
+    before = (_tree_snapshot(literature), _tree_snapshot(knowledge))
+    inactive_staging = _run_json_status_both(literature, knowledge, work_id)
+    inactive_staging_report = inactive_staging["result"]
+    assert type(inactive_staging_report) is dict
+    assert inactive_staging_report["status"] == "staging"
+    assert inactive_staging_report["literature"]["stages"][3] == {
+        "stage": "read",
+        "status": "pending",
+    }
+    assert inactive_staging_report["recovery"]["staging_count"] == 1
+    assert inactive_staging_report["next_action"] == "inspect_recovery"
+    assert before == (_tree_snapshot(literature), _tree_snapshot(knowledge))
 
     with open_validated_data_root_v1(str(literature)) as root:
         identity = root.inspection.identity
@@ -444,17 +476,112 @@ def test_live_work_writer_and_reader_staging_project_read_as_running(
         owner = try_acquire_work_writer_v1(identity, work_id)
         assert owner is not None
         try:
-            report = project_literature_work_status_v1(
-                root,
-                work_id,
-                include_intake_staging=True,
-            )
+            before = (_tree_snapshot(literature), _tree_snapshot(knowledge))
+            active_staging = _run_json_status_both(literature, knowledge, work_id)
+            assert before == (_tree_snapshot(literature), _tree_snapshot(knowledge))
         finally:
             owner.close()
 
-    assert report is not None
-    assert report["stages"][3] == {"stage": "read", "status": "running"}
-    assert before == _tree_snapshot(literature)
+    active_staging_report = active_staging["result"]
+    assert type(active_staging_report) is dict
+    assert active_staging_report["status"] == "staging"
+    assert active_staging_report["literature"]["stages"][3] == {
+        "stage": "read",
+        "status": "running",
+    }
+    assert active_staging_report["recovery"]["staging_count"] == 1
+    assert active_staging_report["next_action"] == "inspect_recovery"
+
+    live_stage.rmdir()
+    with open_validated_data_root_v1(str(literature)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_work_writer_v1(identity, work_id)
+        assert owner is not None
+        try:
+            before = (_tree_snapshot(literature), _tree_snapshot(knowledge))
+            active_without_staging = _run_json_status_both(
+                literature,
+                knowledge,
+                work_id,
+            )
+            assert before == (_tree_snapshot(literature), _tree_snapshot(knowledge))
+        finally:
+            owner.close()
+
+    active_without_staging_report = active_without_staging["result"]
+    assert type(active_without_staging_report) is dict
+    assert active_without_staging_report["status"] == "running"
+    assert active_without_staging_report["literature"]["stages"][3] == {
+        "stage": "read",
+        "status": "running",
+    }
+    assert active_without_staging_report["recovery"]["staging_count"] == 0
+    assert active_without_staging_report["next_action"] == "none"
+
+    before = (_tree_snapshot(literature), _tree_snapshot(knowledge))
+    inactive_without_staging = _run_json_status_both(literature, knowledge, work_id)
+    inactive_without_staging_report = inactive_without_staging["result"]
+    assert type(inactive_without_staging_report) is dict
+    assert inactive_without_staging_report["status"] == "pending"
+    assert inactive_without_staging_report["literature"]["stages"][3] == {
+        "stage": "read",
+        "status": "pending",
+    }
+    assert inactive_without_staging_report["recovery"]["staging_count"] == 0
+    assert inactive_without_staging_report["next_action"] == "resume_work"
+    assert before == (_tree_snapshot(literature), _tree_snapshot(knowledge))
+
+
+def test_live_work_writer_projects_first_unmet_ocr_without_staging(
+    status_roots: tuple[Path, Path, Path],
+) -> None:
+    from gezhi._windows_data_root import open_validated_data_root_v1
+    from gezhi._windows_ownership import try_acquire_work_writer_v1
+
+    base, literature, knowledge = status_roots
+    pdf_path = base / "ocr-running.pdf"
+    write_text_pdf(
+        pdf_path,
+        "This native PDF leaves OCR as the first unmet stage before resume.",
+    )
+    added = _run_add(literature, pdf_path)
+    work_id = str(added["work_id"])
+
+    with open_validated_data_root_v1(str(literature)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_work_writer_v1(identity, work_id)
+        assert owner is not None
+        try:
+            before = (_tree_snapshot(literature), _tree_snapshot(knowledge))
+            active = _run_json_status_both(literature, knowledge, work_id)
+            assert before == (_tree_snapshot(literature), _tree_snapshot(knowledge))
+        finally:
+            owner.close()
+
+    active_report = active["result"]
+    assert type(active_report) is dict
+    assert active_report["status"] == "running"
+    assert active_report["literature"]["stages"][1] == {
+        "stage": "ocr",
+        "status": "running",
+    }
+    assert active_report["recovery"]["staging_count"] == 0
+    assert active_report["next_action"] == "none"
+
+    before = (_tree_snapshot(literature), _tree_snapshot(knowledge))
+    inactive = _run_json_status_both(literature, knowledge, work_id)
+    inactive_report = inactive["result"]
+    assert type(inactive_report) is dict
+    assert inactive_report["status"] == "pending"
+    assert inactive_report["literature"]["stages"][1] == {
+        "stage": "ocr",
+        "status": "pending",
+    }
+    assert inactive_report["recovery"]["staging_count"] == 0
+    assert inactive_report["next_action"] == "resume_work"
+    assert before == (_tree_snapshot(literature), _tree_snapshot(knowledge))
 
 
 def test_real_candidate_registry_projects_the_same_candidate_for_overall_and_work(

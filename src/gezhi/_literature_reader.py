@@ -98,6 +98,38 @@ ReaderTerminalStatusV1: TypeAlias = Literal[
     "failed",
     "interrupted",
 ]
+_READER_MANIFEST_KEYS_V1 = frozenset(
+    {
+        "assets",
+        "attempt_count",
+        "attempts",
+        "candidate_count",
+        "candidate_draft_count",
+        "canonical_content_sha256",
+        "canonical_manifest_sha256",
+        "canonical_run_id",
+        "codex_cli_version",
+        "finished_at",
+        "git_revision",
+        "input_block_count",
+        "input_block_limit",
+        "input_byte_length",
+        "input_byte_limit",
+        "input_sha256",
+        "model",
+        "prompt_sha256",
+        "reasoning_effort",
+        "role",
+        "run_id",
+        "schema_sha256",
+        "schema_version",
+        "source_id",
+        "source_sha256",
+        "status",
+        "usage_totals",
+        "work_id",
+    }
+)
 ReaderReason: TypeAlias = Literal[
     "reader_input_invalid",
     "reader_input_too_large",
@@ -1278,6 +1310,103 @@ def _recover_staging_v1(
         ) from error
 
 
+@dataclass(frozen=True, slots=True)
+class _ValidatedReaderTerminalPrefixV1:
+    manifest_sha256: str
+    status: ReaderTerminalStatusV1
+    attempt_count: int
+    attempts: list[dict[str, object]]
+    evidence: dict[str, str]
+
+
+def _validated_reader_terminal_prefix_v1(
+    run_dir: Path,
+    run_id: str,
+    authority: ActiveSourceAuthorityV1,
+    canonical: CurrentCanonicalAssetV1,
+    *,
+    manifest: dict[str, object],
+    manifest_bytes: bytes,
+    expected_sha256: str | None,
+) -> _ValidatedReaderTerminalPrefixV1:
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    status = manifest.get("status")
+    if status not in {"succeeded", "blocked", "failed", "interrupted"}:
+        raise ValueError("semantic terminal status is invalid")
+    expected_keys = set(_READER_MANIFEST_KEYS_V1)
+    if status != "succeeded":
+        expected_keys.add("reason")
+    input_bytes, evidence = _reader_input(authority, canonical)
+    schema_bytes = reader_output_schema_bytes_v1()
+    prompt_bytes = _effective_prompt(input_bytes)
+    candidate_draft_count = manifest.get("candidate_draft_count")
+    attempt_count = manifest.get("attempt_count")
+    git_revision = manifest.get("git_revision")
+    if (
+        (expected_sha256 is not None and manifest_sha256 != expected_sha256)
+        or set(manifest) != expected_keys
+        or manifest.get("schema_version") != "gezhi.literature_semantic_run_manifest.v1"
+        or manifest.get("run_id") != run_id
+        or manifest.get("canonical_content_sha256")
+        != canonical.canonical_content_sha256
+        or manifest.get("canonical_manifest_sha256") != canonical.manifest_sha256
+        or manifest.get("canonical_run_id") != canonical.run_id
+        or manifest.get("source_id") != authority.source_id
+        or manifest.get("source_sha256") != authority.source_sha256
+        or manifest.get("work_id") != authority.work_id
+        or manifest.get("candidate_count") != 0
+        or type(candidate_draft_count) is not int
+        or not 0 <= candidate_draft_count <= 12
+        or manifest.get("codex_cli_version") != "0.146.0"
+        or manifest.get("model") != "gpt-5.6-sol"
+        or manifest.get("reasoning_effort") != "high"
+        or manifest.get("role") != "literature_reader_v1"
+        or type(manifest.get("finished_at")) is not str
+        or not manifest["finished_at"]
+        or type(git_revision) is not str
+        or re.fullmatch(r"[0-9a-f]{40}", git_revision) is None
+        or manifest.get("input_block_count") != len(evidence)
+        or manifest.get("input_block_limit") != _INPUT_BLOCK_LIMIT
+        or manifest.get("input_byte_length") != len(input_bytes)
+        or manifest.get("input_byte_limit") != _INPUT_BYTE_LIMIT
+        or manifest.get("input_sha256") != hashlib.sha256(input_bytes).hexdigest()
+        or manifest.get("prompt_sha256") != hashlib.sha256(prompt_bytes).hexdigest()
+        or manifest.get("schema_sha256") != hashlib.sha256(schema_bytes).hexdigest()
+        or _read_safe_bytes(
+            run_dir / "input.jsonl",
+            limit=_INPUT_BYTE_LIMIT,
+        )
+        != input_bytes
+        or _read_safe_bytes(
+            run_dir / "prompt.txt",
+            limit=_MAX_JSON_OR_TEXT_BYTES,
+        )
+        != prompt_bytes
+        or _read_safe_bytes(
+            run_dir / "schema.json",
+            limit=_MAX_JSON_OR_TEXT_BYTES,
+        )
+        != schema_bytes
+        or type(attempt_count) is not int
+        or not 0 <= attempt_count <= 3
+    ):
+        raise ValueError("semantic terminal run prefix is invalid")
+    attempts = _attempt_documents_from_run_v1(run_dir)
+    if (
+        len(attempts) != attempt_count
+        or manifest.get("attempts") != attempts
+        or manifest.get("usage_totals") != _usage_totals(attempts)
+    ):
+        raise ValueError("semantic terminal attempt provenance is invalid")
+    return _ValidatedReaderTerminalPrefixV1(
+        manifest_sha256=manifest_sha256,
+        status=cast(ReaderTerminalStatusV1, status),
+        attempt_count=attempt_count,
+        attempts=attempts,
+        evidence=evidence,
+    )
+
+
 def _validated_success_manifest_sha256(
     run_dir: Path,
     run_id: str,
@@ -1288,7 +1417,6 @@ def _validated_success_manifest_sha256(
 ) -> str | None:
     try:
         manifest, manifest_bytes = _read_canonical_object_v1(run_dir / "manifest.json")
-        manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
         identity_matches = (
             manifest.get("canonical_content_sha256")
             == canonical.canonical_content_sha256
@@ -1302,93 +1430,22 @@ def _validated_success_manifest_sha256(
             manifest.get("status") != "succeeded" or not identity_matches
         ):
             return None
-        if expected_sha256 is not None and manifest_sha256 != expected_sha256:
-            raise ValueError("semantic manifest identity is invalid")
-        expected_manifest_keys = {
-            "assets",
-            "attempt_count",
-            "attempts",
-            "candidate_count",
-            "candidate_draft_count",
-            "canonical_content_sha256",
-            "canonical_manifest_sha256",
-            "canonical_run_id",
-            "codex_cli_version",
-            "finished_at",
-            "git_revision",
-            "input_block_count",
-            "input_block_limit",
-            "input_byte_length",
-            "input_byte_limit",
-            "input_sha256",
-            "model",
-            "prompt_sha256",
-            "reasoning_effort",
-            "role",
-            "run_id",
-            "schema_sha256",
-            "schema_version",
-            "source_id",
-            "source_sha256",
-            "status",
-            "usage_totals",
-            "work_id",
-        }
-        input_bytes, evidence = _reader_input(authority, canonical)
-        schema_bytes = reader_output_schema_bytes_v1()
-        prompt_bytes = _effective_prompt(input_bytes)
-        candidate_draft_count = manifest.get("candidate_draft_count")
-        git_revision = manifest.get("git_revision")
+        terminal = _validated_reader_terminal_prefix_v1(
+            run_dir,
+            run_id,
+            authority,
+            canonical,
+            manifest=manifest,
+            manifest_bytes=manifest_bytes,
+            expected_sha256=expected_sha256,
+        )
+        manifest_sha256 = terminal.manifest_sha256
+        attempt_count = terminal.attempt_count
+        attempts = terminal.attempts
+        evidence = terminal.evidence
         if (
-            set(manifest) != expected_manifest_keys
-            or manifest.get("schema_version")
-            != "gezhi.literature_semantic_run_manifest.v1"
-            or manifest.get("run_id") != run_id
-            or manifest.get("status") != "succeeded"
-            or not identity_matches
-            or manifest.get("candidate_count") != 0
-            or type(candidate_draft_count) is not int
-            or not 0 <= candidate_draft_count <= 12
-            or manifest.get("codex_cli_version") != "0.146.0"
-            or manifest.get("model") != "gpt-5.6-sol"
-            or manifest.get("reasoning_effort") != "high"
-            or manifest.get("role") != "literature_reader_v1"
-            or type(manifest.get("finished_at")) is not str
-            or not manifest["finished_at"]
-            or type(git_revision) is not str
-            or re.fullmatch(r"[0-9a-f]{40}", git_revision) is None
-            or manifest.get("input_block_count") != len(evidence)
-            or manifest.get("input_block_limit") != _INPUT_BLOCK_LIMIT
-            or manifest.get("input_byte_length") != len(input_bytes)
-            or manifest.get("input_byte_limit") != _INPUT_BYTE_LIMIT
-            or manifest.get("input_sha256") != hashlib.sha256(input_bytes).hexdigest()
-            or manifest.get("prompt_sha256") != hashlib.sha256(prompt_bytes).hexdigest()
-            or manifest.get("schema_sha256") != hashlib.sha256(schema_bytes).hexdigest()
-            or _read_safe_bytes(
-                run_dir / "input.jsonl",
-                limit=_INPUT_BYTE_LIMIT,
-            )
-            != input_bytes
-            or _read_safe_bytes(
-                run_dir / "prompt.txt",
-                limit=_MAX_JSON_OR_TEXT_BYTES,
-            )
-            != prompt_bytes
-            or _read_safe_bytes(
-                run_dir / "schema.json",
-                limit=_MAX_JSON_OR_TEXT_BYTES,
-            )
-            != schema_bytes
-        ):
-            raise ValueError("semantic run is invalid")
-        attempt_count = manifest.get("attempt_count")
-        if type(attempt_count) is not int or not 1 <= attempt_count <= 3:
-            raise ValueError("semantic attempt count is invalid")
-        attempts = _attempt_documents_from_run_v1(run_dir)
-        if (
-            len(attempts) != attempt_count
-            or manifest.get("attempts") != attempts
-            or manifest.get("usage_totals") != _usage_totals(attempts)
+            terminal.status != "succeeded"
+            or not 1 <= attempt_count <= 3
             or any(
                 attempt.get("failure_class") != "timeout" for attempt in attempts[:-1]
             )
@@ -1508,101 +1565,21 @@ def validated_terminal_reader_status_v1(
             if manifest_sha256 is None:
                 raise ValueError("semantic success is not attributable")
             return "succeeded"
-
-        expected_manifest_keys = {
-            "assets",
-            "attempt_count",
-            "attempts",
-            "candidate_count",
-            "candidate_draft_count",
-            "canonical_content_sha256",
-            "canonical_manifest_sha256",
-            "canonical_run_id",
-            "codex_cli_version",
-            "finished_at",
-            "git_revision",
-            "input_block_count",
-            "input_block_limit",
-            "input_byte_length",
-            "input_byte_limit",
-            "input_sha256",
-            "model",
-            "prompt_sha256",
-            "reason",
-            "reasoning_effort",
-            "role",
-            "run_id",
-            "schema_sha256",
-            "schema_version",
-            "source_id",
-            "source_sha256",
-            "status",
-            "usage_totals",
-            "work_id",
-        }
-        input_bytes, evidence = _reader_input(authority, canonical)
-        schema_bytes = reader_output_schema_bytes_v1()
-        prompt_bytes = _effective_prompt(input_bytes)
-        attempt_count = manifest.get("attempt_count")
-        git_revision = manifest.get("git_revision")
+        terminal = _validated_reader_terminal_prefix_v1(
+            run_dir,
+            run_id,
+            authority,
+            canonical,
+            manifest=manifest,
+            manifest_bytes=manifest_bytes,
+            expected_sha256=None,
+        )
+        status = terminal.status
+        attempt_count = terminal.attempt_count
+        attempts = terminal.attempts
         reason = manifest.get("reason")
-        if (
-            status not in {"blocked", "failed", "interrupted"}
-            or set(manifest) != expected_manifest_keys
-            or manifest.get("schema_version")
-            != "gezhi.literature_semantic_run_manifest.v1"
-            or manifest.get("run_id") != run_id
-            or manifest.get("canonical_content_sha256")
-            != canonical.canonical_content_sha256
-            or manifest.get("canonical_manifest_sha256") != canonical.manifest_sha256
-            or manifest.get("canonical_run_id") != canonical.run_id
-            or manifest.get("source_id") != authority.source_id
-            or manifest.get("source_sha256") != authority.source_sha256
-            or manifest.get("work_id") != authority.work_id
-            or manifest.get("candidate_count") != 0
-            or manifest.get("candidate_draft_count") != 0
-            or manifest.get("codex_cli_version") != "0.146.0"
-            or manifest.get("model") != "gpt-5.6-sol"
-            or manifest.get("reasoning_effort") != "high"
-            or manifest.get("role") != "literature_reader_v1"
-            or type(manifest.get("finished_at")) is not str
-            or not manifest["finished_at"]
-            or type(git_revision) is not str
-            or re.fullmatch(r"[0-9a-f]{40}", git_revision) is None
-            or manifest.get("input_block_count") != len(evidence)
-            or manifest.get("input_block_limit") != _INPUT_BLOCK_LIMIT
-            or manifest.get("input_byte_length") != len(input_bytes)
-            or manifest.get("input_byte_limit") != _INPUT_BYTE_LIMIT
-            or manifest.get("input_sha256") != hashlib.sha256(input_bytes).hexdigest()
-            or manifest.get("prompt_sha256") != hashlib.sha256(prompt_bytes).hexdigest()
-            or manifest.get("schema_sha256") != hashlib.sha256(schema_bytes).hexdigest()
-            or _read_safe_bytes(
-                run_dir / "input.jsonl",
-                limit=_INPUT_BYTE_LIMIT,
-            )
-            != input_bytes
-            or _read_safe_bytes(
-                run_dir / "prompt.txt",
-                limit=_MAX_JSON_OR_TEXT_BYTES,
-            )
-            != prompt_bytes
-            or _read_safe_bytes(
-                run_dir / "schema.json",
-                limit=_MAX_JSON_OR_TEXT_BYTES,
-            )
-            != schema_bytes
-            or type(attempt_count) is not int
-            or not 0 <= attempt_count <= 3
-        ):
+        if status == "succeeded" or manifest.get("candidate_draft_count") != 0:
             raise ValueError("semantic terminal run is invalid")
-
-        attempts = _attempt_documents_from_run_v1(run_dir)
-        if (
-            len(attempts) != attempt_count
-            or manifest.get("attempts") != attempts
-            or manifest.get("usage_totals") != _usage_totals(attempts)
-        ):
-            raise ValueError("semantic terminal attempt provenance is invalid")
         if status == "blocked":
             valid_terminal = (
                 reason == "codex_runtime_unavailable" and attempt_count == 0

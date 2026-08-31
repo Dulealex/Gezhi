@@ -556,6 +556,22 @@ def _work_status(stages: list[dict[str, str]], recovery: dict[str, int]) -> str:
     return "succeeded"
 
 
+def _project_live_automatic_stage_v1(
+    stages: list[dict[str, str]],
+    *,
+    writer_active: bool,
+) -> None:
+    if not writer_active:
+        return
+    for stage in ("ocr", "canonicalize", "read"):
+        item = next(candidate for candidate in stages if candidate["stage"] == stage)
+        if item["status"] == "succeeded":
+            continue
+        if item["status"] == "pending":
+            item["status"] = "running"
+        return
+
+
 def project_literature_work_status_v1(
     root: ValidatedDataRootV1,
     work_id: str,
@@ -632,6 +648,7 @@ def project_literature_work_status_v1(
                             stages,
                             recovery,
                         )
+    _project_live_automatic_stage_v1(stages, writer_active=writer_active)
     availability = "partial" if recovery["inconsistent_count"] else "ready"
     return {
         "availability": availability,
