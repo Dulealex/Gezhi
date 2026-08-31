@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from collections import Counter
 from typing import cast
 
@@ -9,10 +8,8 @@ from gezhi._windows_data_root import (
     DataRootOpenErrorV1,
     ValidatedDataRootV1,
 )
+from gezhi._work_id import is_work_id_v1
 
-_WORK_ID = re.compile(
-    r"^wrk_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
-)
 _ANSWER_STATUS_ORDER = ("succeeded", "blocked", "failed", "interrupted")
 _ZERO_RECOVERY = {
     "staging_count": 0,
@@ -97,7 +94,7 @@ def _read_candidate_projections(
             if (
                 type(payload) is not dict
                 or type(payload.get("work_id")) is not str
-                or _WORK_ID.fullmatch(cast(str, payload["work_id"])) is None
+                or not is_work_id_v1(payload["work_id"])
                 or governance.get("intake_status") not in {"active", "withdrawn"}
             ):
                 inconsistent_count += 1
@@ -141,10 +138,7 @@ def _import_facts(
                 continue
             try:
                 handoff = knowledge_read._read_handoff_v1(root, name)
-                if (
-                    handoff.handoff_id != name
-                    or _WORK_ID.fullmatch(handoff.work_id) is None
-                ):
+                if handoff.handoff_id != name or not is_work_id_v1(handoff.work_id):
                     raise ValueError("Knowledge import identity differs")
             except Exception:  # noqa: BLE001 - isolate one immutable import target.
                 inconsistent_count += 1
@@ -160,39 +154,112 @@ def _import_facts(
 def _answer_work_ids(retrieval_view_bytes: bytes | None) -> frozenset[str]:
     if retrieval_view_bytes is None:
         return frozenset()
+    from gezhi._knowledge_intake import _HandoffInvalidV1, _validate_accept_record
+    from gezhi._knowledge_retrieval import _WITNESS_ACCEPT_PAYLOAD_SHA256ES
+
     try:
         value = json.loads(retrieval_view_bytes)
+        items = value.get("items") if type(value) is dict else None
         if (
             type(value) is not dict
+            or set(value)
+            != {"answer_kind", "candidate_count", "items", "schema_version"}
+            or value.get("answer_kind") != "candidate_backed"
             or value.get("schema_version") != "gezhi.retrieval_view.v1"
-            or type(value.get("items")) is not list
+            or type(value.get("candidate_count")) is not int
+            or not 0 <= cast(int, value["candidate_count"]) <= 12
+            or type(items) is not list
+            or value["candidate_count"] != len(items)
         ):
             raise ValueError("Retrieval View shape is invalid")
         observed: set[str] = set()
-        for item in value["items"]:
-            if type(item) is not dict or type(item.get("candidate")) is not dict:
+        candidate_ids: set[str] = set()
+        for rank, item in enumerate(items, start=1):
+            if (
+                type(item) is not dict
+                or set(item)
+                != {
+                    "candidate",
+                    "citation",
+                    "descriptor_snapshots",
+                    "evidence_snapshots",
+                    "governance",
+                    "rank",
+                }
+                or type(item.get("rank")) is not int
+                or item["rank"] != rank
+                or item.get("governance")
+                != {
+                    "intake_status": "active",
+                    "promotion_status": "not_promoted",
+                    "review_status": "accepted",
+                }
+                or type(item.get("candidate")) is not dict
+                or type(item.get("citation")) is not dict
+                or type(item.get("descriptor_snapshots")) is not list
+                or type(item.get("evidence_snapshots")) is not list
+            ):
                 raise ValueError("Retrieval View Candidate is invalid")
-            payload = item["candidate"].get("payload")
-            if type(payload) is not dict or type(payload.get("work_id")) is not str:
+            candidate = cast(dict[str, object], item["candidate"])
+            synthetic_record: dict[str, object] = {
+                "action": "accept",
+                "candidate": candidate,
+                "citation": item["citation"],
+                "descriptor_snapshots": item["descriptor_snapshots"],
+                "evidence_snapshots": item["evidence_snapshots"],
+                "review_receipt": {},
+                "schema_version": "gezhi.reviewed_candidate_action.v1",
+            }
+            candidate_id, _payload_sha256 = _validate_accept_record(
+                synthetic_record,
+                exact_witness=(
+                    candidate.get("payload_sha256") in _WITNESS_ACCEPT_PAYLOAD_SHA256ES
+                ),
+            )
+            if candidate_id in candidate_ids:
+                raise ValueError("Retrieval View Candidate is duplicated")
+            candidate_ids.add(candidate_id)
+            payload = candidate.get("payload")
+            if type(payload) is not dict or not is_work_id_v1(payload.get("work_id")):
                 raise ValueError("Retrieval View Work binding is invalid")
             work_id = cast(str, payload["work_id"])
-            if _WORK_ID.fullmatch(work_id) is None:
-                raise ValueError("Retrieval View Work ID is invalid")
             observed.add(work_id)
         return frozenset(observed)
-    except (KeyError, TypeError, ValueError) as error:
+    except (KeyError, TypeError, ValueError, _HandoffInvalidV1) as error:
         raise KnowledgeStatusProjectionFailedV1(
             "validated Answer relation is unavailable"
         ) from error
 
 
+def _answer_staging_facts(
+    answers: ValidatedDataRootV1,
+) -> tuple[int, int]:
+    from gezhi._answer_terminal import _ANSWER_ID
+
+    with answers.open_relative_data_root_v1((".staging",)) as staging:
+        staging_count = 0
+        inconsistent_count = 0
+        for entry in staging.relative_entries_v1():
+            if (
+                entry.is_directory
+                and not entry.is_reparse
+                and entry.short_name is None
+                and _ANSWER_ID.fullmatch(entry.name) is not None
+            ):
+                staging_count += 1
+            else:
+                inconsistent_count += 1
+        return staging_count, inconsistent_count
+
+
 def _answer_statuses(
     root: ValidatedDataRootV1,
-) -> tuple[tuple[tuple[str, frozenset[str]], ...], int, int]:
+) -> tuple[tuple[tuple[str, frozenset[str]], ...], int, int, bool]:
     names = root.relative_entry_names_v1()
     if "answers" not in names:
-        return (), 0, 0
+        return (), 0, 0, False
     from gezhi._answer_terminal import (
+        _ANSWER_ID,
         TerminalAnswerBytesReadyV1,
         read_committed_answer_v1,
     )
@@ -202,25 +269,45 @@ def _answer_statuses(
     inconsistent_count = 0
     try:
         with root.open_relative_data_root_v1(("answers",)) as answers:
-            for name in answers.relative_entry_names_v1():
-                if name == ".staging":
-                    staging_count += _staging_payload_count(answers, ".staging")
+            for entry in answers.relative_entries_v1():
+                if entry.name == ".staging":
+                    if (
+                        not entry.is_directory
+                        or entry.is_reparse
+                        or entry.short_name is not None
+                    ):
+                        inconsistent_count += 1
+                        continue
+                    staged, inconsistent = _answer_staging_facts(answers)
+                    staging_count += staged
+                    inconsistent_count += inconsistent
                     continue
-                terminal = read_committed_answer_v1(root, name)
+                if (
+                    not entry.is_directory
+                    or entry.is_reparse
+                    or entry.short_name is not None
+                    or _ANSWER_ID.fullmatch(entry.name) is None
+                ):
+                    inconsistent_count += 1
+                    continue
+                terminal = read_committed_answer_v1(root, entry.name)
                 if type(terminal) is not TerminalAnswerBytesReadyV1:
+                    inconsistent_count += 1
+                    continue
+                try:
+                    work_ids = _answer_work_ids(terminal.retrieval_view_bytes)
+                except KnowledgeStatusProjectionFailedV1:
                     inconsistent_count += 1
                     continue
                 facts.append(
                     (
                         terminal.status,
-                        _answer_work_ids(terminal.retrieval_view_bytes),
+                        work_ids,
                     )
                 )
-    except DataRootOpenErrorV1 as error:
-        raise KnowledgeStatusProjectionFailedV1(
-            "Knowledge Answers cannot be bounded"
-        ) from error
-    return tuple(facts), staging_count, inconsistent_count
+    except (DataRootOpenErrorV1, OSError):
+        return (), 0, 0, True
+    return tuple(facts), staging_count, inconsistent_count, False
 
 
 def project_knowledge_status_v1(
@@ -246,7 +333,12 @@ def project_knowledge_status_v1(
         root,
         registered_handoffs,
     )
-    answer_facts, answer_staging, answer_inconsistent = _answer_statuses(root)
+    (
+        answer_facts,
+        answer_staging,
+        answer_inconsistent,
+        answer_unavailable,
+    ) = _answer_statuses(root)
     untrusted_count = (
         foreign_count
         + candidate_inconsistent
@@ -259,7 +351,7 @@ def project_knowledge_status_v1(
             orphaned_count=len(orphan_work_ids),
             inconsistent_count=untrusted_count,
         )
-        availability = "partial" if untrusted_count else "ready"
+        availability = "partial" if untrusted_count or answer_unavailable else "ready"
         candidate_counts = Counter(status for _work, status in candidates)
         answer_statuses = Counter(status for status, _work_ids in answer_facts)
         return {
@@ -280,7 +372,7 @@ def project_knowledge_status_v1(
         status for status, work_ids in answer_facts if work_id in work_ids
     )
     return {
-        "availability": "partial" if untrusted_count else "ready",
+        "availability": "partial" if answer_unavailable else "ready",
         "candidate_counts": {
             "active": candidate_counts["active"],
             "withdrawn": candidate_counts["withdrawn"],

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import re
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -22,11 +21,9 @@ from gezhi._windows_data_root import (
     data_roots_are_physically_isolated,
     open_validated_data_root_v1,
 )
+from gezhi._work_id import is_work_id_v1
 
 _PROJECT_ROOT = Path(r"E:\Gezhi")
-_WORK_ID = re.compile(
-    r"^wrk_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
-)
 _ZERO_RECOVERY = {
     "staging_count": 0,
     "orphaned_count": 0,
@@ -119,9 +116,7 @@ def _observe_status_v1(
         return {"kind": "blocked", "reason": "configuration_invalid"}
     except Exception:  # noqa: BLE001 - unexpected resolver faults fail closed.
         return {"kind": "failed"}
-    if work_id is not None and (
-        type(work_id) is not str or _WORK_ID.fullmatch(work_id) is None
-    ):
+    if work_id is not None and not is_work_id_v1(work_id):
         return {"kind": "blocked", "reason": "invalid_work_id"}
 
     try:

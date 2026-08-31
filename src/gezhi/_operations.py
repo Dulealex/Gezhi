@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping, Sequence
 from typing import Literal, TypeAlias, cast
 
@@ -9,6 +8,7 @@ from gezhi._presentation import (
     present_operations_human,
     present_operations_json,
 )
+from gezhi._work_id import is_work_id_v1
 
 CheckStatus: TypeAlias = Literal["ready", "blocked", "failed", "not_checked"]
 CheckReason: TypeAlias = (
@@ -151,9 +151,6 @@ _DIAGNOSTIC_HUMAN = {
 }
 
 _MAX_INT64 = 9_223_372_036_854_775_807
-_WORK_ID = re.compile(
-    r"^wrk_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
-)
 _OPERATIONAL_ORDER = (
     "empty",
     "pending",
@@ -802,7 +799,7 @@ def _work_result(
         label="Work status observation",
     )
     work_id = raw["work_id"]
-    if type(work_id) is not str or _WORK_ID.fullmatch(work_id) is None:
+    if not is_work_id_v1(work_id):
         raise ValueError("Work status observation identity is invalid")
     literature, literature_recovery = _validate_work_literature(raw["literature"])
     knowledge, knowledge_recovery = _validate_work_knowledge(raw["knowledge"])
@@ -866,7 +863,7 @@ def _blocked_status_observation(
             label="Work-not-found observation",
         )
         work_id = raw["work_id"]
-        if type(work_id) is not str or _WORK_ID.fullmatch(work_id) is None:
+        if not is_work_id_v1(work_id):
             raise ValueError("Work-not-found identity is invalid")
         context = {"work_id": work_id}
     elif reason in {"data_root_unsafe", "data_root_unavailable"}:

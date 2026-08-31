@@ -386,6 +386,168 @@ def test_answer_staging_is_counted_without_content_classification(
     assert before == _tree_snapshot(knowledge)
 
 
+@pytest.mark.parametrize(
+    ("name", "is_directory"),
+    [
+        pytest.param("not-an-answer", True, id="invalid-directory-name"),
+        pytest.param(
+            "ans_00000000-0000-4000-8000-000000000084",
+            False,
+            id="answer-id-file",
+        ),
+    ],
+)
+def test_unattributable_answer_staging_only_counts_as_overall_inconsistent(
+    status_roots: tuple[Path, Path, Path],
+    name: str,
+    is_directory: bool,
+) -> None:
+    from gezhi._knowledge_status import project_knowledge_status_v1
+    from gezhi._windows_data_root import open_validated_data_root_v1
+
+    _base, _literature, knowledge = status_roots
+    entry = knowledge / "answers" / ".staging" / name
+    entry.parent.mkdir(parents=True)
+    if is_directory:
+        entry.mkdir()
+    else:
+        entry.write_bytes(b"not a directory")
+    before = _tree_snapshot(knowledge)
+    work_id = "wrk_123e4567-e89b-42d3-a456-426614174000"
+
+    with open_validated_data_root_v1(str(knowledge)) as root:
+        overall = project_knowledge_status_v1(root, work_id=None)
+        scoped = project_knowledge_status_v1(root, work_id=work_id)
+
+    assert overall["availability"] == "partial"
+    assert overall["recovery"] == {
+        "staging_count": 0,
+        "orphaned_count": 0,
+        "quarantined_count": 0,
+        "inconsistent_count": 1,
+    }
+    assert scoped["availability"] == "ready"
+    assert scoped["recovery"] == {
+        "staging_count": 0,
+        "orphaned_count": 0,
+        "quarantined_count": 0,
+        "inconsistent_count": 0,
+    }
+    assert before == _tree_snapshot(knowledge)
+
+
+def test_unavailable_answer_subroot_preserves_a_partial_projection(
+    status_roots: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gezhi._knowledge_status import project_knowledge_status_v1
+    from gezhi._windows_data_root import (
+        DataRootOpenErrorV1,
+        ValidatedDataRootV1,
+        open_validated_data_root_v1,
+    )
+
+    _base, _literature, knowledge = status_roots
+    (knowledge / "answers").mkdir()
+    before = _tree_snapshot(knowledge)
+    original_open = ValidatedDataRootV1.open_relative_data_root_v1
+
+    def fail_answer_open(
+        self: ValidatedDataRootV1,
+        parts: tuple[str, ...],
+    ) -> ValidatedDataRootV1:
+        if parts == ("answers",):
+            raise DataRootOpenErrorV1("unavailable")
+        return original_open(self, parts)
+
+    monkeypatch.setattr(
+        ValidatedDataRootV1,
+        "open_relative_data_root_v1",
+        fail_answer_open,
+    )
+    work_id = "wrk_123e4567-e89b-42d3-a456-426614174000"
+
+    with open_validated_data_root_v1(str(knowledge)) as root:
+        overall = project_knowledge_status_v1(root, work_id=None)
+        scoped = project_knowledge_status_v1(root, work_id=work_id)
+
+    assert overall["availability"] == "partial"
+    assert overall["answer_status_counts"] == []
+    assert overall["recovery"] == {
+        "staging_count": 0,
+        "orphaned_count": 0,
+        "quarantined_count": 0,
+        "inconsistent_count": 0,
+    }
+    assert scoped["availability"] == "partial"
+    assert scoped["related_answer_status_counts"] == []
+    assert scoped["recovery"] == overall["recovery"]
+    assert before == _tree_snapshot(knowledge)
+
+
+def test_answer_work_relation_requires_a_matching_validated_source_snapshot() -> None:
+    from support.knowledge_handoff_factory_v1 import accepted_handoff_v1
+
+    from gezhi._knowledge_status import (
+        KnowledgeStatusProjectionFailedV1,
+        _answer_work_ids,
+    )
+
+    handoff = accepted_handoff_v1(
+        ordinal=85,
+        statement_text="Answer 与 Work 的关系必须来自完整验证的来源快照。",
+        source_terms=["Answer", "Work", "快照"],
+    )
+    record = json.loads(handoff.candidates_bytes)
+    item = {
+        "candidate": record["candidate"],
+        "citation": record["citation"],
+        "descriptor_snapshots": record["descriptor_snapshots"],
+        "evidence_snapshots": record["evidence_snapshots"],
+        "governance": {
+            "intake_status": "active",
+            "promotion_status": "not_promoted",
+            "review_status": "accepted",
+        },
+        "rank": 1,
+    }
+    view = {
+        "answer_kind": "candidate_backed",
+        "candidate_count": 1,
+        "items": [item],
+        "schema_version": "gezhi.retrieval_view.v1",
+    }
+    view_bytes = (
+        json.dumps(
+            view,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    work_id = record["candidate"]["payload"]["work_id"]
+
+    assert _answer_work_ids(view_bytes) == frozenset({work_id})
+
+    mismatched = json.loads(view_bytes)
+    mismatched["items"][0]["citation"]["work_id"] = (
+        "wrk_223e4567-e89b-42d3-a456-426614174000"
+    )
+    mismatched_bytes = (
+        json.dumps(
+            mismatched,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+    with pytest.raises(KnowledgeStatusProjectionFailedV1):
+        _answer_work_ids(mismatched_bytes)
+
+
 def test_corrupt_registry_fails_the_unbounded_observation_without_mutation(
     status_roots: tuple[Path, Path, Path],
 ) -> None:

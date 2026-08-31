@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -15,6 +14,7 @@ from gezhi._windows_data_root import (
     ValidatedDataRootV1,
     open_validated_data_root_v1,
 )
+from gezhi._work_id import is_work_id_v1
 
 if TYPE_CHECKING:
     from gezhi._literature_canonical import (
@@ -24,9 +24,6 @@ if TYPE_CHECKING:
     from gezhi._literature_reader import ReaderAdvanceV1
     from gezhi._literature_resume import _ValidatedRunV1
 
-_WORK_ID = re.compile(
-    r"^wrk_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
-)
 _WORK_STATUS_ORDER = (
     "pending",
     "running",
@@ -631,7 +628,7 @@ def _literature_work_ids(root: ValidatedDataRootV1) -> tuple[str, ...]:
         return tuple(
             name
             for name in works.relative_entry_names_v1()
-            if name != ".staging" and _WORK_ID.fullmatch(name) is not None
+            if name != ".staging" and is_work_id_v1(name)
         )
 
 
@@ -658,8 +655,7 @@ def project_literature_overall_status_v1(
     with root.open_relative_data_root_v1(("works",)) as works:
         work_names = works.relative_entry_names_v1()
         recovery["inconsistent_count"] += sum(
-            name != ".staging" and _WORK_ID.fullmatch(name) is None
-            for name in work_names
+            name != ".staging" and not is_work_id_v1(name) for name in work_names
         )
         recovery["staging_count"] += _staging_count(works)
     availability = "ready"
