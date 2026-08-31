@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -17,7 +18,9 @@ from launcher_support import (
     PYTHON_EXE,
     REPOSITORY_ROOT,
     SOURCE_ROOT,
+    launcher_commands,
     run_both_launchers,
+    run_launcher,
     subprocess_environment,
 )
 from support.reviewed_handoff_witness_v1 import (
@@ -30,6 +33,7 @@ from support.reviewed_handoff_witness_v1 import (
 _CODEX_CHILD_DOUBLE = (
     Path(__file__).parent / "support" / "codex_child_executable_double_v1.py"
 )
+_CTRL_C_DRIVER = Path(__file__).parent / "support" / "knowledge_ctrl_c_driver_v1.py"
 _ACTIVE_CANDIDATE_ID = json.loads(ACCEPT_CANDIDATES_V1)["candidate"]["candidate_id"]
 _GOVERNANCE_DISCLOSURE_FOR_TEST = (
     "> 治理说明：本结果为候选知识支持（Candidate-backed）；可用内容仅来自已审核但尚未晋升的 "
@@ -321,6 +325,541 @@ def _run_with_answerer_double(
         resolved_runtime = runtime_root.resolve(strict=True)
         assert resolved_runtime.parent == attempt_container.resolve(strict=True)
         assert resolved_runtime.name.startswith("t21-")
+        shutil.rmtree(resolved_runtime)
+
+
+def _install_attempt_sequence_double(site_root: Path) -> None:
+    site_root.mkdir()
+    (site_root / "sitecustomize.py").write_text(
+        """
+import os
+import sys
+from pathlib import Path
+
+import gezhi._knowledge_answerer as answerer
+from gezhi._codex_child_process import NeverCancelledV1
+from gezhi._codex_child_process import _run_codex_child_test_double_v1
+from gezhi._codex_role_plan import _freeze_test_double_launch_v1
+
+
+_scenarios = os.environ["T22_DOUBLE_SCENARIOS"].split(",")
+
+
+def run_double(request):
+    scenario = _scenarios[request.attempt_ordinal - 1]
+    capture_parent = request.attempt_root / "captures"
+    capture = capture_parent / f"{request.attempt_ordinal:02d}"
+    staging = capture_parent / f".{request.attempt_ordinal:02d}.codex-stage"
+    final_spool = staging / ".final_message.spool"
+    if scenario == "success":
+        arguments = (
+            "-I", "-B", os.environ["T22_DOUBLE_EXE"], "final-from-file",
+            "--final", str(final_spool), "--payload-file",
+            os.environ["T22_DOUBLE_FINAL"],
+        )
+        timeout_seconds = 10
+    elif scenario == "timeout":
+        arguments = (
+            "-I", "-B", os.environ["T22_DOUBLE_EXE"], "hang",
+            "--final", str(final_spool),
+        )
+        timeout_seconds = 0.15
+    elif scenario == "provider-error":
+        arguments = (
+            "-I", "-B", os.environ["T22_DOUBLE_EXE"], "message-failure",
+            "--final", str(final_spool), "--payload-file",
+            os.environ["T22_DOUBLE_MESSAGE"], "--value", "1",
+        )
+        timeout_seconds = 10
+    elif scenario == "final-overflow":
+        arguments = (
+            "-I", "-B", os.environ["T22_DOUBLE_EXE"], "final-overflow-hang",
+            "--final", str(final_spool), "--value", "1048577",
+        )
+        timeout_seconds = 10
+    else:
+        raise AssertionError(f"unknown scenario: {scenario}")
+    plan = _freeze_test_double_launch_v1(
+        executable=Path(sys.executable),
+        arguments=arguments,
+        prompt=request.prompt,
+        attempt_ordinal=request.attempt_ordinal,
+        working_directory=request.attempt_root / "working",
+        capture_directory=capture,
+        staging_directory=staging,
+        temporary_directory=request.attempt_root / "temporary",
+        source_environment={"SystemRoot": os.environ["SystemRoot"]},
+        timeout_seconds=timeout_seconds,
+        capture_profile="knowledge",
+        existing_shared_deadline_monotonic_ns=(
+            request.existing_shared_deadline_monotonic_ns
+        ),
+    )
+    return _run_codex_child_test_double_v1(
+        plan,
+        getattr(request, "cancellation", NeverCancelledV1()),
+    )
+
+
+answerer._run_role_attempt_v1 = run_double
+answerer._prepare_role_invocation_v1 = lambda: object()
+answerer._wait_retry_backoff_v1 = lambda **_kwargs: "ready"
+""",
+        encoding="utf-8",
+    )
+
+
+def _install_cancellation_cutover_double(site_root: Path) -> None:
+    site_root.mkdir()
+    (site_root / "sitecustomize.py").write_text(
+        """
+import os
+import time
+
+import gezhi._knowledge_ask as knowledge_ask
+import gezhi._knowledge_commands as commands
+from gezhi._knowledge_cancellation import CancellationSnapshotV1
+
+
+class ScriptedCancellationV1:
+    active = None
+
+    def __init__(self):
+        self.mode = os.environ["T22_CANCELLATION_CUTOVER"]
+        self.observed = None
+        self.generation = 0
+        self.sealed_token = 0
+        self.phase = "accepting"
+        self.cutover_complete = False
+        ScriptedCancellationV1.active = self
+
+    def observed_at_monotonic_ns(self):
+        return self.observed
+
+    def try_begin_work_v1(self):
+        if (
+            self.mode == "pre-retrieval"
+            and self.cutover_complete
+            and self.observed is None
+        ):
+            self.observed = time.monotonic_ns()
+            self.generation = 1
+        return self.observed is None
+
+    def try_answer_id_cutover_v1(self):
+        if self.mode in {"pre-id", "post-id"}:
+            self.observed = time.monotonic_ns()
+            self.generation = 1
+        self.cutover_complete = True
+        return self.mode != "pre-id"
+
+    def snapshot_v1(self):
+        return CancellationSnapshotV1(
+            phase=self.phase,
+            generation=self.generation,
+            observed_monotonic_ns=self.observed,
+            accepted_in_flight=0,
+            publication_ready=self.observed is not None,
+            sealed_candidate_token=self.sealed_token,
+        )
+
+    def conditional_seal_v1(self, *, expected_generation, candidate_token):
+        assert self.phase == "accepting"
+        if expected_generation != self.generation:
+            return False
+        self.sealed_token = candidate_token
+        self.phase = "sealed"
+        return True
+
+    def release_v1(self):
+        assert self.phase == "sealed"
+        self.phase = "released"
+
+
+original_zero_candidate_markdown = knowledge_ask._zero_candidate_answer_markdown_v1
+
+
+def render_zero_candidate_and_cancel(question):
+    payload = original_zero_candidate_markdown(question)
+    active = ScriptedCancellationV1.active
+    if active is not None and active.mode == "zero-render":
+        active.observed = time.monotonic_ns()
+        active.generation = 1
+    return payload
+
+
+knowledge_ask._zero_candidate_answer_markdown_v1 = render_zero_candidate_and_cancel
+commands.activate_knowledge_ask_cancellation_v1 = ScriptedCancellationV1
+""",
+        encoding="utf-8",
+    )
+
+
+def _run_with_cancellation_cutover_double(
+    knowledge_root: Path,
+    tmp_path: Path,
+    *,
+    cutover: str,
+) -> tuple[subprocess.CompletedProcess[bytes], subprocess.CompletedProcess[bytes]]:
+    site_root = tmp_path / "site"
+    _install_cancellation_cutover_double(site_root)
+    return run_both_launchers(
+        (
+            "--knowledge-data-root",
+            str(knowledge_root),
+            "knowledge",
+            "ask",
+            "what was reviewed?",
+            "--json",
+        ),
+        pythonpath_roots=(site_root, SOURCE_ROOT),
+        environment_updates={"T22_CANCELLATION_CUTOVER": cutover},
+        timeout=30.0,
+    )
+
+
+def _install_active_child_cancellation_double(site_root: Path) -> None:
+    site_root.mkdir()
+    (site_root / "sitecustomize.py").write_text(
+        """
+import os
+import sys
+import time
+from pathlib import Path
+
+import gezhi._knowledge_answerer as answerer
+import gezhi._knowledge_commands as commands
+from gezhi._codex_child_process import _run_codex_child_test_double_v1
+from gezhi._codex_role_plan import _freeze_test_double_launch_v1
+from gezhi._knowledge_cancellation import CancellationSnapshotV1
+
+
+class MarkerCancellationV1:
+    def __init__(self):
+        self.marker = Path(os.environ["T22_CANCEL_MARKER"])
+        self.observed = None
+        self.generation = 0
+        self.phase = "accepting"
+        self.sealed_token = 0
+
+    def observed_at_monotonic_ns(self):
+        if self.observed is None and self.marker.is_file():
+            self.observed = time.monotonic_ns()
+            self.generation = 1
+        return self.observed
+
+    def try_begin_work_v1(self):
+        return self.observed_at_monotonic_ns() is None
+
+    def try_answer_id_cutover_v1(self):
+        return self.observed_at_monotonic_ns() is None
+
+    def snapshot_v1(self):
+        self.observed_at_monotonic_ns()
+        return CancellationSnapshotV1(
+            phase=self.phase,
+            generation=self.generation,
+            observed_monotonic_ns=self.observed,
+            accepted_in_flight=0,
+            publication_ready=self.observed is not None,
+            sealed_candidate_token=self.sealed_token,
+        )
+
+    def conditional_seal_v1(self, *, expected_generation, candidate_token):
+        self.observed_at_monotonic_ns()
+        if expected_generation != self.generation:
+            return False
+        self.phase = "sealed"
+        self.sealed_token = candidate_token
+        return True
+
+    def release_v1(self):
+        assert self.phase == "sealed"
+        self.phase = "released"
+
+
+def run_double(request):
+    capture_parent = request.attempt_root / "captures"
+    capture = capture_parent / f"{request.attempt_ordinal:02d}"
+    staging = capture_parent / f".{request.attempt_ordinal:02d}.codex-stage"
+    final_spool = staging / ".final_message.spool"
+    plan = _freeze_test_double_launch_v1(
+        executable=Path(sys.executable),
+        arguments=(
+            "-I", "-B", os.environ["T22_CANCEL_DOUBLE"], "mark-and-hang",
+            "--final", str(final_spool), "--payload-file",
+            os.environ["T22_CANCEL_MARKER"],
+        ),
+        prompt=request.prompt,
+        attempt_ordinal=request.attempt_ordinal,
+        working_directory=request.attempt_root / "working",
+        capture_directory=capture,
+        staging_directory=staging,
+        temporary_directory=request.attempt_root / "temporary",
+        source_environment={"SystemRoot": os.environ["SystemRoot"]},
+        timeout_seconds=10,
+        capture_profile="knowledge",
+        existing_shared_deadline_monotonic_ns=(
+            request.existing_shared_deadline_monotonic_ns
+        ),
+    )
+    return _run_codex_child_test_double_v1(plan, request.cancellation)
+
+
+commands.activate_knowledge_ask_cancellation_v1 = MarkerCancellationV1
+answerer._run_role_attempt_v1 = run_double
+answerer._prepare_role_invocation_v1 = lambda: object()
+""",
+        encoding="utf-8",
+    )
+
+
+def _run_active_child_cancellation_double(
+    knowledge_root: Path,
+    tmp_path: Path,
+) -> tuple[
+    tuple[subprocess.CompletedProcess[bytes], int],
+    tuple[subprocess.CompletedProcess[bytes], int],
+]:
+    site_root = tmp_path / "site"
+    _install_active_child_cancellation_double(site_root)
+    marker = tmp_path / "child.pid"
+    attempt_container = Path(r"E:\gztest")
+    attempt_container.mkdir(parents=True, exist_ok=True)
+    runtime_root = attempt_container / ("t22-cancel-" + uuid.uuid4().hex[:12])
+    runtime_root.mkdir()
+    arguments = (
+        "--knowledge-data-root",
+        str(knowledge_root),
+        "knowledge",
+        "ask",
+        "示例结论",
+        "--json",
+    )
+    observed: list[tuple[subprocess.CompletedProcess[bytes], int]] = []
+    try:
+        for command in launcher_commands(arguments):
+            marker.unlink(missing_ok=True)
+            result = run_launcher(
+                command,
+                pythonpath_roots=(site_root, SOURCE_ROOT),
+                environment_updates={
+                    "TEMP": str(runtime_root),
+                    "TMP": str(runtime_root),
+                    "T22_CANCEL_DOUBLE": str(_CODEX_CHILD_DOUBLE),
+                    "T22_CANCEL_MARKER": str(marker),
+                },
+                timeout=30.0,
+            )
+            observed.append((result, int(marker.read_text(encoding="ascii"))))
+        return observed[0], observed[1]
+    finally:
+        resolved_runtime = runtime_root.resolve(strict=True)
+        assert resolved_runtime.parent == attempt_container.resolve(strict=True)
+        assert resolved_runtime.name.startswith("t22-cancel-")
+        shutil.rmtree(resolved_runtime)
+
+
+def _install_native_active_child_ctrl_c_double(site_root: Path) -> None:
+    site_root.mkdir()
+    (site_root / "sitecustomize.py").write_text(
+        """
+import os
+import sys
+from pathlib import Path
+
+import gezhi._knowledge_answerer as answerer
+from gezhi._codex_child_process import _run_codex_child_test_double_v1
+from gezhi._codex_role_plan import _freeze_test_double_launch_v1
+
+
+def run_double(request):
+    capture_parent = request.attempt_root / "captures"
+    capture = capture_parent / f"{request.attempt_ordinal:02d}"
+    staging = capture_parent / f".{request.attempt_ordinal:02d}.codex-stage"
+    final_spool = staging / ".final_message.spool"
+    plan = _freeze_test_double_launch_v1(
+        executable=Path(sys.executable),
+        arguments=(
+            "-I", "-B", os.environ["T22_CANCEL_DOUBLE"], "mark-and-hang",
+            "--final", str(final_spool), "--payload-file",
+            os.environ["T22_CANCEL_MARKER"],
+        ),
+        prompt=request.prompt,
+        attempt_ordinal=request.attempt_ordinal,
+        working_directory=request.attempt_root / "working",
+        capture_directory=capture,
+        staging_directory=staging,
+        temporary_directory=request.attempt_root / "temporary",
+        source_environment={"SystemRoot": os.environ["SystemRoot"]},
+        timeout_seconds=20,
+        capture_profile="knowledge",
+        existing_shared_deadline_monotonic_ns=(
+            request.existing_shared_deadline_monotonic_ns
+        ),
+    )
+    return _run_codex_child_test_double_v1(plan, request.cancellation)
+
+
+answerer._run_role_attempt_v1 = run_double
+answerer._prepare_role_invocation_v1 = lambda: object()
+""",
+        encoding="utf-8",
+    )
+
+
+def _run_active_child_native_ctrl_c(
+    knowledge_root: Path,
+    tmp_path: Path,
+) -> tuple[
+    tuple[subprocess.CompletedProcess[bytes], int],
+    tuple[subprocess.CompletedProcess[bytes], int],
+]:
+    site_root = tmp_path / "native-site"
+    _install_native_active_child_ctrl_c_double(site_root)
+    marker = tmp_path / "native-child.pid"
+    attempt_container = Path(r"E:\gztest")
+    attempt_container.mkdir(parents=True, exist_ok=True)
+    runtime_root = attempt_container / ("t22-native-cancel-" + uuid.uuid4().hex[:12])
+    runtime_root.mkdir()
+    arguments = (
+        "--knowledge-data-root",
+        str(knowledge_root),
+        "knowledge",
+        "ask",
+        "示例结论",
+        "--json",
+    )
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 0
+    observed: list[tuple[subprocess.CompletedProcess[bytes], int]] = []
+    try:
+        for command in launcher_commands(arguments):
+            marker.unlink(missing_ok=True)
+            driver = subprocess.run(
+                [
+                    str(PYTHON_EXE),
+                    "-I",
+                    "-B",
+                    str(_CTRL_C_DRIVER),
+                    str(marker),
+                    *command,
+                ],
+                cwd=REPOSITORY_ROOT,
+                env=subprocess_environment(
+                    pythonpath_roots=(site_root, SOURCE_ROOT),
+                    updates={
+                        "TEMP": str(runtime_root),
+                        "TMP": str(runtime_root),
+                        "T22_CANCEL_DOUBLE": str(_CODEX_CHILD_DOUBLE),
+                        "T22_CANCEL_MARKER": str(marker),
+                    },
+                ),
+                capture_output=True,
+                check=False,
+                timeout=45,
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+                startupinfo=startupinfo,
+            )
+            assert driver.returncode == 0, (driver.stdout + driver.stderr).decode(
+                errors="replace"
+            )
+            receipt = json.loads(driver.stdout)
+            observed.append(
+                (
+                    subprocess.CompletedProcess(
+                        command,
+                        receipt["returncode"],
+                        base64.b64decode(receipt["stdout_base64"]),
+                        base64.b64decode(receipt["stderr_base64"]),
+                    ),
+                    receipt["child_pid"],
+                )
+            )
+        return observed[0], observed[1]
+    finally:
+        resolved_runtime = runtime_root.resolve(strict=True)
+        assert resolved_runtime.parent == attempt_container.resolve(strict=True)
+        assert resolved_runtime.name.startswith("t22-native-cancel-")
+        shutil.rmtree(runtime_root)
+
+
+def _process_is_active_v1(process_id: int) -> bool:
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    open_process.restype = ctypes.c_void_p
+    wait = kernel32.WaitForSingleObject
+    wait.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    wait.restype = ctypes.c_ulong
+    close = kernel32.CloseHandle
+    close.argtypes = [ctypes.c_void_p]
+    close.restype = ctypes.c_int
+    handle = open_process(0x00100000 | 0x1000, False, process_id)
+    if handle is None:
+        return False
+    try:
+        return wait(handle, 0) == 258
+    finally:
+        assert close(handle)
+
+
+def _run_with_attempt_sequence(
+    knowledge_root: Path,
+    tmp_path: Path,
+    *,
+    scenarios: tuple[str, ...],
+) -> tuple[subprocess.CompletedProcess[bytes], subprocess.CompletedProcess[bytes]]:
+    site_root = tmp_path / "site"
+    _install_attempt_sequence_double(site_root)
+    answer_output = {
+        "answer_status": "answered",
+        "answer_units": [
+            {
+                "candidate_id": _ACTIVE_CANDIDATE_ID,
+                "text": "示例结论由该 Candidate 支持。",
+            }
+        ],
+        "insufficiency_reason": None,
+        "qualification_units": [],
+        "schema_version": "gezhi.answer_output.v1",
+    }
+    final_path = tmp_path / "answer-output.json"
+    final_path.write_bytes(_canonical_json_line(answer_output))
+    message_path = tmp_path / "provider-message.txt"
+    message_path.write_text("HTTP 429 rate limit; retry this request", encoding="utf-8")
+    attempt_container = Path(r"E:\gztest")
+    attempt_container.mkdir(parents=True, exist_ok=True)
+    runtime_root = attempt_container / ("t22-" + uuid.uuid4().hex[:12])
+    runtime_root.mkdir()
+    try:
+        return run_both_launchers(
+            (
+                "--knowledge-data-root",
+                str(knowledge_root),
+                "knowledge",
+                "ask",
+                "示例结论",
+                "--json",
+            ),
+            pythonpath_roots=(site_root, SOURCE_ROOT),
+            environment_updates={
+                "TEMP": str(runtime_root),
+                "TMP": str(runtime_root),
+                "T22_DOUBLE_EXE": str(_CODEX_CHILD_DOUBLE),
+                "T22_DOUBLE_FINAL": str(final_path),
+                "T22_DOUBLE_MESSAGE": str(message_path),
+                "T22_DOUBLE_SCENARIOS": ",".join(scenarios),
+            },
+            timeout=30.0,
+        )
+    finally:
+        resolved_runtime = runtime_root.resolve(strict=True)
+        assert resolved_runtime.parent == attempt_container.resolve(strict=True)
+        assert resolved_runtime.name.startswith("t22-")
         shutil.rmtree(resolved_runtime)
 
 
@@ -1008,12 +1547,12 @@ def test_ask_commits_a_candidate_backed_citable_answer(
         assert manifest["error"] is None
         assert len(manifest["attempts"]) == 1
         assert manifest["attempts"][0]["failure_class"] is None
-        assert manifest["attempts"][0]["usage_unavailable"] is True
+        assert manifest["attempts"][0]["usage_unavailable"] is False
         assert manifest["usage_totals"] == {
-            "cached_input_tokens": None,
-            "input_tokens": None,
-            "output_tokens": None,
-            "reasoning_output_tokens": None,
+            "cached_input_tokens": 0,
+            "input_tokens": 10,
+            "output_tokens": 20,
+            "reasoning_output_tokens": 5,
         }
         assert (committed / "answer_output.json").read_bytes() == (
             _canonical_json_line(answer_output)
@@ -1306,3 +1845,353 @@ def test_ask_separates_citation_link_construction_from_generic_rendering_failure
             "code": "citation_link_construction_failed",
             "stage": "rendering",
         }
+
+
+def test_ask_retries_two_timeouts_with_fresh_attempts_then_succeeds(
+    active_knowledge_ask_root: Path,
+    tmp_path: Path,
+) -> None:
+    results = _run_with_attempt_sequence(
+        active_knowledge_ask_root,
+        tmp_path,
+        scenarios=("timeout", "timeout", "success"),
+    )
+
+    for result in results:
+        assert result.returncode == 0, (result.stdout + result.stderr).decode(
+            errors="replace"
+        )
+        envelope = json.loads(result.stdout)
+        answer_id = envelope["result"]["answer_id"]
+        committed = active_knowledge_ask_root / "answers" / answer_id
+        manifest = json.loads((committed / "manifest.json").read_bytes())
+        assert manifest["status"] == "succeeded"
+        assert [attempt["failure_class"] for attempt in manifest["attempts"]] == [
+            "timeout",
+            "timeout",
+            None,
+        ]
+        assert [path.name for path in sorted((committed / "attempts").iterdir())] == [
+            "01",
+            "02",
+            "03",
+        ]
+        assert manifest["attempts"][2]["input_tokens"] == 10
+        assert manifest["attempts"][2]["cached_input_tokens"] == 0
+        assert manifest["attempts"][2]["output_tokens"] == 20
+        assert manifest["attempts"][2]["reasoning_output_tokens"] == 5
+        assert manifest["usage_totals"] == {
+            "cached_input_tokens": None,
+            "input_tokens": None,
+            "output_tokens": None,
+            "reasoning_output_tokens": None,
+        }
+
+
+def test_ask_commits_timeout_exhaustion_after_three_real_attempts(
+    active_knowledge_ask_root: Path,
+    tmp_path: Path,
+) -> None:
+    results = _run_with_attempt_sequence(
+        active_knowledge_ask_root,
+        tmp_path,
+        scenarios=("timeout", "timeout", "timeout"),
+    )
+
+    for result in results:
+        assert result.returncode == 2, (result.stdout + result.stderr).decode(
+            errors="replace"
+        )
+        envelope = json.loads(result.stdout)
+        assert envelope["outcome"] == "blocked"
+        assert envelope["diagnostics"] == [
+            {"code": "knowledge.ask.codex_timeout_exhausted.v1", "context": {}}
+        ]
+        answer_id = envelope["result"]["answer_id"]
+        committed = active_knowledge_ask_root / "answers" / answer_id
+        manifest = json.loads((committed / "manifest.json").read_bytes())
+        assert manifest["error"] == {
+            "code": "codex_timeout_exhausted",
+            "stage": "synthesis",
+        }
+        assert [attempt["failure_class"] for attempt in manifest["attempts"]] == [
+            "timeout",
+            "timeout",
+            "timeout",
+        ]
+        assert not (committed / "answer_output.json").exists()
+        assert not (committed / "answer.md").exists()
+
+
+def test_ask_does_not_retry_a_human_only_provider_error_classification(
+    active_knowledge_ask_root: Path,
+    tmp_path: Path,
+) -> None:
+    results = _run_with_attempt_sequence(
+        active_knowledge_ask_root,
+        tmp_path,
+        scenarios=("provider-error", "success"),
+    )
+
+    for result in results:
+        assert result.returncode == 1, (result.stdout + result.stderr).decode(
+            errors="replace"
+        )
+        envelope = json.loads(result.stdout)
+        assert envelope["outcome"] == "failed"
+        assert envelope["diagnostics"] == [
+            {"code": "knowledge.ask.codex_process_failed.v1", "context": {}}
+        ]
+        answer_id = envelope["result"]["answer_id"]
+        committed = active_knowledge_ask_root / "answers" / answer_id
+        manifest = json.loads((committed / "manifest.json").read_bytes())
+        assert len(manifest["attempts"]) == 1
+        assert manifest["attempts"][0]["failure_class"] == "process_error"
+
+
+def test_ask_commits_the_exact_final_overflow_prefix_without_retry(
+    active_knowledge_ask_root: Path,
+    tmp_path: Path,
+) -> None:
+    results = _run_with_attempt_sequence(
+        active_knowledge_ask_root,
+        tmp_path,
+        scenarios=("final-overflow", "success"),
+    )
+
+    for result in results:
+        assert result.returncode == 1, (result.stdout + result.stderr).decode(
+            errors="replace"
+        )
+        envelope = json.loads(result.stdout)
+        assert envelope["diagnostics"] == [
+            {"code": "knowledge.ask.codex_process_failed.v1", "context": {}},
+            {
+                "code": "knowledge.ask.capture_overflow.v1",
+                "context": {"channels": ["final_message"]},
+            },
+        ]
+        answer_id = envelope["result"]["answer_id"]
+        committed = active_knowledge_ask_root / "answers" / answer_id
+        manifest = json.loads((committed / "manifest.json").read_bytes())
+        assert len(manifest["attempts"]) == 1
+        assert manifest["attempts"][0]["failure_class"] == "process_error"
+        assert (
+            committed / "attempts" / "01" / "final_message.txt"
+        ).read_bytes() == b"f" * 1_048_576
+
+
+def test_ask_ctrl_c_before_answer_id_returns_no_commit_interruption(
+    zero_active_knowledge_ask_root: Path,
+    tmp_path: Path,
+) -> None:
+    results = _run_with_cancellation_cutover_double(
+        zero_active_knowledge_ask_root,
+        tmp_path,
+        cutover="pre-id",
+    )
+
+    for result in results:
+        assert result.returncode == 130, (result.stdout + result.stderr).decode(
+            errors="replace"
+        )
+        assert json.loads(result.stdout) == {
+            "command": "knowledge.ask",
+            "diagnostics": [
+                {
+                    "code": "knowledge.ask.user_interrupted_before_answer.v1",
+                    "context": {},
+                }
+            ],
+            "outcome": "interrupted",
+            "result": None,
+            "schema_version": "gezhi.cli_result.v1",
+        }
+    answers = zero_active_knowledge_ask_root / "answers"
+    assert not answers.exists() or not tuple(
+        path for path in answers.iterdir() if path.name != ".staging"
+    )
+
+
+def test_ask_ctrl_c_after_answer_id_commits_one_interrupted_p2_prefix(
+    zero_active_knowledge_ask_root: Path,
+    tmp_path: Path,
+) -> None:
+    results = _run_with_cancellation_cutover_double(
+        zero_active_knowledge_ask_root,
+        tmp_path,
+        cutover="post-id",
+    )
+
+    observed_ids: set[str] = set()
+    for result in results:
+        assert result.returncode == 130, (result.stdout + result.stderr).decode(
+            errors="replace"
+        )
+        envelope = json.loads(result.stdout)
+        assert envelope["outcome"] == "interrupted"
+        assert envelope["diagnostics"] == [
+            {"code": "knowledge.ask.user_interrupted.v1", "context": {}}
+        ]
+        answer_id = envelope["result"]["answer_id"]
+        assert envelope["result"]["answer_output"] is None
+        observed_ids.add(answer_id)
+        committed = zero_active_knowledge_ask_root / "answers" / answer_id
+        manifest = json.loads((committed / "manifest.json").read_bytes())
+        assert manifest["status"] == "interrupted"
+        assert manifest["error"] is None
+        assert manifest["attempts"] == []
+        assert [asset["path"] for asset in manifest["assets"]] == [
+            "effective_config.json",
+            "question.json",
+            "retrieval_query.json",
+        ]
+        assert not (committed / "retrieval_audit.json").exists()
+        assert not (committed / "retrieval_view.json").exists()
+        assert not (committed / "answer_output.json").exists()
+        assert not (committed / "answer.md").exists()
+    assert len(observed_ids) == 2
+
+
+def test_ask_ctrl_c_before_retrieval_commits_one_interrupted_p2_prefix(
+    zero_active_knowledge_ask_root: Path,
+    tmp_path: Path,
+) -> None:
+    results = _run_with_cancellation_cutover_double(
+        zero_active_knowledge_ask_root,
+        tmp_path,
+        cutover="pre-retrieval",
+    )
+
+    observed_ids: set[str] = set()
+    for result in results:
+        assert result.returncode == 130, (result.stdout + result.stderr).decode(
+            errors="replace"
+        )
+        envelope = json.loads(result.stdout)
+        assert envelope["outcome"] == "interrupted"
+        assert envelope["diagnostics"] == [
+            {"code": "knowledge.ask.user_interrupted.v1", "context": {}}
+        ]
+        answer_id = envelope["result"]["answer_id"]
+        assert envelope["result"]["answer_output"] is None
+        observed_ids.add(answer_id)
+        committed = zero_active_knowledge_ask_root / "answers" / answer_id
+        manifest = json.loads((committed / "manifest.json").read_bytes())
+        assert manifest["status"] == "interrupted"
+        assert manifest["error"] is None
+        assert manifest["attempts"] == []
+        assert [asset["path"] for asset in manifest["assets"]] == [
+            "effective_config.json",
+            "question.json",
+            "retrieval_query.json",
+        ]
+        assert not (committed / "retrieval_audit.json").exists()
+        assert not (committed / "retrieval_view.json").exists()
+        assert not (committed / "answer_output.json").exists()
+        assert not (committed / "answer.md").exists()
+    assert len(observed_ids) == 2
+
+
+def test_ask_ctrl_c_during_zero_candidate_render_commits_interrupted_p4_prefix(
+    zero_active_knowledge_ask_root: Path,
+    tmp_path: Path,
+) -> None:
+    results = _run_with_cancellation_cutover_double(
+        zero_active_knowledge_ask_root,
+        tmp_path,
+        cutover="zero-render",
+    )
+
+    observed_ids: set[str] = set()
+    for result in results:
+        assert result.returncode == 130, (result.stdout + result.stderr).decode(
+            errors="replace"
+        )
+        envelope = json.loads(result.stdout)
+        assert envelope["outcome"] == "interrupted"
+        assert envelope["diagnostics"] == [
+            {"code": "knowledge.ask.user_interrupted.v1", "context": {}}
+        ]
+        answer_id = envelope["result"]["answer_id"]
+        observed_ids.add(answer_id)
+        committed = zero_active_knowledge_ask_root / "answers" / answer_id
+        manifest = json.loads((committed / "manifest.json").read_bytes())
+        assert manifest["status"] == "interrupted"
+        assert manifest["error"] is None
+        assert manifest["attempts"] == []
+        assert [asset["path"] for asset in manifest["assets"]] == [
+            "effective_config.json",
+            "question.json",
+            "retrieval_audit.json",
+            "retrieval_query.json",
+            "retrieval_view.json",
+        ]
+        assert not (committed / "answer_output.json").exists()
+        assert not (committed / "answer.md").exists()
+    assert len(observed_ids) == 2
+
+
+def test_ask_ctrl_c_stops_the_active_codex_job_and_keeps_partial_capture(
+    active_knowledge_ask_root: Path,
+    tmp_path: Path,
+) -> None:
+    results = _run_active_child_cancellation_double(
+        active_knowledge_ask_root,
+        tmp_path,
+    )
+
+    for result, process_id in results:
+        assert result.returncode == 130, (result.stdout + result.stderr).decode(
+            errors="replace"
+        )
+        envelope = json.loads(result.stdout)
+        assert envelope["outcome"] == "interrupted"
+        assert envelope["diagnostics"] == [
+            {"code": "knowledge.ask.user_interrupted.v1", "context": {}}
+        ]
+        answer_id = envelope["result"]["answer_id"]
+        committed = active_knowledge_ask_root / "answers" / answer_id
+        manifest = json.loads((committed / "manifest.json").read_bytes())
+        assert manifest["status"] == "interrupted"
+        assert manifest["error"] is None
+        assert len(manifest["attempts"]) == 1
+        assert manifest["attempts"][0]["failure_class"] == "interrupted"
+        assert (
+            committed / "attempts" / "01" / "events.jsonl"
+        ).read_bytes() == b'{"type":"double.started"}\n'
+        assert (committed / "attempts" / "01" / "final_message.txt").read_bytes() == b""
+        assert not _process_is_active_v1(process_id)
+
+
+def test_real_ctrl_c_stops_the_active_codex_job_through_both_launchers(
+    active_knowledge_ask_root: Path,
+    tmp_path: Path,
+) -> None:
+    results = _run_active_child_native_ctrl_c(
+        active_knowledge_ask_root,
+        tmp_path,
+    )
+
+    for result, process_id in results:
+        assert result.returncode == 130, (result.stdout + result.stderr).decode(
+            errors="replace"
+        )
+        assert result.stderr == b""
+        envelope = json.loads(result.stdout)
+        assert envelope["outcome"] == "interrupted"
+        assert envelope["diagnostics"] == [
+            {"code": "knowledge.ask.user_interrupted.v1", "context": {}}
+        ]
+        answer_id = envelope["result"]["answer_id"]
+        committed = active_knowledge_ask_root / "answers" / answer_id
+        manifest = json.loads((committed / "manifest.json").read_bytes())
+        assert manifest["status"] == "interrupted"
+        assert manifest["error"] is None
+        assert len(manifest["attempts"]) == 1
+        assert manifest["attempts"][0]["failure_class"] == "interrupted"
+        assert (
+            committed / "attempts" / "01" / "events.jsonl"
+        ).read_bytes() == b'{"type":"double.started"}\n'
+        assert (committed / "attempts" / "01" / "final_message.txt").read_bytes() == b""
+        assert not _process_is_active_v1(process_id)

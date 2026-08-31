@@ -107,6 +107,15 @@ def _events_then_hang() -> None:
     threading.Event().wait()
 
 
+def _mark_and_hang(marker_path: Path) -> None:
+    sys.stdin.buffer.read()
+    _write_all(1, b'{"type":"double.started"}\n')
+    marker_staging = marker_path.with_name(marker_path.name + ".tmp")
+    marker_staging.write_text(str(os.getpid()), encoding="ascii")
+    os.replace(marker_staging, marker_path)
+    threading.Event().wait()
+
+
 def _events_bytes_then_hang(length: int) -> None:
     sys.stdin.buffer.read()
     remaining = length
@@ -331,6 +340,7 @@ def main() -> None:
             "events-bytes",
             "events-overflow-hang",
             "events-then-hang",
+            "mark-and-hang",
             "final-bytes",
             "final-overflow-hang",
             "stderr-flood",
@@ -377,6 +387,10 @@ def main() -> None:
         _events_bytes_then_hang(args.value)
     if args.scenario == "events-then-hang":
         _events_then_hang()
+    if args.scenario == "mark-and-hang":
+        if args.payload_file is None:
+            parser.error("mark-and-hang requires --payload-file")
+        _mark_and_hang(args.payload_file)
     if args.scenario == "final-bytes":
         _final_bytes(args.value, args.final)
     if args.scenario == "final-overflow-hang":

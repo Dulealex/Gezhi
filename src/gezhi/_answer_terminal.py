@@ -11,6 +11,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, TypeAlias, cast
 
+from gezhi._knowledge_attempt_events import (
+    KNOWLEDGE_ATTEMPT_EVENTS_CAP_V1,
+    parse_knowledge_attempt_events_v1,
+    project_knowledge_attempt_usage_v1,
+)
 from gezhi._windows_data_root import (
     DataRootOpenErrorV1,
     ValidatedDataRootV1,
@@ -31,6 +36,7 @@ _UTC_MILLISECONDS = re.compile(
     r"[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$"
 )
 _GIT_REVISION = re.compile(r"^[0-9a-f]{40}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _INT64_MAX = 9_223_372_036_854_775_807
 
 ANSWER_MANIFEST_MAX_BYTES = 65_536
@@ -88,7 +94,7 @@ _ROOT_ASSET_SPECS = (
     ),
 )
 
-_ATTEMPT_EVENTS_CAP = 16_777_216
+_ATTEMPT_EVENTS_CAP = KNOWLEDGE_ATTEMPT_EVENTS_CAP_V1
 _ATTEMPT_FINAL_CAP = 1_048_576
 _ERROR_MATRIX = {
     "fts5_unavailable": ("blocked", "retrieval"),
@@ -180,9 +186,9 @@ class AnswerPublishRequestV1:
     started_monotonic_ns: int
     provenance: Mapping[str, object]
     effective_config_bytes: bytes
-    question_bytes: bytes
-    retrieval_query_bytes: bytes
-    retrieval_audit_bytes: bytes
+    question_bytes: bytes | None
+    retrieval_query_bytes: bytes | None
+    retrieval_audit_bytes: bytes | None
     retrieval_view_bytes: bytes | None
     status: Literal["succeeded", "blocked", "failed", "interrupted"] = "succeeded"
     error: Mapping[str, object] | None = None
@@ -492,6 +498,215 @@ def _validate_attempt_record_v1(record: Mapping[str, object]) -> dict[str, objec
     return dict(record)
 
 
+def _validate_retrieval_view_measurement_v1(
+    value: object,
+) -> dict[str, object]:
+    if type(value) is not dict or set(value) != {
+        "byte_length",
+        "limit_bytes",
+        "sha256",
+        "status",
+    }:
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer Retrieval View measurement is invalid"
+        )
+    byte_length = value["byte_length"]
+    status = value["status"]
+    if (
+        type(byte_length) is not int
+        or not 0 <= byte_length <= _INT64_MAX
+        or type(value["limit_bytes"]) is not int
+        or value["limit_bytes"] != 262_144
+        or type(value["sha256"]) is not str
+        or _SHA256.fullmatch(value["sha256"]) is None
+        or type(status) is not str
+        or status not in {"within_limit", "too_large"}
+        or status == "within_limit"
+        and byte_length > 262_144
+        or status == "too_large"
+        and byte_length <= 262_144
+    ):
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer Retrieval View measurement is invalid"
+        )
+    return dict(value)
+
+
+def _validate_attempt_evidence_v1(
+    record: Mapping[str, object],
+    events: bytes,
+) -> None:
+    if (
+        len(events) == _ATTEMPT_EVENTS_CAP
+        and record["failure_class"] == "process_error"
+    ):
+        records: tuple[dict[str, object], ...] = ()
+        events_valid = True
+    else:
+        records, events_valid = parse_knowledge_attempt_events_v1(events)
+    projected = project_knowledge_attempt_usage_v1(
+        events,
+        records,
+        events_valid=events_valid,
+    )
+    if not events_valid and record["failure_class"] != "process_error":
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer attempt events differ from failure class"
+        )
+    has_completed = any(record.get("type") == "turn.completed" for record in records)
+    has_provider_failure = any(
+        record.get("type") in {"turn.failed", "error"} for record in records
+    )
+    if record["failure_class"] is None and (
+        not events_valid or not has_completed or has_provider_failure
+    ):
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer attempt events differ from failure class"
+        )
+    recorded = tuple(
+        record[name]
+        for name in (
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+        )
+    )
+    if recorded != projected:
+        raise AnswerTerminalRequestInvalidV1("Answer attempt usage differs from events")
+
+
+def _validate_attempt_terminal_matrix_v1(
+    *,
+    status: str,
+    error: dict[str, object] | None,
+    candidate_count: int | None,
+    attempts: list[dict[str, object]],
+) -> None:
+    error_code = None if error is None else error.get("code")
+    if not attempts:
+        legacy_transient_error = error_code in {
+            "codex_network_exhausted",
+            "codex_rate_limit_exhausted",
+            "codex_server_error_exhausted",
+            "codex_transient_exhausted",
+        }
+        attempt_required = error_code in {
+            "codex_timeout_exhausted",
+            "codex_process_failed",
+        } or (
+            candidate_count != 0
+            and error_code
+            in {
+                "answer_output_invalid",
+                "citation_link_construction_failed",
+                "answer_rendering_failed",
+            }
+        )
+        if legacy_transient_error or attempt_required:
+            raise AnswerTerminalRequestInvalidV1(
+                "Answer terminal matrix rejects the no-attempt cause"
+            )
+        return
+    if candidate_count is None or candidate_count <= 0:
+        raise AnswerTerminalRequestInvalidV1("Answer terminal matrix has no Candidate")
+    failure_classes = tuple(attempt["failure_class"] for attempt in attempts)
+    if any(
+        failure_class not in {None, "timeout", "process_error", "interrupted"}
+        for failure_class in failure_classes
+    ) or any(failure_class != "timeout" for failure_class in failure_classes[:-1]):
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer terminal matrix has an invalid attempt sequence"
+        )
+    last_failure = failure_classes[-1]
+    valid = False
+    if status == "succeeded":
+        valid = last_failure is None
+    elif status == "interrupted":
+        valid = last_failure in {None, "interrupted"} or (
+            last_failure == "timeout" and len(failure_classes) < 3
+        )
+    elif error_code == "codex_timeout_exhausted":
+        valid = last_failure == "timeout"
+    elif error_code == "codex_process_failed":
+        valid = last_failure == "process_error"
+    elif error_code in {
+        "answer_output_invalid",
+        "citation_link_construction_failed",
+        "answer_rendering_failed",
+    }:
+        valid = last_failure is None
+    if not valid:
+        raise AnswerTerminalRequestInvalidV1(
+            "Answer terminal matrix differs from its attempts"
+        )
+
+
+def _validate_root_terminal_matrix_v1(
+    *,
+    status: str,
+    error: dict[str, object] | None,
+    prefix_level: int,
+    has_call_pair: bool,
+    candidate_count: int | None,
+    attempt_count: int,
+) -> None:
+    error_code = None if error is None else error.get("code")
+    no_synthesis = not has_call_pair and candidate_count is None and attempt_count == 0
+    zero_candidate = (
+        prefix_level == 4
+        and not has_call_pair
+        and candidate_count == 0
+        and attempt_count == 0
+    )
+    nonzero_without_call = (
+        prefix_level == 4
+        and not has_call_pair
+        and candidate_count is not None
+        and 1 <= candidate_count <= 12
+        and attempt_count == 0
+    )
+    nonzero_with_call = (
+        prefix_level == 4
+        and has_call_pair
+        and candidate_count is not None
+        and 1 <= candidate_count <= 12
+    )
+
+    valid = False
+    if status == "succeeded":
+        valid = zero_candidate or (nonzero_with_call and 1 <= attempt_count <= 3)
+    elif status == "interrupted":
+        valid = (
+            0 <= prefix_level <= 3
+            and no_synthesis
+            or zero_candidate
+            or nonzero_without_call
+            or nonzero_with_call
+            and 0 <= attempt_count <= 3
+        )
+    elif error_code in {"fts5_unavailable", "retrieval_query_failed"}:
+        valid = prefix_level == 2 and no_synthesis
+    elif error_code == "retrieval_view_too_large":
+        valid = prefix_level == 3 and no_synthesis
+    elif error_code == "retrieval_materialization_failed":
+        valid = 0 <= prefix_level <= 3 and no_synthesis
+    elif error_code == "synthesis_input_invalid":
+        valid = nonzero_without_call
+    elif error_code == "codex_runtime_unavailable":
+        valid = nonzero_with_call and attempt_count == 0
+    elif error_code in {"codex_timeout_exhausted", "codex_process_failed"}:
+        valid = nonzero_with_call and 1 <= attempt_count <= 3
+    elif error_code in {
+        "answer_output_invalid",
+        "citation_link_construction_failed",
+        "answer_rendering_failed",
+    }:
+        valid = zero_candidate or (nonzero_with_call and 1 <= attempt_count <= 3)
+    if not valid:
+        raise AnswerTerminalRequestInvalidV1("Answer root terminal matrix differs")
+
+
 def _validate_utf8_text_asset_v1(payload: bytes, *, label: str) -> None:
     if payload.startswith(b"\xef\xbb\xbf") or not payload.endswith(b"\n"):
         raise AnswerTerminalRequestInvalidV1(f"{label} framing is invalid")
@@ -514,6 +729,24 @@ def _request_assets(
         request.answer_markdown_bytes is None
     ):
         raise AnswerTerminalRequestInvalidV1("Answer result pair is partial")
+    stage_prefix = (
+        request.effective_config_bytes,
+        request.question_bytes,
+        request.retrieval_query_bytes,
+        request.retrieval_audit_bytes,
+        request.retrieval_view_bytes,
+    )
+    if type(stage_prefix[0]) is not bytes:
+        raise AnswerTerminalRequestInvalidV1("Answer effective configuration is absent")
+    missing_seen = False
+    for payload in stage_prefix:
+        if payload is None:
+            missing_seen = True
+        elif missing_seen:
+            raise AnswerTerminalRequestInvalidV1(
+                "Answer root asset stage prefix is discontinuous"
+            )
+    prefix_level = sum(payload is not None for payload in stage_prefix) - 1
     payload_by_path: dict[str, bytes | None] = {
         "effective_config.json": request.effective_config_bytes,
         "question.json": request.question_bytes,
@@ -560,12 +793,13 @@ def _request_assets(
             _validate_utf8_text_asset_v1(payload, label=path)
         assets.append((path, payload, identity_key, identity_value, cap))
 
-    audit = decoded["retrieval_audit.json"]
-    measurement = audit.get("retrieval_view_measurement")
-    if type(measurement) is not dict:
-        raise AnswerTerminalRequestInvalidV1(
-            "Answer Retrieval View measurement is invalid"
-        )
+    audit = decoded.get("retrieval_audit.json")
+    measurement: dict[str, object] | None
+    if audit is None:
+        measurement = None
+    else:
+        raw_measurement = audit.get("retrieval_view_measurement")
+        measurement = _validate_retrieval_view_measurement_v1(raw_measurement)
     view = decoded.get("retrieval_view.json")
     candidate_count: int | None = None
     if request.retrieval_view_bytes is not None:
@@ -581,13 +815,29 @@ def _request_assets(
             raise AnswerTerminalRequestInvalidV1(
                 "Answer Retrieval View measurement differs"
             )
-    elif measurement.get("status") != "too_large":
-        raise AnswerTerminalRequestInvalidV1(
-            "Missing Retrieval View is not an over-limit branch"
+    elif measurement is not None:
+        materialization_failed = (
+            request.status == "failed"
+            and type(request.error) is dict
+            and request.error.get("code") == "retrieval_materialization_failed"
         )
+        if not (
+            request.status == "interrupted"
+            or materialization_failed
+            and measurement.get("status") == "within_limit"
+            or not materialization_failed
+            and measurement.get("status") == "too_large"
+        ):
+            raise AnswerTerminalRequestInvalidV1(
+                "Missing Retrieval View has an invalid measurement cause"
+            )
 
     if request.status == "succeeded":
-        if request.error is not None or request.answer_output_bytes is None:
+        if (
+            request.error is not None
+            or request.answer_output_bytes is None
+            or candidate_count is None
+        ):
             raise AnswerTerminalRequestInvalidV1(
                 "Succeeded Answer terminal presence is invalid"
             )
@@ -645,6 +895,7 @@ def _request_assets(
             request.retrieval_view_bytes is not None
             or has_call_pair
             or request.attempts
+            or type(measurement) is not dict
             or measurement.get("status") != "too_large"
         )
     ):
@@ -666,6 +917,7 @@ def _request_assets(
             raise AnswerTerminalRequestInvalidV1(
                 "Answer attempt capture capacity is invalid"
             )
+        _validate_attempt_evidence_v1(record, attempt.events_bytes)
         prefix = f"attempts/{ordinal:02d}"
         assets.extend(
             (
@@ -686,6 +938,20 @@ def _request_assets(
             )
         )
         attempt_records.append(record)
+    _validate_root_terminal_matrix_v1(
+        status=request.status,
+        error=error,
+        prefix_level=prefix_level,
+        has_call_pair=has_call_pair,
+        candidate_count=candidate_count,
+        attempt_count=len(attempt_records),
+    )
+    _validate_attempt_terminal_matrix_v1(
+        status=request.status,
+        error=error,
+        candidate_count=candidate_count,
+        attempts=attempt_records,
+    )
     return tuple(assets), tuple(attempt_records)
 
 

@@ -68,9 +68,7 @@ class _LatchedCancellation:
     def trigger(self, observed_at_ns: int | None = None) -> None:
         assert self._observed_at_ns is None
         self._observed_at_ns = (
-            time.monotonic_ns()
-            if observed_at_ns is None
-            else observed_at_ns
+            time.monotonic_ns() if observed_at_ns is None else observed_at_ns
         )
 
     def observed_at_monotonic_ns(self) -> int | None:
@@ -100,6 +98,17 @@ class _FaultOnCancellationObservation:
         self.calls += 1
         if self.calls == self._fault_call:
             raise RuntimeError("injected cancellation observation fault")
+
+
+class _KeyboardInterruptOnCancellationObservation:
+    def __init__(self, call: int) -> None:
+        self._interrupt_call = call
+        self.calls = 0
+
+    def observed_at_monotonic_ns(self) -> None:
+        self.calls += 1
+        if self.calls == self._interrupt_call:
+            raise KeyboardInterrupt
 
 
 class _FaultAfterCaptureInstall:
@@ -285,7 +294,12 @@ def test_measured_pipe_capacities_prove_bidirectional_backpressure(
 ) -> None:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     create_event = kernel32.CreateEventW
-    create_event.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_wchar_p]
+    create_event.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_wchar_p,
+    ]
     create_event.restype = ctypes.c_void_p
     set_event = kernel32.SetEvent
     set_event.argtypes = [ctypes.c_void_p]
@@ -509,10 +523,7 @@ def test_literature_active_final_overflow_stops_before_its_deadline(
 
     assert time.monotonic() - started < 5
     assert evidence.final_message is not None
-    assert (
-        evidence.final_message.byte_length
-        == LITERATURE_FINAL_CAPTURE_CAP_V1
-    )
+    assert evidence.final_message.byte_length == LITERATURE_FINAL_CAPTURE_CAP_V1
     assert evidence.final_message.overflow
     assert evidence.stop_calls == 1
     assert evidence.mechanical_outcome == "process_error"
@@ -568,10 +579,7 @@ def test_literature_final_overflow_retains_the_exact_prefix(
     evidence = run_codex_child_v1(plan, NeverCancelledV1())
 
     assert evidence.final_message is not None
-    assert (
-        evidence.final_message.byte_length
-        == LITERATURE_FINAL_CAPTURE_CAP_V1
-    )
+    assert evidence.final_message.byte_length == LITERATURE_FINAL_CAPTURE_CAP_V1
     assert evidence.final_message.overflow is overflow
     assert evidence.mechanical_outcome == ("process_error" if overflow else "clean")
 
@@ -581,12 +589,7 @@ def test_stdout_chunk_boundaries_do_not_change_raw_bytes(tmp_path: Path) -> None
 
     evidence = run_codex_child_v1(plan, NeverCancelledV1())
 
-    expected = (
-        b"a"
-        + (b"b" * 65_535)
-        + (b"c" * 65_536)
-        + (b"d" * 65_537)
-    )
+    expected = b"a" + (b"b" * 65_535) + (b"c" * 65_536) + (b"d" * 65_537)
     assert evidence.events.path.read_bytes() == expected
     assert evidence.mechanical_outcome == "clean"
 
@@ -656,8 +659,7 @@ def test_inheritable_handles_outside_the_allowlist_are_unavailable(
     wait_for_single_object.restype = ctypes.c_ulong
     security = SecurityAttributes(ctypes.sizeof(SecurityAttributes), None, True)
     sentinels = tuple(
-        int(create_event(ctypes.byref(security), True, False, None))
-        for _ in range(8)
+        int(create_event(ctypes.byref(security), True, False, None)) for _ in range(8)
     )
     assert all(sentinels)
     arguments = tuple(
@@ -742,9 +744,7 @@ def test_latched_cancellation_stops_a_proven_pending_stdin_writer(
     def observe_close(handle) -> None:  # type: ignore[no-untyped-def]
         if (
             handle.label == "stdin-write"
-            and not threading.current_thread().name.startswith(
-                "gezhi-codex-stdin-"
-            )
+            and not threading.current_thread().name.startswith("gezhi-codex-stdin-")
         ):
             wrong_owner_closes.append(threading.current_thread().name)
         real_close(handle)
@@ -823,6 +823,188 @@ def test_final_precommit_gate_fault_rolls_back_without_an_attempt(
     assert not Path(plan.staging_directory).exists()
 
 
+@pytest.mark.parametrize("boundary", ["utc", "monotonic", "cancellation"])
+def test_final_precommit_keyboard_interrupt_rolls_back_and_reraises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    plan = _plan(tmp_path, "success")
+    cancellation: object = NeverCancelledV1()
+    ledger_counts: list[int] = []
+    real_count = child_process._ResourceLedger.count
+
+    def interrupt(*_args: object) -> None:
+        raise KeyboardInterrupt
+
+    def observe_count(ledger):  # type: ignore[no-untyped-def]
+        count = real_count(ledger)
+        ledger_counts.append(count)
+        return count
+
+    monkeypatch.setattr(child_process._ResourceLedger, "count", observe_count)
+    if boundary == "utc":
+        monkeypatch.setattr(child_process, "_utc_now", interrupt)
+    elif boundary == "monotonic":
+        monkeypatch.setattr(child_process, "_monotonic_now_ns_v1", interrupt)
+    else:
+        cancellation = _KeyboardInterruptOnCancellationObservation(1)
+
+    with pytest.raises(KeyboardInterrupt):
+        run_codex_child_v1(plan, cancellation)  # type: ignore[arg-type]
+
+    assert ledger_counts[-1] == 0
+    assert not Path(plan.capture_directory).exists()
+    assert not Path(plan.staging_directory).exists()
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    (
+        "cancellation",
+        "monotonic",
+        "create",
+        "attribute-delete",
+        "adoption",
+        "assignment",
+        "resume",
+    ),
+)
+def test_committed_keyboard_interrupt_settles_and_reraises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    plan = _plan(tmp_path, "success", timeout_seconds=10)
+    cancellation: object = NeverCancelledV1()
+    ledger_counts: list[int] = []
+    real_count = child_process._ResourceLedger.count
+
+    def interrupt(*_args: object) -> None:
+        raise KeyboardInterrupt
+
+    def observe_count(ledger):  # type: ignore[no-untyped-def]
+        count = real_count(ledger)
+        ledger_counts.append(count)
+        return count
+
+    monkeypatch.setattr(child_process._ResourceLedger, "count", observe_count)
+    if boundary == "cancellation":
+        cancellation = _KeyboardInterruptOnCancellationObservation(2)
+    elif boundary == "monotonic":
+        real_clock = child_process._monotonic_now_ns_v1
+        clock_calls = 0
+
+        def interrupt_second_clock() -> int:
+            nonlocal clock_calls
+            clock_calls += 1
+            if clock_calls == 2:
+                raise KeyboardInterrupt
+            return real_clock()
+
+        monkeypatch.setattr(
+            child_process,
+            "_monotonic_now_ns_v1",
+            interrupt_second_clock,
+        )
+    elif boundary == "create":
+        monkeypatch.setattr(child_process, "_CREATE_PROCESS", interrupt)
+    elif boundary == "attribute-delete":
+        real_delete = child_process._AttributeList.delete
+        interrupted = False
+
+        def delete_then_interrupt(attribute_list):  # type: ignore[no-untyped-def]
+            nonlocal interrupted
+            real_delete(attribute_list)
+            if not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr(
+            child_process._AttributeList,
+            "delete",
+            delete_then_interrupt,
+        )
+    elif boundary == "adoption":
+        monkeypatch.setattr(child_process._OwnedHandle, "activate", interrupt)
+    elif boundary == "assignment":
+        monkeypatch.setattr(
+            child_process,
+            "_ASSIGN_PROCESS_TO_JOB_OBJECT",
+            interrupt,
+        )
+    else:
+        monkeypatch.setattr(child_process, "_RESUME_THREAD", interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        run_codex_child_v1(plan, cancellation)  # type: ignore[arg-type]
+
+    assert ledger_counts[-1] == 0
+    worker_names = {
+        f"gezhi-codex-stdin-{plan.attempt_ordinal}",
+        f"gezhi-codex-stdout-{plan.attempt_ordinal}",
+    }
+    assert not any(
+        worker.is_alive() and worker.name in worker_names
+        for worker in threading.enumerate()
+    )
+
+
+@pytest.mark.parametrize("terminal_failure", [False, True])
+def test_committed_unsafe_hold_wins_over_later_keyboard_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_failure: bool,
+) -> None:
+    plan = _plan(tmp_path, "success", timeout_seconds=10)
+    cancellation = _KeyboardInterruptOnCancellationObservation(2)
+    real_delete = child_process._AttributeList.delete
+    real_count = child_process._ResourceLedger.count
+    ledger_counts: list[int] = []
+    injected = False
+
+    def delete_then_fail(attribute_list):  # type: ignore[no-untyped-def]
+        nonlocal injected
+        real_delete(attribute_list)
+        if not injected:
+            injected = True
+            raise RuntimeError("injected settled attribute teardown failure")
+
+    def observe_count(ledger):  # type: ignore[no-untyped-def]
+        count = real_count(ledger)
+        ledger_counts.append(count)
+        return count
+
+    def fail_terminal_read(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("injected terminal finalization failure")
+
+    monkeypatch.setattr(
+        child_process._AttributeList,
+        "delete",
+        delete_then_fail,
+    )
+    monkeypatch.setattr(child_process._ResourceLedger, "count", observe_count)
+    if terminal_failure:
+        monkeypatch.setattr(child_process, "_read_final_source", fail_terminal_read)
+
+    with pytest.raises(
+        CodexChildUnsafeHoldErrorV1,
+        match="resource ownership is uncertain",
+    ):
+        run_codex_child_v1(plan, cancellation)
+
+    assert injected
+    assert ledger_counts[-1] == 0
+    worker_names = {
+        f"gezhi-codex-stdin-{plan.attempt_ordinal}",
+        f"gezhi-codex-stdout-{plan.attempt_ordinal}",
+    }
+    assert not any(
+        worker.is_alive() and worker.name in worker_names
+        for worker in threading.enumerate()
+    )
+
+
 @pytest.mark.parametrize("fault_call", [2, 3])
 def test_committed_cancellation_observer_fault_stops_and_settles(
     tmp_path: Path,
@@ -840,9 +1022,7 @@ def test_committed_cancellation_observer_fault_stops_and_settles(
         "cancellation_observation:RuntimeError" in fact
         for fact in evidence.lifecycle_facts
     )
-    assert (evidence.provider_started_monotonic_ns is not None) is (
-        fault_call == 3
-    )
+    assert (evidence.provider_started_monotonic_ns is not None) is (fault_call == 3)
     assert "provider_started_timestamp_unavailable" not in evidence.lifecycle_facts
 
 
@@ -870,13 +1050,12 @@ def test_committed_monotonic_clock_fault_stops_and_settles(
     assert evidence.stop_calls == 1
     assert evidence.resource_ledger_count == 0
     assert any(
-        "monotonic_clock:RuntimeError" in fact
-        for fact in evidence.lifecycle_facts
+        "monotonic_clock:RuntimeError" in fact for fact in evidence.lifecycle_facts
     )
     assert evidence.provider_started_monotonic_ns is None
-    assert (
-        "provider_started_timestamp_unavailable" in evidence.lifecycle_facts
-    ) is (fault_call == 3)
+    assert ("provider_started_timestamp_unavailable" in evidence.lifecycle_facts) is (
+        fault_call == 3
+    )
 
 
 @pytest.mark.parametrize("fault", ["cancellation", "monotonic"])
@@ -909,9 +1088,7 @@ def test_terminal_observation_fault_returns_settled_process_error(
     assert evidence.stop_calls == 0
     assert evidence.resource_ledger_count == 0
     assert capture.is_dir()
-    assert (evidence.capture_ready_monotonic_ns is None) is (
-        fault == "monotonic"
-    )
+    assert (evidence.capture_ready_monotonic_ns is None) is (fault == "monotonic")
 
 
 def test_persistent_observation_fault_is_latched_once(
@@ -976,6 +1153,38 @@ def test_existing_shared_deadline_before_commit_creates_no_attempt(
 
     assert isinstance(result, PreAttemptRejectedV1)
     assert result.reason == "shared_deadline_before_commit"
+    assert result.create_process_calls == 0
+    assert result.resource_ledger_count == 0
+
+
+@pytest.mark.parametrize(
+    ("cancel_offset_ns", "expected_reason"),
+    (
+        (-1, "cancelled_before_commit"),
+        (0, "cancelled_before_commit"),
+        (1, "shared_deadline_before_commit"),
+    ),
+    ids=("cancel-earlier", "cancel-tied", "deadline-earlier"),
+)
+def test_final_precommit_gate_arbitrates_cancel_and_shared_deadline(
+    tmp_path: Path,
+    cancel_offset_ns: int,
+    expected_reason: str,
+) -> None:
+    shared_deadline_ns = time.monotonic_ns() - 1_000
+    plan = _plan(
+        tmp_path,
+        "success",
+        existing_shared_deadline_monotonic_ns=shared_deadline_ns,
+    )
+
+    result = run_codex_child_v1(
+        plan,
+        _FixedCancellation(shared_deadline_ns + cancel_offset_ns),
+    )
+
+    assert isinstance(result, PreAttemptRejectedV1)
+    assert result.reason == expected_reason
     assert result.create_process_calls == 0
     assert result.resource_ledger_count == 0
 
@@ -1100,7 +1309,8 @@ def test_completion_barrier_arbitrates_equal_or_late_cancel_at_kernel_seam(
     cancel_offset_ns: int,
     expected: str,
 ) -> None:
-    plan = _plan(tmp_path, "success")
+    # Keep the synthetic completion tick strictly inside the unrelated timeout.
+    plan = _plan(tmp_path, "success", timeout_seconds=60)
     capture = Path(plan.capture_directory)
     real_clock = child_process._monotonic_now_ns_v1
     ready_tick_ns = real_clock() + 10_000_000_000
@@ -1906,6 +2116,24 @@ def test_precommit_environment_allocation_fault_returns_no_attempt(
     assert result.reason == "preparation_failed:MemoryError"
     assert result.create_process_calls == 0
     assert result.resource_ledger_count == 0
+    assert not Path(plan.staging_directory).exists()
+
+
+def test_precommit_keyboard_interrupt_is_never_mapped_to_a_rejection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan(tmp_path, "success")
+
+    def interrupt_environment(_block: str) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(child_process, "_environment_array", interrupt_environment)
+
+    with pytest.raises(KeyboardInterrupt):
+        run_codex_child_v1(plan, NeverCancelledV1())
+
+    assert not Path(plan.capture_directory).exists()
     assert not Path(plan.staging_directory).exists()
 
 
@@ -2740,9 +2968,8 @@ def test_one_shot_wait_failure_stops_and_then_safely_settles(
 
     def wait_many(*args):  # type: ignore[no-untyped-def]
         nonlocal injected
-        if (
-            not injected
-            and not threading.current_thread().name.startswith("gezhi-codex")
+        if not injected and not threading.current_thread().name.startswith(
+            "gezhi-codex"
         ):
             injected = True
             ctypes.set_last_error(31)
@@ -2889,8 +3116,7 @@ def test_two_parallel_attempts_do_not_cross_inherit_or_cross_capture(
     wait_for_single_object.restype = ctypes.c_ulong
     security = SecurityAttributes(ctypes.sizeof(SecurityAttributes), None, True)
     sentinels = tuple(
-        int(create_event(ctypes.byref(security), True, False, None))
-        for _ in range(12)
+        int(create_event(ctypes.byref(security), True, False, None)) for _ in range(12)
     )
     assert all(sentinels)
     sentinel_arguments = tuple(
@@ -2923,10 +3149,7 @@ def test_two_parallel_attempts_do_not_cross_inherit_or_cross_capture(
             )
             evidence_a = future_a.result(timeout=10)
             evidence_b = future_b.result(timeout=10)
-        assert all(
-            wait_for_single_object(handle, 0) == 0x102
-            for handle in sentinels
-        )
+        assert all(wait_for_single_object(handle, 0) == 0x102 for handle in sentinels)
     finally:
         assert all(close_handle(handle) for handle in sentinels)
 
@@ -2959,7 +3182,9 @@ def test_create_process_receives_a_mutable_copy_without_changing_audit_identity(
     mutated = False
 
     def mutate_then_create(
-        application, command_line, *arguments  # type: ignore[no-untyped-def]
+        application,
+        command_line,
+        *arguments,  # type: ignore[no-untyped-def]
     ) -> int:
         nonlocal mutated
         final_index = len(command_line.value) - 1
@@ -2995,9 +3220,7 @@ def test_writefile_progress_sequence_preserves_the_exact_remaining_suffix(
         if threading.current_thread().name.startswith("gezhi-codex-stdin"):
             writer_calls += 1
             if writer_calls == 1:
-                result = int(
-                    real_write(handle, buffer, requested, written, overlapped)
-                )
+                result = int(real_write(handle, buffer, requested, written, overlapped))
                 count = ctypes.cast(
                     written,
                     ctypes.POINTER(ctypes.c_ulong),
@@ -3005,9 +3228,7 @@ def test_writefile_progress_sequence_preserves_the_exact_remaining_suffix(
                 observations.append((requested, int(count)))
                 return result
             if writer_calls == 2:
-                result = int(
-                    real_write(handle, buffer, 7, written, overlapped)
-                )
+                result = int(real_write(handle, buffer, 7, written, overlapped))
                 count = ctypes.cast(
                     written,
                     ctypes.POINTER(ctypes.c_ulong),
@@ -3048,9 +3269,7 @@ def test_terminal_writefile_observation_fails_once_without_another_write(
         if threading.current_thread().name.startswith("gezhi-codex-stdin"):
             if injected:
                 later_writer_calls += 1
-                return int(
-                    real_write(handle, buffer, requested, written, overlapped)
-                )
+                return int(real_write(handle, buffer, requested, written, overlapped))
             injected = True
             target = ctypes.cast(written, ctypes.POINTER(ctypes.c_ulong))
             if observation == "zero":
@@ -3060,7 +3279,11 @@ def test_terminal_writefile_observation_fails_once_without_another_write(
                 target.contents.value = requested + 1
                 return 1
             ctypes.set_last_error(
-                109 if observation == "broken" else 232 if observation == "no-data" else 31
+                109
+                if observation == "broken"
+                else 232
+                if observation == "no-data"
+                else 31
             )
             target.contents.value = 0
             return 0
@@ -3170,7 +3393,7 @@ def test_terminal_readfile_observation_latches_once_then_drains_to_real_eof(
     assert evidence.create_process_calls == 1
     assert evidence.stop_calls == 1
     assert evidence.resource_ledger_count == 0
-    assert sum(
-        "stdout_collector_failure" in fact
-        for fact in evidence.lifecycle_facts
-    ) == 1
+    assert (
+        sum("stdout_collector_failure" in fact for fact in evidence.lifecycle_facts)
+        == 1
+    )
