@@ -56,6 +56,7 @@ class WriterOwnershipV1:
     _thread_id: int
     _closed: bool = False
     _knowledge_answer_publish_consumed: bool = False
+    _knowledge_answer_active_staging_id: str | None = None
 
     def __enter__(self) -> Self:
         if self._closed:
@@ -132,6 +133,42 @@ class WriterOwnershipV1:
                     "Knowledge Answer publication is already consumed"
                 )
             self._knowledge_answer_publish_consumed = True
+
+    def bind_knowledge_answer_active_staging_v1(
+        self,
+        root_identity: FileIdentity,
+        answer_id: str,
+    ) -> None:
+        """Bind this lease's consumed publication to its current staging ID."""
+
+        self.assert_knowledge_answer_ownership_v1(root_identity)
+        if type(answer_id) is not str or not answer_id:
+            raise ValueError("Knowledge Answer staging identity is invalid")
+        with _registry_guard:
+            if (
+                not self._knowledge_answer_publish_consumed
+                or self._knowledge_answer_active_staging_id is not None
+            ):
+                raise WriterOwnershipLifecycleErrorV1(
+                    "Knowledge Answer active staging cannot be rebound"
+                )
+            self._knowledge_answer_active_staging_id = answer_id
+
+    def assert_knowledge_answer_orphan_ownership_v1(
+        self,
+        root_identity: FileIdentity,
+        answer_id: str,
+    ) -> None:
+        """Reject the current publication from historical orphan seams."""
+
+        self.assert_knowledge_answer_ownership_v1(root_identity)
+        if type(answer_id) is not str or not answer_id:
+            raise ValueError("Knowledge Answer orphan identity is invalid")
+        with _registry_guard:
+            if self._knowledge_answer_active_staging_id == answer_id:
+                raise WriterOwnershipLifecycleErrorV1(
+                    "current Knowledge Answer staging is not an orphan"
+                )
 
     def close(self) -> None:
         if self._closed:

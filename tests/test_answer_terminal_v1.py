@@ -8,9 +8,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from support.knowledge_handoff_factory_v1 import accepted_handoff_v1
 
 from gezhi import _answer_terminal as terminal
+from gezhi import _knowledge_answerer as answerer
 from gezhi import _windows_data_root as windows_root
+from gezhi._knowledge_registry import normalize_search_query_v1
 from gezhi._windows_data_root import open_validated_data_root_v1
 from gezhi._windows_ownership import try_acquire_knowledge_answer_writer_v1
 
@@ -28,23 +31,129 @@ def _canonical_json_file(value: object) -> bytes:
     )
 
 
-def _succeeded_request_with_timeout_attempt() -> terminal.AnswerPublishRequestV1:
-    retrieval_view_bytes = _canonical_json_file(
+def _candidate_retrieval_documents() -> tuple[
+    bytes,
+    bytes,
+    bytes,
+    bytes,
+    dict[str, object],
+    dict[str, dict[str, object]],
+]:
+    question = "示例结论"
+    question_bytes = _canonical_json_file(
+        {"question": question, "schema_version": "gezhi.question.v1"}
+    )
+    search_text = normalize_search_query_v1(question)
+    retrieval_query_bytes = _canonical_json_file(
         {
-            "candidate_count": 1,
-            "schema_version": "gezhi.retrieval_view.v1",
+            "normalized_text": search_text.normalized_text,
+            "schema_version": "gezhi.retrieval_query.v1",
+            "trigram_atoms": list(search_text.trigram_atoms),
+            "unicode61_atoms": list(search_text.unicode61_atoms),
         }
     )
-    retrieval_audit_bytes = _canonical_json_file(
-        {
-            "retrieval_view_measurement": {
-                "byte_length": len(retrieval_view_bytes),
-                "limit_bytes": 262_144,
-                "sha256": hashlib.sha256(retrieval_view_bytes).hexdigest(),
-                "status": "within_limit",
-            },
-            "schema_version": "gezhi.retrieval_audit.v1",
-        }
+    handoff = accepted_handoff_v1(
+        ordinal=1,
+        statement_text="示例结论",
+        source_terms=["示例", "结论"],
+        title="示例论文",
+    )
+    record = json.loads(handoff.candidates_bytes)
+    candidate = record["candidate"]
+    candidate_id = candidate["candidate_id"]
+    payload_sha256 = candidate["payload_sha256"]
+    assert type(candidate_id) is str
+    assert type(payload_sha256) is str
+    view_item: dict[str, object] = {
+        "candidate": candidate,
+        "citation": record["citation"],
+        "descriptor_snapshots": record["descriptor_snapshots"],
+        "evidence_snapshots": record["evidence_snapshots"],
+        "governance": {
+            "intake_status": "active",
+            "promotion_status": "not_promoted",
+            "review_status": "accepted",
+        },
+        "rank": 1,
+    }
+    retrieval_view = {
+        "answer_kind": "candidate_backed",
+        "candidate_count": 1,
+        "items": [view_item],
+        "schema_version": "gezhi.retrieval_view.v1",
+    }
+    retrieval_view_bytes = _canonical_json_file(retrieval_view)
+    identity = {
+        "candidate_id": candidate_id,
+        "payload_sha256": payload_sha256,
+        "review_revision": 1,
+        "search_projection_sha256": "1" * 64,
+    }
+    branch_item = {
+        "bm25_float64_hex": "0x0.0p+0",
+        **identity,
+        "rank": 1,
+    }
+    final_item = {
+        **identity,
+        "final_rank": 1,
+        "rrf_denominator": 13,
+        "rrf_numerator": 1,
+        "trigram_rank": None,
+        "unicode61_rank": 1,
+    }
+    retrieval_audit = {
+        "algorithm_version": "gezhi.fts5_dual_rrf_k12.v1",
+        "branch_results": {"trigram": [], "unicode61": [branch_item]},
+        "final_selection": [final_item],
+        "query_atoms": {
+            "trigram": list(search_text.trigram_atoms),
+            "unicode61": list(search_text.unicode61_atoms),
+        },
+        "question_asset_sha256": hashlib.sha256(question_bytes).hexdigest(),
+        "registry_snapshot_sha256": "2" * 64,
+        "retrieval_query_asset_sha256": hashlib.sha256(
+            retrieval_query_bytes
+        ).hexdigest(),
+        "retrieval_view_measurement": {
+            "byte_length": len(retrieval_view_bytes),
+            "limit_bytes": 262_144,
+            "sha256": hashlib.sha256(retrieval_view_bytes).hexdigest(),
+            "status": "within_limit",
+        },
+        "schema_version": "gezhi.retrieval_audit.v1",
+    }
+    answer_output: dict[str, object] = {
+        "answer_status": "answered",
+        "answer_units": [
+            {"candidate_id": candidate_id, "text": "示例结论由该 Candidate 支持。"}
+        ],
+        "insufficiency_reason": None,
+        "qualification_units": [],
+        "schema_version": "gezhi.answer_output.v1",
+    }
+    return (
+        question_bytes,
+        retrieval_query_bytes,
+        _canonical_json_file(retrieval_audit),
+        retrieval_view_bytes,
+        answer_output,
+        {candidate_id: view_item},
+    )
+
+
+def _succeeded_request_with_timeout_attempt() -> terminal.AnswerPublishRequestV1:
+    (
+        question_bytes,
+        retrieval_query_bytes,
+        retrieval_audit_bytes,
+        retrieval_view_bytes,
+        answer_output,
+        candidates,
+    ) = _candidate_retrieval_documents()
+    prompt_bytes = answerer._effective_prompt_v1(
+        question_bytes,
+        retrieval_view_bytes,
     )
     timestamp = "2026-08-31T12:00:00.000Z"
     return terminal.AnswerPublishRequestV1(
@@ -66,16 +175,12 @@ def _succeeded_request_with_timeout_attempt() -> terminal.AnswerPublishRequestV1
                 "schema_version": "gezhi.knowledge_answerer_effective_config.v1",
             }
         ),
-        question_bytes=_canonical_json_file({"schema_version": "gezhi.question.v1"}),
-        retrieval_query_bytes=_canonical_json_file(
-            {"schema_version": "gezhi.retrieval_query.v1"}
-        ),
+        question_bytes=question_bytes,
+        retrieval_query_bytes=retrieval_query_bytes,
         retrieval_audit_bytes=retrieval_audit_bytes,
         retrieval_view_bytes=retrieval_view_bytes,
-        prompt_bytes=b"prompt\n",
-        schema_bytes=_canonical_json_file(
-            {"$id": ("https://gezhi.local/schemas/answer-output-v1.schema.json")}
-        ),
+        prompt_bytes=prompt_bytes,
+        schema_bytes=answerer.answer_output_schema_bytes_v1(),
         attempts=(
             terminal.AnswerAttemptPublishV1(
                 record={
@@ -94,10 +199,12 @@ def _succeeded_request_with_timeout_attempt() -> terminal.AnswerPublishRequestV1
                 final_message_bytes=b"",
             ),
         ),
-        answer_output_bytes=_canonical_json_file(
-            {"schema_version": "gezhi.answer_output.v1"}
+        answer_output_bytes=_canonical_json_file(answer_output),
+        answer_markdown_bytes=answerer._render_answer_markdown_v1(
+            "示例结论",
+            answer_output,
+            candidates,
         ),
-        answer_markdown_bytes=b"answer\n",
     )
 
 
@@ -142,12 +249,29 @@ def _zero_candidate_request(
     )
     retrieval_view_bytes = _canonical_json_file(
         {
+            "answer_kind": "candidate_backed",
             "candidate_count": 0,
+            "items": [],
             "schema_version": "gezhi.retrieval_view.v1",
         }
     )
+    assert base.question_bytes is not None
+    assert base.retrieval_query_bytes is not None
+    query = json.loads(base.retrieval_query_bytes)
     retrieval_audit_bytes = _canonical_json_file(
         {
+            "algorithm_version": "gezhi.fts5_dual_rrf_k12.v1",
+            "branch_results": {"trigram": [], "unicode61": []},
+            "final_selection": [],
+            "query_atoms": {
+                "trigram": query["trigram_atoms"],
+                "unicode61": query["unicode61_atoms"],
+            },
+            "question_asset_sha256": hashlib.sha256(base.question_bytes).hexdigest(),
+            "registry_snapshot_sha256": "2" * 64,
+            "retrieval_query_asset_sha256": hashlib.sha256(
+                base.retrieval_query_bytes
+            ).hexdigest(),
             "retrieval_view_measurement": {
                 "byte_length": len(retrieval_view_bytes),
                 "limit_bytes": 262_144,
@@ -212,17 +336,17 @@ def _request_with_candidate_count(
 
 
 def _too_large_retrieval_audit_bytes() -> bytes:
-    return _canonical_json_file(
-        {
-            "retrieval_view_measurement": {
-                "byte_length": 262_145,
-                "limit_bytes": 262_144,
-                "sha256": "0" * 64,
-                "status": "too_large",
-            },
-            "schema_version": "gezhi.retrieval_audit.v1",
-        }
+    _question, _query, audit_bytes, _view, _output, _candidates = (
+        _candidate_retrieval_documents()
     )
+    audit = json.loads(audit_bytes)
+    audit["retrieval_view_measurement"] = {
+        "byte_length": 262_145,
+        "limit_bytes": 262_144,
+        "sha256": "0" * 64,
+        "status": "too_large",
+    }
+    return _canonical_json_file(audit)
 
 
 def test_committed_reader_revalidates_a_published_answer(tmp_path) -> None:
@@ -249,6 +373,159 @@ def test_committed_reader_revalidates_a_published_answer(tmp_path) -> None:
     assert observed.status == "succeeded"
     assert observed.answer_output_bytes == request.answer_output_bytes
     assert observed.answer_markdown_bytes == request.answer_markdown_bytes
+
+
+def _rewrite_terminal_assets(
+    target: Path,
+    replacements: dict[str, bytes],
+) -> None:
+    manifest_path = target / "manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    by_path = {item["path"]: item for item in manifest["assets"]}
+    for relative_path, payload in replacements.items():
+        (target / relative_path).write_bytes(payload)
+        item = by_path[relative_path]
+        item["byte_length"] = len(payload)
+        item["sha256"] = hashlib.sha256(payload).hexdigest()
+    manifest_path.write_bytes(_canonical_json_file(manifest))
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "answer-output-schema",
+        "answer-markdown-rendering",
+        "schema-snapshot",
+        "prompt-binding",
+        "retrieval-view-schema",
+    ),
+)
+def test_committed_reader_rejects_semantically_invalid_rehashed_assets(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner:
+            terminal.publish_answer_v1(root, owner, request)
+
+        target = knowledge_root / "answers" / request.answer_id
+        if corruption == "answer-output-schema":
+            output = json.loads((target / "answer_output.json").read_bytes())
+            output["unexpected"] = True
+            replacements = {"answer_output.json": _canonical_json_file(output)}
+        elif corruption == "answer-markdown-rendering":
+            replacements = {"answer.md": b"# unrelated but valid UTF-8\n"}
+        elif corruption == "schema-snapshot":
+            schema = json.loads((target / "schema.json").read_bytes())
+            schema["unexpected"] = True
+            replacements = {"schema.json": _canonical_json_file(schema)}
+        elif corruption == "prompt-binding":
+            replacements = {
+                "prompt.txt": (target / "prompt.txt").read_bytes() + b"tampered\n"
+            }
+        else:
+            view_bytes = _canonical_json_file(
+                {
+                    "candidate_count": 1,
+                    "schema_version": "gezhi.retrieval_view.v1",
+                }
+            )
+            audit = json.loads((target / "retrieval_audit.json").read_bytes())
+            audit["retrieval_view_measurement"] = {
+                "byte_length": len(view_bytes),
+                "limit_bytes": 262_144,
+                "sha256": hashlib.sha256(view_bytes).hexdigest(),
+                "status": "within_limit",
+            }
+            replacements = {
+                "retrieval_audit.json": _canonical_json_file(audit),
+                "retrieval_view.json": view_bytes,
+            }
+        _rewrite_terminal_assets(target, replacements)
+
+        observed = terminal.read_committed_answer_v1(root, request.answer_id)
+
+    assert type(observed) is terminal.TerminalAnswerBytesRejectedV1
+
+
+def test_manifest_cross_field_rejection_precedes_any_asset_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner:
+            terminal.publish_answer_v1(root, owner, request)
+        manifest_path = knowledge_root / "answers" / request.answer_id / "manifest.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        manifest["error"] = {"code": "answer_output_invalid", "stage": "validation"}
+        manifest_path.write_bytes(_canonical_json_file(manifest))
+        read_paths: list[str] = []
+        real_read = terminal._read_candidate_file_v1
+
+        def record_read(*args: object, **kwargs: object) -> bytes:
+            read_paths.append(str(args[1]))
+            return real_read(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(terminal, "_read_candidate_file_v1", record_read)
+        observed = terminal.read_committed_answer_v1(root, request.answer_id)
+
+    assert type(observed) is terminal.TerminalAnswerBytesRejectedV1
+    assert read_paths == ["manifest.json"]
+
+
+def test_terminal_namespace_validation_never_recursively_walks_an_extra_subtree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner:
+            terminal.publish_answer_v1(root, owner, request)
+        monkeypatch.setattr(
+            windows_root.ValidatedDataRootV1,
+            "relative_file_paths_v1",
+            lambda _self: (_ for _ in ()).throw(
+                AssertionError("terminal namespace must not recurse")
+            ),
+        )
+        observed = terminal.read_committed_answer_v1(root, request.answer_id)
+
+    assert type(observed) is terminal.TerminalAnswerBytesReadyV1
 
 
 @pytest.mark.parametrize(
@@ -295,14 +572,24 @@ def test_writer_readback_rejects_an_asset_changed_after_manifest_creation(
         error=None,
         failure_classes=(None,),
     )
-    real_write = terminal._write_new_file
+    real_create = terminal.create_exclusive_file_bytes_v1
 
-    def write_then_tamper(path: Path, payload: bytes) -> None:
-        real_write(path, payload)
-        if path.name == "manifest.json":
-            (path.parent / "answer.md").write_bytes(b"tampered\n")
+    def create_then_tamper(
+        parent: windows_root.ValidatedDataRootV1,
+        component: str,
+        payload: bytes,
+    ) -> None:
+        real_create(parent, component, payload)
+        if component == "manifest.json":
+            canonical_path = parent.inspection.canonical_path
+            assert canonical_path is not None
+            (Path(canonical_path) / "answer.md").write_bytes(b"tampered\n")
 
-    monkeypatch.setattr(terminal, "_write_new_file", write_then_tamper)
+    monkeypatch.setattr(
+        terminal,
+        "create_exclusive_file_bytes_v1",
+        create_then_tamper,
+    )
 
     with open_validated_data_root_v1(str(knowledge_root)) as root:
         identity = root.inspection.identity
@@ -735,6 +1022,47 @@ def test_manifest_aggregate_uses_one_actual_serialized_buffer(
     assert asset.byte_length + 65_536 > terminal.ANSWER_TERMINAL_MAX_BYTES
 
 
+def test_terminal_manifest_uses_the_exclusive_relative_create_seam(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+    calls: list[str] = []
+
+    def exclusive_create(
+        parent: windows_root.ValidatedDataRootV1,
+        component: str,
+        payload: bytes,
+    ) -> None:
+        calls.append(component)
+        canonical_path = parent.inspection.canonical_path
+        assert canonical_path is not None
+        terminal._write_new_file(Path(canonical_path) / component, payload)
+
+    monkeypatch.setattr(
+        terminal,
+        "create_exclusive_file_bytes_v1",
+        exclusive_create,
+        raising=False,
+    )
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner:
+            terminal.publish_answer_v1(root, owner, request)
+
+    assert calls == ["manifest.json"]
+
+
 def test_committed_reader_bounds_each_asset_by_its_declared_length(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -920,6 +1248,41 @@ def test_staging_scan_stops_on_an_indeterminate_recovery_rename(
 
     assert target.is_dir()
     assert not orphan.exists()
+
+
+def test_current_publish_staging_cannot_reenter_orphan_recovery_on_same_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    knowledge_root.mkdir()
+    request = _request_with_terminal_matrix(
+        status="succeeded",
+        error=None,
+        failure_classes=(None,),
+    )
+    rename_calls = 0
+
+    def fail_rename(_source: object, _destination: object) -> None:
+        nonlocal rename_calls
+        rename_calls += 1
+        raise PermissionError("forced determinate no-commit")
+
+    monkeypatch.setattr(terminal.os, "rename", fail_rename)
+
+    with open_validated_data_root_v1(str(knowledge_root)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_knowledge_answer_writer_v1(identity)
+        assert owner is not None
+        with owner:
+            with pytest.raises(terminal.AnswerCommitFailedV1):
+                terminal.publish_answer_v1(root, owner, request)
+            with pytest.raises(terminal.AnswerWriterOwnershipInvalidV1):
+                terminal.scan_answer_staging_v1(root, owner)
+
+    assert rename_calls == 1
+    assert (knowledge_root / "answers" / ".staging" / request.answer_id).is_dir()
 
 
 def test_terminal_writer_rejects_success_with_a_timeout_attempt() -> None:

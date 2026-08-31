@@ -30,7 +30,7 @@ from gezhi._presentation import (
     write_knowledge_ask_human_buffer_v1,
     write_knowledge_ask_json_buffer_v1,
 )
-from gezhi._windows_data_root import DataRootOpenErrorV1, open_validated_data_root_v1
+from gezhi._windows_data_root import open_validated_data_root_v1
 
 _OUTPUT_CAP = 1_048_576
 _ASK_JSON_OUTPUT_CAP = 65_536
@@ -780,7 +780,10 @@ def _knowledge_ask_diagnostics_v1(
         for code, count in orphan_supplementals
         if count
     )
-    return diagnostics
+    return sorted(
+        diagnostics,
+        key=lambda item: cast(str, item["code"]).encode("ascii"),
+    )
 
 
 def _build_knowledge_ask_diagnostics_v1(
@@ -888,11 +891,8 @@ def _read_committed_answer_for_human_v1(
     locator = report.committed_answer_locator
     if locator is None or report.result is None:
         raise ValueError("Knowledge ask committed Answer locator is absent")
-    try:
-        with open_validated_data_root_v1(locator.root_path) as root:
-            observed = read_committed_answer_v1(root, locator.answer_id)
-    except (DataRootOpenErrorV1, OSError):
-        return None
+    with open_validated_data_root_v1(locator.root_path) as root:
+        observed = read_committed_answer_v1(root, locator.answer_id)
     if (
         type(observed) is not TerminalAnswerBytesReadyV1
         or observed.answer_id != locator.answer_id
@@ -1121,15 +1121,25 @@ def _prepare_knowledge_ask_presentation_v1(
             raise RuntimeError("Knowledge ask envelope freeze proof differs")
         envelope = frozen_envelope
         try:
-            buffer = (
-                json.dumps(
-                    envelope_value,
-                    ensure_ascii=False,
-                    allow_nan=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8", errors="strict")
-                + b"\n"
+            buffer = cli_json_buffer_v1(
+                command="knowledge.ask",
+                outcome=report.outcome,
+                result=report.result,
+                diagnostics=diagnostics,
+                output_cap=_ASK_JSON_OUTPUT_CAP,
+            )
+        except CliJsonOutputTooLargeV1:
+            return _UnboundKnowledgeAskPresentationV1(
+                report=report,
+                outcome=report.outcome,
+                result=frozen_result,
+                diagnostics=frozen_diagnostics,
+                envelope=envelope,
+                disposition="no_output_presentation_failure",
+                failure_kind="stdout_cap_exceeded",
+                buffer=None,
+                byte_length=None,
+                json_output=True,
             )
         except (TypeError, ValueError):
             return _UnboundKnowledgeAskPresentationV1(
@@ -1140,19 +1150,6 @@ def _prepare_knowledge_ask_presentation_v1(
                 envelope=envelope,
                 disposition="no_output_presentation_failure",
                 failure_kind="canonical_serialization_failed",
-                buffer=None,
-                byte_length=None,
-                json_output=True,
-            )
-        if len(buffer) > _ASK_JSON_OUTPUT_CAP:
-            return _UnboundKnowledgeAskPresentationV1(
-                report=report,
-                outcome=report.outcome,
-                result=frozen_result,
-                diagnostics=frozen_diagnostics,
-                envelope=envelope,
-                disposition="no_output_presentation_failure",
-                failure_kind="stdout_cap_exceeded",
                 buffer=None,
                 byte_length=None,
                 json_output=True,

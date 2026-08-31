@@ -619,6 +619,56 @@ def test_file_id_info_keeps_all_128_identifier_bits() -> None:
     assert windows_root._identity_from_file_id_info(value) == (7, raw)
 
 
+def test_exclusive_relative_create_holds_zero_sharing_while_writing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root = tmp_path / "knowledge"
+    data_root.mkdir()
+    target = data_root / "manifest.json"
+    real_write = windows_root._WRITE_FILE
+    sharing_witnesses: list[str] = []
+
+    def write_with_sharing_witness(*args: Any) -> int:
+        with pytest.raises(PermissionError):
+            target.open("r+b")
+        sharing_witnesses.append("exclusive")
+        return real_write(*args)
+
+    monkeypatch.setattr(windows_root, "_WRITE_FILE", write_with_sharing_witness)
+
+    with open_validated_data_root_v1(str(data_root)) as root:
+        windows_root.create_exclusive_file_bytes_v1(
+            root,
+            "manifest.json",
+            b'{"schema_version":"test.v1"}\n',
+        )
+
+    assert sharing_witnesses
+    assert target.read_bytes() == b'{"schema_version":"test.v1"}\n'
+
+
+def test_exclusive_relative_create_never_opens_or_overwrites_an_existing_leaf(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "knowledge"
+    data_root.mkdir()
+    target = data_root / "manifest.json"
+    target.write_bytes(b"authority\n")
+
+    with (
+        open_validated_data_root_v1(str(data_root)) as root,
+        pytest.raises(windows_root.DataRootOpenErrorV1),
+    ):
+        windows_root.create_exclusive_file_bytes_v1(
+            root,
+            "manifest.json",
+            b"replacement\n",
+        )
+
+    assert target.read_bytes() == b"authority\n"
+
+
 def test_directory_enumeration_preserves_an_8dot3_short_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

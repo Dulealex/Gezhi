@@ -94,6 +94,71 @@ def test_orphan_recovery_facts_project_to_closed_supplementals() -> None:
     assert "提示：有 5 个历史 Answer 因同身份 target 已存在而未恢复\n" in human
 
 
+def test_diagnostics_are_sorted_by_code_ascii_bytes_after_aggregation() -> None:
+    report = KnowledgeAskReportV1(
+        outcome="interrupted",
+        result=None,
+        reason="user_interrupted_before_answer",
+        orphan_recovered_count=1,
+    )
+
+    diagnostics = commands._knowledge_ask_diagnostics_v1(report)
+
+    assert [item["code"] for item in diagnostics] == [
+        "knowledge.ask.orphan_recovered.v1",
+        "knowledge.ask.user_interrupted_before_answer.v1",
+    ]
+
+
+def test_json_preparation_uses_the_shared_envelope_serializer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = KnowledgeAskReportV1(
+        outcome="blocked",
+        result=None,
+        reason="invalid_question",
+    )
+    calls: list[dict[str, object]] = []
+    real_serializer = commands.cli_json_buffer_v1
+
+    def serialize(**kwargs: object) -> bytes:
+        calls.append(dict(kwargs))
+        return real_serializer(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(commands, "cli_json_buffer_v1", serialize)
+
+    candidate = commands._prepare_knowledge_ask_presentation_v1(
+        report,
+        json_output=True,
+        answer_markdown_bytes=None,
+    )
+
+    assert candidate.disposition == "ready_bytes"
+    assert len(calls) == 1
+    assert calls[0]["command"] == "knowledge.ask"
+    assert calls[0]["output_cap"] == 65_536
+
+
+def test_human_terminal_reader_os_error_escapes_without_relabelling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = KnowledgeAskReportV1(
+        outcome="succeeded",
+        result={"answer_id": _committed_locator_v1().answer_id, "answer_output": {}},
+        reason=None,
+        answer_markdown_bytes=b"writer-copy\n",
+        committed_answer_locator=_committed_locator_v1(),
+    )
+    monkeypatch.setattr(
+        commands,
+        "open_validated_data_root_v1",
+        lambda _path: (_ for _ in ()).throw(OSError("outside typed reader verdict")),
+    )
+
+    with pytest.raises(OSError, match="outside typed reader verdict"):
+        commands._read_committed_answer_for_human_v1(report)
+
+
 def test_human_success_uses_the_committed_terminal_reader(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

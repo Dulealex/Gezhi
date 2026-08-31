@@ -4,7 +4,7 @@ import ctypes
 import hashlib
 import ntpath
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import Literal, Self, TypeAlias
 
@@ -24,6 +24,7 @@ _FILE_ATTRIBUTE_DIRECTORY = 0x10
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _FILE_LIST_DIRECTORY = 0x0001
 _FILE_READ_DATA = 0x0001
+_FILE_WRITE_DATA = 0x0002
 _FILE_TRAVERSE = 0x0020
 _FILE_READ_ATTRIBUTES = 0x0080
 _SYNCHRONIZE = 0x00100000
@@ -33,6 +34,7 @@ _OPEN_EXISTING = 3
 _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 _FILE_OPEN = 1
+_FILE_CREATE = 2
 _FILE_DIRECTORY_FILE = 0x00000001
 _FILE_NON_DIRECTORY_FILE = 0x00000040
 _FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
@@ -210,6 +212,15 @@ _READ_FILE.argtypes = [
     ctypes.c_void_p,
 ]
 _READ_FILE.restype = ctypes.c_int
+_WRITE_FILE = _KERNEL32.WriteFile
+_WRITE_FILE.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.c_ulong,
+    ctypes.POINTER(ctypes.c_ulong),
+    ctypes.c_void_p,
+]
+_WRITE_FILE.restype = ctypes.c_int
 _GET_VOLUME_INFORMATION_BY_HANDLE = _KERNEL32.GetVolumeInformationByHandleW
 _GET_VOLUME_INFORMATION_BY_HANDLE.argtypes = [
     ctypes.c_void_p,
@@ -589,6 +600,39 @@ class ValidatedDataRootV1:
             )
         return tuple(sorted(observed, key=lambda item: item.name.encode("utf-8")))
 
+    def validate_relative_entry_profile_v1(
+        self,
+        expected: Mapping[str, bool],
+    ) -> None:
+        """Fail on the first unexpected immediate entry without descending."""
+
+        if self._closed:
+            raise RuntimeError("validated Data Root is closed")
+        if type(expected) is not dict or any(
+            type(name) is not str
+            or not _is_safe_component(name)
+            or type(is_directory) is not bool
+            for name, is_directory in expected.items()
+        ):
+            raise TypeError("relative entry profile is invalid")
+        observed: set[str] = set()
+        for entry in _enumerate_directory(self.borrowed_handle()):
+            if len(observed) >= _MAX_ENUMERATED_ENTRIES:
+                raise DataRootOpenErrorV1("unavailable")
+            expected_directory = expected.get(entry.name)
+            if (
+                expected_directory is None
+                or entry.name in observed
+                or bool(entry.attributes & _FILE_ATTRIBUTE_DIRECTORY)
+                is not expected_directory
+                or bool(entry.attributes & _FILE_ATTRIBUTE_REPARSE_POINT)
+                or entry.short_name is not None
+            ):
+                raise DataRootOpenErrorV1("unsafe")
+            observed.add(entry.name)
+        if observed != set(expected):
+            raise DataRootOpenErrorV1("unavailable")
+
     def validate_streams_v1(self) -> None:
         if self._closed:
             raise RuntimeError("validated Data Root is closed")
@@ -884,12 +928,13 @@ def _open_drive_root(path: str) -> int:
     return int(handle)
 
 
-def _nt_open_relative(
+def _nt_relative_file(
     parent: int,
     component: str,
     *,
     desired_access: int,
     share: int,
+    disposition: int,
     options: int,
 ) -> int:
     if not _is_safe_component(component):
@@ -919,7 +964,7 @@ def _nt_open_relative(
         None,
         0,
         share,
-        _FILE_OPEN,
+        disposition,
         options,
         None,
         0,
@@ -927,6 +972,39 @@ def _nt_open_relative(
     if status < 0 or handle.value in {None, 0, _INVALID_HANDLE_VALUE}:
         raise DataRootOpenErrorV1("unavailable")
     return int(handle.value)
+
+
+def _nt_open_relative(
+    parent: int,
+    component: str,
+    *,
+    desired_access: int,
+    share: int,
+    options: int,
+) -> int:
+    return _nt_relative_file(
+        parent,
+        component,
+        desired_access=desired_access,
+        share=share,
+        disposition=_FILE_OPEN,
+        options=options,
+    )
+
+
+def _nt_create_exclusive_relative(parent: int, component: str) -> int:
+    return _nt_relative_file(
+        parent,
+        component,
+        desired_access=_FILE_WRITE_DATA | _FILE_READ_ATTRIBUTES | _SYNCHRONIZE,
+        share=0,
+        disposition=_FILE_CREATE,
+        options=(
+            _FILE_SYNCHRONOUS_IO_NONALERT
+            | _FILE_OPEN_REPARSE_POINT
+            | _FILE_NON_DIRECTORY_FILE
+        ),
+    )
 
 
 def _open_relative_handle(
@@ -1421,6 +1499,70 @@ def open_validated_mutable_local_file_v1(value: str) -> ValidatedFileV1:
     """Hold one no-follow local file while a cooperating writer mutates it."""
 
     return _open_validated_local_file_v1(value, share_writes=True)
+
+
+def create_exclusive_file_bytes_v1(
+    parent: ValidatedDataRootV1,
+    component: str,
+    payload: bytes,
+) -> None:
+    """CREATE_NEW one ordinary child with zero sharing and synchronous writes."""
+
+    if type(parent) is not ValidatedDataRootV1:
+        raise TypeError("exclusive file parent type is invalid")
+    if not _is_safe_component(component):
+        raise DataRootOpenErrorV1("unsafe")
+    if type(payload) is not bytes:
+        raise TypeError("exclusive file payload must be immutable bytes")
+    parent_path = parent.inspection.canonical_path
+    parent_identity = parent.inspection.identity
+    if parent_path is None or parent_identity is None:
+        raise DataRootOpenErrorV1("unavailable")
+    parent.validate_streams_v1()
+    handle = _nt_create_exclusive_relative(parent.borrowed_handle(), component)
+    try:
+        expected_path = ntpath.join(parent_path, component)
+        initial_facts = _handle_facts(handle, directory=False)
+        _validate_expected_facts(initial_facts, expected_path, parent_identity[0])
+        _reject_hidden_short_alias(parent.borrowed_handle(), component)
+
+        if payload:
+            base = ctypes.c_char_p(payload)
+            base_address = ctypes.cast(base, ctypes.c_void_p).value
+            if base_address is None:
+                raise DataRootOpenErrorV1("unavailable")
+            offset = 0
+            while offset < len(payload):
+                requested = min(len(payload) - offset, 0xFFFFFFFF)
+                completed = ctypes.c_ulong()
+                if not _WRITE_FILE(
+                    handle,
+                    ctypes.c_void_p(base_address + offset),
+                    requested,
+                    ctypes.byref(completed),
+                    None,
+                ):
+                    raise DataRootOpenErrorV1("unavailable")
+                count = int(completed.value)
+                if not 1 <= count <= requested:
+                    raise DataRootOpenErrorV1("unavailable")
+                offset += count
+
+        final_facts = _handle_facts(handle, directory=False)
+        if (
+            final_facts.identity != initial_facts.identity
+            or _key(final_facts.canonical_path) != _key(initial_facts.canonical_path)
+            or _file_size(handle) != len(payload)
+        ):
+            raise DataRootOpenErrorV1("unavailable")
+    except BaseException as error:
+        try:
+            _close_handles((handle,))
+        except Exception as close_error:
+            raise close_error from error
+        raise
+    _close_handles((handle,))
+    parent.validate_streams_v1()
 
 
 def inspect_data_root_v1(value: str) -> DataRootInspectionV1:

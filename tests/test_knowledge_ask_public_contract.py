@@ -2051,11 +2051,11 @@ def test_ask_commits_the_exact_final_overflow_prefix_without_retry(
         )
         envelope = json.loads(result.stdout)
         assert envelope["diagnostics"] == [
-            {"code": "knowledge.ask.codex_process_failed.v1", "context": {}},
             {
                 "code": "knowledge.ask.capture_overflow.v1",
                 "context": {"channels": ["final_message"]},
             },
+            {"code": "knowledge.ask.codex_process_failed.v1", "context": {}},
         ]
         answer_id = envelope["result"]["answer_id"]
         committed = active_knowledge_ask_root / "answers" / answer_id
