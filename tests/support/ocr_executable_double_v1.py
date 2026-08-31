@@ -7,6 +7,8 @@ import shutil
 import sys
 from pathlib import Path
 
+from pypdf import PdfReader, PdfWriter
+
 _EVIDENCE_TEXT = "Deterministic OCR evidence supports the complete Gezhi workflow."
 
 
@@ -79,6 +81,22 @@ def _write_output_v1(source_pdf: Path, output_root: Path) -> None:
         shutil.copyfile(source_pdf, leaf / name)
 
 
+def _rewrite_origin_with_coordinate_delta_v1(
+    source_pdf: Path,
+    origin_pdf: Path,
+    *,
+    top_delta: float,
+) -> None:
+    reader = PdfReader(str(source_pdf), strict=True)
+    writer = PdfWriter()
+    for page in reader.pages:
+        page.mediabox.top = float(page.mediabox.top) + top_delta
+        page.cropbox.top = float(page.cropbox.top) + top_delta
+        writer.add_page(page)
+    with origin_pdf.open("wb") as stream:
+        writer.write(stream)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", dest="source_pdf", type=Path, required=True)
@@ -102,9 +120,20 @@ def main() -> None:
         arguments.output_root.mkdir(parents=True)
         sys.stdout.buffer.write(b'{"fixture":"gezhi.ocr.v1","status":"invalid"}\n')
         return
-    if scenario != "succeeded":
+    coordinate_deltas = {
+        "origin-coordinate-rounding": -0.00002,
+        "origin-coordinate-outside-rounding": -0.00011,
+    }
+    if scenario != "succeeded" and scenario not in coordinate_deltas:
         parser.error("the OCR fixture scenario is invalid")
     _write_output_v1(arguments.source_pdf, arguments.output_root)
+    coordinate_delta = coordinate_deltas.get(scenario)
+    if coordinate_delta is not None:
+        _rewrite_origin_with_coordinate_delta_v1(
+            arguments.source_pdf,
+            arguments.output_root / "source" / "ocr" / "source_origin.pdf",
+            top_delta=coordinate_delta,
+        )
     sys.stdout.buffer.write(b'{"fixture":"gezhi.ocr.v1","status":"succeeded"}\n')
 
 
