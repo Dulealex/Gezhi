@@ -255,6 +255,7 @@ class TerminalAnswerBytesReadyV1:
     answer_output_bytes: bytes | None
     answer_markdown_bytes: bytes | None
     answer_markdown_text: str | None
+    retrieval_view_bytes: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2003,6 +2004,7 @@ def _validate_terminal_candidate_v1(
         answer_output_bytes=payload_by_path.get("answer_output.json"),
         answer_markdown_bytes=answer_markdown_bytes,
         answer_markdown_text=answer_markdown_text,
+        retrieval_view_bytes=payload_by_path.get("retrieval_view.json"),
     )
 
 
