@@ -648,7 +648,8 @@ def project_literature_work_status_v1(
                             stages,
                             recovery,
                         )
-    _project_live_automatic_stage_v1(stages, writer_active=writer_active)
+    if authority.ingest_identity_ready:
+        _project_live_automatic_stage_v1(stages, writer_active=writer_active)
     availability = "partial" if recovery["inconsistent_count"] else "ready"
     return {
         "availability": availability,

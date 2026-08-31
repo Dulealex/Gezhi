@@ -584,6 +584,59 @@ def test_live_work_writer_projects_first_unmet_ocr_without_staging(
     assert before == (_tree_snapshot(literature), _tree_snapshot(knowledge))
 
 
+def test_live_work_writer_does_not_skip_blocked_ingest_identity(
+    status_roots: tuple[Path, Path, Path],
+) -> None:
+    from gezhi._windows_data_root import open_validated_data_root_v1
+    from gezhi._windows_ownership import try_acquire_work_writer_v1
+
+    base, literature, knowledge = status_roots
+    pdf_path = base / "identity-review.pdf"
+    write_text_pdf(
+        pdf_path,
+        "This Work keeps valid source authority while identity review is pending.",
+    )
+    added = _run_add(literature, pdf_path)
+    work_id = str(added["work_id"])
+    identity_current = literature / "works" / work_id / "identity" / "current.json"
+    identity_current.unlink()
+
+    before = (_tree_snapshot(literature), _tree_snapshot(knowledge))
+    inactive = _run_json_status_both(literature, knowledge, work_id)
+    inactive_report = inactive["result"]
+    assert type(inactive_report) is dict
+    assert inactive_report["status"] == "blocked"
+    assert inactive_report["literature"]["stages"][:2] == [
+        {"stage": "ingest", "status": "blocked"},
+        {"stage": "ocr", "status": "pending"},
+    ]
+    assert inactive_report["recovery"]["staging_count"] == 0
+    assert inactive_report["next_action"] == "resume_work"
+    assert before == (_tree_snapshot(literature), _tree_snapshot(knowledge))
+
+    with open_validated_data_root_v1(str(literature)) as root:
+        identity = root.inspection.identity
+        assert identity is not None
+        owner = try_acquire_work_writer_v1(identity, work_id)
+        assert owner is not None
+        try:
+            before = (_tree_snapshot(literature), _tree_snapshot(knowledge))
+            active = _run_json_status_both(literature, knowledge, work_id)
+            assert before == (_tree_snapshot(literature), _tree_snapshot(knowledge))
+        finally:
+            owner.close()
+
+    active_report = active["result"]
+    assert type(active_report) is dict
+    assert active_report["status"] == "blocked"
+    assert active_report["literature"]["stages"][:2] == [
+        {"stage": "ingest", "status": "blocked"},
+        {"stage": "ocr", "status": "pending"},
+    ]
+    assert active_report["recovery"]["staging_count"] == 0
+    assert active_report["next_action"] == "resume_work"
+
+
 def test_real_candidate_registry_projects_the_same_candidate_for_overall_and_work(
     status_roots: tuple[Path, Path, Path],
 ) -> None:
