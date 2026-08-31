@@ -194,6 +194,92 @@ def empty_registry_knowledge_ask_root(empty_knowledge_ask_root: Path) -> Path:
     return empty_knowledge_ask_root
 
 
+@pytest.mark.parametrize("launcher_index", (0, 1), ids=("native", "module"))
+def test_ask_recovers_a_valid_orphan_and_continues_with_a_new_answer(
+    empty_registry_knowledge_ask_root: Path,
+    launcher_index: int,
+) -> None:
+    arguments = (
+        "--knowledge-data-root",
+        str(empty_registry_knowledge_ask_root),
+        "knowledge",
+        "ask",
+        "Which evidence supports this conclusion?",
+        "--json",
+    )
+    command = launcher_commands(arguments)[launcher_index]
+    first = run_launcher(command)
+    assert first.returncode == 0, first.stderr.decode(errors="replace")
+    first_receipt = json.loads(first.stdout)
+    first_answer_id = first_receipt["result"]["answer_id"]
+    first_target = empty_registry_knowledge_ask_root / "answers" / first_answer_id
+    first_orphan = (
+        empty_registry_knowledge_ask_root / "answers" / ".staging" / first_answer_id
+    )
+    first_target.rename(first_orphan)
+
+    second = run_launcher(command)
+
+    assert second.returncode == 0, second.stderr.decode(errors="replace")
+    assert second.stderr == b""
+    second_receipt = json.loads(second.stdout)
+    assert second_receipt["outcome"] == "succeeded"
+    assert second_receipt["result"]["answer_id"] != first_answer_id
+    assert second_receipt["diagnostics"] == [
+        {
+            "code": "knowledge.ask.orphan_recovered.v1",
+            "context": {"count": 1},
+        }
+    ]
+    assert first_target.is_dir()
+    assert not first_orphan.exists()
+
+
+@pytest.mark.parametrize("launcher_index", (0, 1), ids=("native", "module"))
+def test_json_broken_pipe_does_not_roll_back_the_committed_answer(
+    empty_registry_knowledge_ask_root: Path,
+    launcher_index: int,
+) -> None:
+    from gezhi._answer_terminal import (
+        TerminalAnswerBytesReadyV1,
+        read_committed_answer_v1,
+    )
+    from gezhi._windows_data_root import open_validated_data_root_v1
+
+    arguments = (
+        "--knowledge-data-root",
+        str(empty_registry_knowledge_ask_root),
+        "knowledge",
+        "ask",
+        "Which evidence supports this conclusion?",
+        "--json",
+    )
+    process = subprocess.Popen(
+        launcher_commands(arguments)[launcher_index],
+        cwd=REPOSITORY_ROOT,
+        env=subprocess_environment(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    process.stdout.close()
+    assert process.wait(timeout=15) == 1
+    assert process.stderr is not None
+    assert process.stderr.read() == b""
+
+    answers = empty_registry_knowledge_ask_root / "answers"
+    answer_ids = sorted(
+        entry.name
+        for entry in answers.iterdir()
+        if entry.is_dir() and entry.name != ".staging"
+    )
+    assert len(answer_ids) == 1
+    with open_validated_data_root_v1(str(empty_registry_knowledge_ask_root)) as root:
+        committed = read_committed_answer_v1(root, answer_ids[0])
+    assert type(committed) is TerminalAnswerBytesReadyV1
+    assert committed.status == "succeeded"
+
+
 def _install_codex_launch_guard(site_root: Path) -> Path:
     marker = site_root / "codex-launched.marker"
     site_root.mkdir()

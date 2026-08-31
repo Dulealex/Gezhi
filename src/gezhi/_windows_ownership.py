@@ -55,6 +55,7 @@ class WriterOwnershipV1:
     _handle: int
     _thread_id: int
     _closed: bool = False
+    _knowledge_answer_publish_consumed: bool = False
 
     def __enter__(self) -> Self:
         if self._closed:
@@ -117,6 +118,20 @@ class WriterOwnershipV1:
                 raise WriterOwnershipLifecycleErrorV1(
                     "Knowledge Answer writer ownership proof is invalid"
                 )
+
+    def consume_knowledge_answer_publish_v1(
+        self,
+        root_identity: FileIdentity,
+    ) -> None:
+        """Consume the one current-Answer publication allowed by this lease."""
+
+        self.assert_knowledge_answer_ownership_v1(root_identity)
+        with _registry_guard:
+            if self._knowledge_answer_publish_consumed:
+                raise WriterOwnershipLifecycleErrorV1(
+                    "Knowledge Answer publication is already consumed"
+                )
+            self._knowledge_answer_publish_consumed = True
 
     def close(self) -> None:
         if self._closed:

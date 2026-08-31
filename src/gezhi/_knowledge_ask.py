@@ -7,7 +7,7 @@ import time
 import unicodedata
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -22,6 +22,7 @@ from gezhi._answer_terminal import (
     AnswerPublishRequestV1,
     AnswerRootIntegrityLostV1,
     AnswerStagingFailedV1,
+    AnswerStagingScanV1,
     AnswerTargetConflictV1,
     publish_answer_v1,
     scan_answer_staging_v1,
@@ -66,6 +67,7 @@ _GIT_REVISION = re.compile(rb"^[0-9a-f]{40}\r?\n?$")
 _ANSWER_ID = re.compile(
     r"^ans_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _EFFECTIVE_CONFIG = {
     "attempt_timeout_ms": 1_800_000,
     "attempt_window_limit_ms": 5_700_000,
@@ -99,12 +101,33 @@ class _UnmanagedNoCancellationV1:
         return True
 
 
-def _pre_id_interrupted_report_v1() -> KnowledgeAskReportV1:
-    return KnowledgeAskReportV1(
+def _with_staging_scan_facts_v1(
+    report: KnowledgeAskReportV1,
+    staging_scan: AnswerStagingScanV1 | None,
+) -> KnowledgeAskReportV1:
+    if staging_scan is None:
+        return report
+    observed = replace(
+        report,
+        orphan_quarantined_count=staging_scan.quarantined_count,
+        orphan_recovered_count=staging_scan.recovered_count,
+        orphan_recovery_failed_count=staging_scan.recovery_failed_count,
+        orphan_target_conflict_count=staging_scan.target_conflict_count,
+    )
+    validate_knowledge_ask_report_v1(observed)
+    return observed
+
+
+def _pre_id_interrupted_report_v1(
+    staging_scan: AnswerStagingScanV1 | None = None,
+) -> KnowledgeAskReportV1:
+    report = KnowledgeAskReportV1(
         outcome="interrupted",
         result=None,
         reason="user_interrupted_before_answer",
     )
+    validate_knowledge_ask_report_v1(report)
+    return _with_staging_scan_facts_v1(report, staging_scan)
 
 
 def _canonical_json_file_v1(value: object) -> bytes:
@@ -205,12 +228,24 @@ def _utc_now_milliseconds_v1() -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class CommittedAnswerLocatorV1:
+    root_path: str
+    answer_id: str
+    manifest_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class KnowledgeAskReportV1:
     outcome: KnowledgeAskOutcomeV1
     result: dict[str, object] | None
     reason: str | None
     capture_overflow_channels: tuple[str, ...] = ()
     answer_markdown_bytes: bytes | None = None
+    committed_answer_locator: CommittedAnswerLocatorV1 | None = None
+    orphan_quarantined_count: int = 0
+    orphan_recovered_count: int = 0
+    orphan_recovery_failed_count: int = 0
+    orphan_target_conflict_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,6 +352,23 @@ def validate_knowledge_ask_report_v1(report: KnowledgeAskReportV1) -> None:
         ("final_message",),
     }:
         raise ValueError("Knowledge ask capture overflow facts are invalid")
+    orphan_counts = (
+        report.orphan_quarantined_count,
+        report.orphan_recovered_count,
+        report.orphan_recovery_failed_count,
+        report.orphan_target_conflict_count,
+    )
+    if any(type(count) is not int or count < 0 for count in orphan_counts):
+        raise ValueError("Knowledge ask orphan recovery facts are invalid")
+    locator = report.committed_answer_locator
+    if locator is not None and (
+        type(locator) is not CommittedAnswerLocatorV1
+        or type(locator.root_path) is not str
+        or not locator.root_path
+        or _ANSWER_ID.fullmatch(locator.answer_id) is None
+        or _SHA256.fullmatch(locator.manifest_sha256) is None
+    ):
+        raise ValueError("Knowledge ask committed Answer locator is invalid")
     if report.outcome == "succeeded":
         if (
             type(report.result) is not dict
@@ -330,6 +382,8 @@ def validate_knowledge_ask_report_v1(report: KnowledgeAskReportV1) -> None:
         answer_id = report.result["answer_id"]
         if type(answer_id) is not str or _ANSWER_ID.fullmatch(answer_id) is None:
             raise ValueError("Knowledge ask result identity is invalid")
+        if locator is None or locator.answer_id != answer_id:
+            raise ValueError("Knowledge ask committed Answer locator differs")
         answer_output = report.result["answer_output"]
         if type(answer_output) is not dict:
             raise ValueError("Knowledge ask AnswerOutput is invalid")
@@ -363,15 +417,21 @@ def validate_knowledge_ask_report_v1(report: KnowledgeAskReportV1) -> None:
             or report.result["answer_output"] is not None
         ):
             raise ValueError("Knowledge ask committed stop receipt is invalid")
+        if locator is None or locator.answer_id != report.result["answer_id"]:
+            raise ValueError("Knowledge ask committed Answer locator differs")
         if report.capture_overflow_channels and (
             report.outcome != "failed" or report.reason != "codex_process_failed"
         ):
             raise ValueError("Knowledge ask capture overflow binding is invalid")
         return
+    if locator is not None:
+        raise ValueError("Knowledge ask no-commit report has an Answer locator")
     if report.answer_markdown_bytes is not None:
         raise ValueError("Knowledge ask non-success Markdown is invalid")
     if report.capture_overflow_channels:
         raise ValueError("Knowledge ask no-commit report has capture overflow facts")
+    if report.outcome == "blocked" and any(orphan_counts):
+        raise ValueError("Knowledge ask blocked report has orphan recovery facts")
     if (report.outcome, report.reason) not in {
         ("blocked", "invalid_question"),
         ("blocked", "question_too_large"),
@@ -396,14 +456,18 @@ def validate_knowledge_ask_report_v1(report: KnowledgeAskReportV1) -> None:
         raise ValueError("Knowledge ask reason/outcome matrix is invalid")
 
 
-def _failed_report_v1(reason: str) -> KnowledgeAskReportV1:
+def _failed_report_v1(
+    reason: str,
+    *,
+    staging_scan: AnswerStagingScanV1 | None = None,
+) -> KnowledgeAskReportV1:
     report = KnowledgeAskReportV1(
         outcome="failed",
         result=None,
         reason=reason,
     )
     validate_knowledge_ask_report_v1(report)
-    return report
+    return _with_staging_scan_facts_v1(report, staging_scan)
 
 
 def _publish_answer_report_v1(
@@ -413,19 +477,23 @@ def _publish_answer_report_v1(
     request: AnswerPublishRequestV1,
     answer_output: dict[str, object] | None,
     capture_overflow_channels: tuple[str, ...],
+    staging_scan: AnswerStagingScanV1,
 ) -> KnowledgeAskReportV1:
     try:
         committed = publish_answer_v1(root, owner, request)
     except AnswerRootIntegrityLostV1:
-        return _failed_report_v1("data_root_integrity_lost")
+        return _failed_report_v1(
+            "data_root_integrity_lost",
+            staging_scan=staging_scan,
+        )
     except AnswerStagingFailedV1:
-        return _failed_report_v1("answer_staging_failed")
+        return _failed_report_v1("answer_staging_failed", staging_scan=staging_scan)
     except AnswerManifestFailedV1:
-        return _failed_report_v1("answer_manifest_failed")
+        return _failed_report_v1("answer_manifest_failed", staging_scan=staging_scan)
     except AnswerTargetConflictV1:
-        return _failed_report_v1("answer_target_conflict")
+        return _failed_report_v1("answer_target_conflict", staging_scan=staging_scan)
     except AnswerCommitFailedV1:
-        return _failed_report_v1("answer_commit_failed")
+        return _failed_report_v1("answer_commit_failed", staging_scan=staging_scan)
     except AnswerCommitIndeterminateV1:
         raise
     if (
@@ -456,6 +524,15 @@ def _publish_answer_report_v1(
         reason=report_reason,
         capture_overflow_channels=capture_overflow_channels,
         answer_markdown_bytes=committed.answer_markdown_bytes,
+        committed_answer_locator=CommittedAnswerLocatorV1(
+            root_path=cast(str, root.inspection.canonical_path),
+            answer_id=committed.answer_id,
+            manifest_sha256=committed.manifest_sha256,
+        ),
+        orphan_quarantined_count=staging_scan.quarantined_count,
+        orphan_recovered_count=staging_scan.recovered_count,
+        orphan_recovery_failed_count=staging_scan.recovery_failed_count,
+        orphan_target_conflict_count=staging_scan.target_conflict_count,
     )
     validate_knowledge_ask_report_v1(report)
     return report
@@ -586,14 +663,12 @@ class KnowledgeAsksV1:
                     return _failed_report_v1("data_root_integrity_lost")
                 except AnswerOrphanScanFailedV1:
                     return _failed_report_v1("orphan_scan_failed")
-                if staging_scan.status != "empty":
-                    # T23 supplies the complete orphan inspection/recovery protocol.
-                    # Until then, an existing staging entry cannot be bypassed safely.
-                    return _failed_report_v1("orphan_scan_failed")
+                if staging_scan.status not in {"empty", "complete"}:
+                    raise RuntimeError("Answer staging scan status is invalid")
 
                 answer_id_candidate = _new_answer_id_v1()
                 if not cancellation_bridge.try_answer_id_cutover_v1():
-                    return _pre_id_interrupted_report_v1()
+                    return _pre_id_interrupted_report_v1(staging_scan)
                 answer_id = answer_id_candidate
                 started_monotonic_ns = time.monotonic_ns()
                 started_at = _utc_now_milliseconds_v1()
@@ -617,6 +692,7 @@ class KnowledgeAsksV1:
                         request=interrupted_request,
                         answer_output=None,
                         capture_overflow_channels=(),
+                        staging_scan=staging_scan,
                     )
                 try:
                     retrieval = KnowledgeRetrievalV1.retrieve(
@@ -628,7 +704,10 @@ class KnowledgeAsksV1:
                         ).hexdigest(),
                     )
                 except RetrievalDataRootIntegrityLostV1:
-                    return _failed_report_v1("data_root_integrity_lost")
+                    return _failed_report_v1(
+                        "data_root_integrity_lost",
+                        staging_scan=staging_scan,
+                    )
                 terminal_status: KnowledgeAskOutcomeV1
                 terminal_error: dict[str, object] | None
                 prompt_bytes: bytes | None
@@ -677,7 +756,10 @@ class KnowledgeAsksV1:
 
                         canonical_root = root.inspection.canonical_path
                         if canonical_root is None:
-                            return _failed_report_v1("data_root_integrity_lost")
+                            return _failed_report_v1(
+                                "data_root_integrity_lost",
+                                staging_scan=staging_scan,
+                            )
                         try:
                             answerer = answer_nonzero_v1(
                                 retrieval,
@@ -778,10 +860,12 @@ class KnowledgeAsksV1:
                     request=request,
                     answer_output=answer_output,
                     capture_overflow_channels=capture_overflow_channels,
+                    staging_scan=staging_scan,
                 )
 
 
 __all__ = [
+    "CommittedAnswerLocatorV1",
     "KnowledgeAskReportV1",
     "KnowledgeAsksV1",
     "NormalizedQuestionV1",

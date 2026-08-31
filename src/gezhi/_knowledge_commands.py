@@ -3,8 +3,12 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from typing import cast
+from typing import Literal, TypeAlias, cast
 
+from gezhi._answer_terminal import (
+    TerminalAnswerBytesReadyV1,
+    read_committed_answer_v1,
+)
 from gezhi._knowledge_ask import (
     KnowledgeAskReportV1,
     KnowledgeAsksV1,
@@ -23,7 +27,10 @@ from gezhi._presentation import (
     CliJsonOutputTooLargeV1,
     cli_json_buffer_v1,
     write_binary_buffer_v1,
+    write_knowledge_ask_human_buffer_v1,
+    write_knowledge_ask_json_buffer_v1,
 )
+from gezhi._windows_data_root import DataRootOpenErrorV1, open_validated_data_root_v1
 
 _OUTPUT_CAP = 1_048_576
 _ASK_JSON_OUTPUT_CAP = 65_536
@@ -171,6 +178,17 @@ _ASK_PRIMARY = {
         "如仍需要答案，请重新运行 knowledge ask",
     ),
 }
+
+_PresentationFailureKindV1: TypeAlias = Literal[
+    "diagnostic_projection_unrepresentable",
+    "canonical_serialization_failed",
+    "stdout_cap_exceeded",
+    "human_terminal_answer_bytes_rejected",
+    "human_semantic_render_rejected",
+    "human_utf8_encode_failed",
+    "human_semantic_bytes_rejected",
+    "human_semantic_bytes_too_large",
+]
 _DISCLOSURE = (
     "治理说明：以下结果仅为已审核但尚未晋升的 Candidate Knowledge，"
     "不代表已晋升知识、已验证事实或自动蕴含证明。"
@@ -609,13 +627,78 @@ def run_ask(
         or candidate.json_output is not json_output
         or candidate.outcome != report.outcome
         or candidate.result != _freeze_json_value_v1(report.result)
-        or candidate.diagnostics
-        != _freeze_json_value_v1(_knowledge_ask_diagnostics_v1(report))
     ):
         raise RuntimeError("Knowledge ask presentation candidate differs")
-    if candidate.byte_length != len(candidate.buffer):
+    if candidate.failure_kind == "diagnostic_projection_unrepresentable":
+        if candidate.diagnostics is not None or candidate.envelope is not None:
+            raise RuntimeError("Knowledge ask diagnostic projection candidate differs")
+    else:
+        projected = _build_knowledge_ask_diagnostics_v1(report)
+        if type(projected) is not _KnowledgeAskDiagnosticsReadyV1 or (
+            candidate.diagnostics != _freeze_json_value_v1(projected.diagnostics)
+        ):
+            raise RuntimeError("Knowledge ask presentation diagnostics differ")
+    if candidate.disposition == "no_output_presentation_failure":
+        if (
+            candidate.failure_kind
+            not in {
+                "canonical_serialization_failed",
+                "stdout_cap_exceeded",
+                "diagnostic_projection_unrepresentable",
+                "human_terminal_answer_bytes_rejected",
+                "human_semantic_render_rejected",
+                "human_utf8_encode_failed",
+                "human_semantic_bytes_rejected",
+                "human_semantic_bytes_too_large",
+            }
+            or candidate.buffer is not None
+            or candidate.byte_length is not None
+            or (
+                candidate.failure_kind == "diagnostic_projection_unrepresentable"
+                and (
+                    candidate.diagnostics is not None or candidate.envelope is not None
+                )
+            )
+            or (
+                candidate.failure_kind
+                in {"canonical_serialization_failed", "stdout_cap_exceeded"}
+                and (
+                    not candidate.json_output
+                    or candidate.envelope is None
+                    or candidate.diagnostics is None
+                )
+            )
+            or (
+                candidate.failure_kind
+                in {
+                    "human_terminal_answer_bytes_rejected",
+                    "human_semantic_render_rejected",
+                    "human_utf8_encode_failed",
+                    "human_semantic_bytes_rejected",
+                    "human_semantic_bytes_too_large",
+                }
+                and (
+                    candidate.json_output
+                    or candidate.envelope is not None
+                    or candidate.diagnostics is None
+                )
+            )
+        ):
+            raise RuntimeError("Knowledge ask no-output candidate differs")
+        os._exit(1)
+        raise RuntimeError("Knowledge ask hard exit returned")
+    if (
+        candidate.disposition != "ready_bytes"
+        or candidate.failure_kind is not None
+        or type(candidate.buffer) is not bytes
+        or candidate.byte_length != len(candidate.buffer)
+    ):
         raise RuntimeError("Knowledge ask presentation buffer proof differs")
-    write_binary_buffer_v1(candidate.buffer, fd=1, max_chunk_size=_WRITE_CHUNK)
+    buffer = candidate.buffer
+    if candidate.json_output:
+        write_knowledge_ask_json_buffer_v1(buffer)
+    else:
+        write_knowledge_ask_human_buffer_v1(buffer)
     return {"succeeded": 0, "blocked": 2, "failed": 1, "interrupted": 130}[
         report.outcome
     ]
@@ -629,6 +712,16 @@ class _FrozenJsonObjectV1:
 @dataclass(frozen=True, slots=True)
 class _FrozenJsonArrayV1:
     items: tuple[object, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _KnowledgeAskDiagnosticsReadyV1:
+    diagnostics: list[dict[str, object]]
+
+
+@dataclass(frozen=True, slots=True)
+class _DiagnosticProjectionUnrepresentableV1:
+    pass
 
 
 def _freeze_json_value_v1(value: object) -> object:
@@ -667,7 +760,43 @@ def _knowledge_ask_diagnostics_v1(
                 "context": {"channels": list(report.capture_overflow_channels)},
             }
         )
+    orphan_supplementals = (
+        (
+            "knowledge.ask.orphan_quarantined.v1",
+            report.orphan_quarantined_count,
+        ),
+        ("knowledge.ask.orphan_recovered.v1", report.orphan_recovered_count),
+        (
+            "knowledge.ask.orphan_recovery_failed.v1",
+            report.orphan_recovery_failed_count,
+        ),
+        (
+            "knowledge.ask.orphan_target_conflict.v1",
+            report.orphan_target_conflict_count,
+        ),
+    )
+    diagnostics.extend(
+        {"code": code, "context": {"count": count}}
+        for code, count in orphan_supplementals
+        if count
+    )
     return diagnostics
+
+
+def _build_knowledge_ask_diagnostics_v1(
+    report: KnowledgeAskReportV1,
+) -> _KnowledgeAskDiagnosticsReadyV1 | _DiagnosticProjectionUnrepresentableV1:
+    counts = (
+        report.orphan_quarantined_count,
+        report.orphan_recovered_count,
+        report.orphan_recovery_failed_count,
+        report.orphan_target_conflict_count,
+    )
+    if any(count > 9_223_372_036_854_775_807 for count in counts):
+        return _DiagnosticProjectionUnrepresentableV1()
+    return _KnowledgeAskDiagnosticsReadyV1(
+        diagnostics=_knowledge_ask_diagnostics_v1(report)
+    )
 
 
 def _knowledge_ask_envelope_v1(
@@ -693,52 +822,232 @@ def _capture_overflow_hint_v1(channels: tuple[str, ...]) -> str | None:
     return "Codex 事件与最终消息捕获均超过各自上限，已保留精确上限前缀"
 
 
+def _orphan_hints_v1(report: KnowledgeAskReportV1) -> tuple[str, ...]:
+    observed: list[str] = []
+    if report.orphan_quarantined_count:
+        observed.append(
+            f"发现 {report.orphan_quarantined_count} 个无法安全恢复的历史 "
+            "Answer staging，已原地逻辑隔离"
+        )
+    if report.orphan_recovered_count:
+        observed.append(
+            f"已恢复并提交 {report.orphan_recovered_count} 个完整历史 Answer"
+        )
+    if report.orphan_recovery_failed_count:
+        observed.append(
+            f"有 {report.orphan_recovery_failed_count} 个历史 Answer 的确定性"
+            "恢复提交失败，staging 已原地保留"
+        )
+    if report.orphan_target_conflict_count:
+        observed.append(
+            f"有 {report.orphan_target_conflict_count} 个历史 Answer 因同身份 "
+            "target 已存在而未恢复"
+        )
+    return tuple(observed)
+
+
+@dataclass(frozen=True, slots=True)
+class _HumanTerminalAnswerReadyV1:
+    answer_markdown_bytes: bytes
+    answer_markdown_text: str
+
+
+@dataclass(frozen=True, slots=True)
+class _HumanSemanticTextReadyV1:
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class _HumanSemanticTextRejectedV1:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class _HumanSemanticBytesValidV1:
+    buffer: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _HumanSemanticBytesRejectedV1:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class _HumanSemanticBytesWithinLimitV1:
+    buffer: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _HumanSemanticBytesTooLargeV1:
+    pass
+
+
+def _read_committed_answer_for_human_v1(
+    report: KnowledgeAskReportV1,
+) -> _HumanTerminalAnswerReadyV1 | None:
+    locator = report.committed_answer_locator
+    if locator is None or report.result is None:
+        raise ValueError("Knowledge ask committed Answer locator is absent")
+    try:
+        with open_validated_data_root_v1(locator.root_path) as root:
+            observed = read_committed_answer_v1(root, locator.answer_id)
+    except (DataRootOpenErrorV1, OSError):
+        return None
+    if (
+        type(observed) is not TerminalAnswerBytesReadyV1
+        or observed.answer_id != locator.answer_id
+        or observed.manifest_sha256 != locator.manifest_sha256
+        or observed.status != "succeeded"
+        or type(observed.answer_markdown_bytes) is not bytes
+        or type(observed.answer_markdown_text) is not str
+    ):
+        return None
+    return _HumanTerminalAnswerReadyV1(
+        answer_markdown_bytes=observed.answer_markdown_bytes,
+        answer_markdown_text=observed.answer_markdown_text,
+    )
+
+
+def _render_knowledge_ask_human_text_v1(
+    report: KnowledgeAskReportV1,
+    *,
+    terminal_answer: _HumanTerminalAnswerReadyV1 | None,
+) -> _HumanSemanticTextReadyV1 | _HumanSemanticTextRejectedV1:
+    if report.outcome == "succeeded":
+        if (
+            type(report.result) is not dict
+            or type(terminal_answer) is not _HumanTerminalAnswerReadyV1
+            or terminal_answer.answer_markdown_bytes.startswith(b"\xef\xbb\xbf")
+            or b"\r" in terminal_answer.answer_markdown_bytes
+            or b"\x00" in terminal_answer.answer_markdown_bytes
+            or not terminal_answer.answer_markdown_bytes.endswith(b"\n")
+        ):
+            return _HumanSemanticTextRejectedV1()
+        answer_id = report.result["answer_id"]
+        if type(answer_id) is not str:
+            return _HumanSemanticTextRejectedV1()
+        lines = ["Knowledge ask：完成", f"Answer ID：{answer_id}"]
+        lines.extend(f"提示：{hint}" for hint in _orphan_hints_v1(report))
+        if (
+            report.orphan_quarantined_count
+            or report.orphan_recovery_failed_count
+            or report.orphan_target_conflict_count
+        ):
+            next_step = (
+                "运行 gezhi status 观察历史 Answer 异常；status 不会修复、"
+                "移动、删除或恢复 Answer 目录"
+            )
+        else:
+            next_step = "无需操作"
+        lines.append(f"下一步：{next_step}")
+        return _HumanSemanticTextReadyV1(
+            text=("\n".join(lines) + "\n\n" + terminal_answer.answer_markdown_text)
+        )
+
+    if terminal_answer is not None or report.reason not in _ASK_PRIMARY:
+        return _HumanSemanticTextRejectedV1()
+    _code, reason, next_step = _ASK_PRIMARY[report.reason]
+    heading = {
+        "blocked": "Knowledge ask：已阻塞",
+        "failed": "Knowledge ask：失败",
+        "interrupted": "Knowledge ask：已中断",
+    }[report.outcome]
+    lines = [heading]
+    if report.result is not None:
+        answer_id = report.result["answer_id"]
+        if type(answer_id) is not str:
+            return _HumanSemanticTextRejectedV1()
+        lines.append(f"Answer ID：{answer_id}")
+    lines.append(f"原因：{reason}")
+    hint = _capture_overflow_hint_v1(report.capture_overflow_channels)
+    if hint is not None:
+        lines.append(f"提示：{hint}")
+    lines.extend(f"提示：{hint}" for hint in _orphan_hints_v1(report))
+    lines.append(f"下一步：{next_step}")
+    return _HumanSemanticTextReadyV1(text="\n".join(lines) + "\n")
+
+
+def _validate_knowledge_ask_human_bytes_v1(
+    report: KnowledgeAskReportV1,
+    rendered: _HumanSemanticTextReadyV1,
+    buffer: bytes,
+    *,
+    terminal_answer: _HumanTerminalAnswerReadyV1 | None,
+) -> _HumanSemanticBytesValidV1 | _HumanSemanticBytesRejectedV1:
+    if (
+        type(buffer) is not bytes
+        or buffer.startswith(b"\xef\xbb\xbf")
+        or b"\r" in buffer
+        or b"\x00" in buffer
+        or b"\x1b" in buffer
+        or not buffer.endswith(b"\n")
+        or buffer.endswith(b"\n\n")
+        or any(line.endswith((b" ", b"\t")) for line in buffer[:-1].split(b"\n"))
+    ):
+        return _HumanSemanticBytesRejectedV1()
+    try:
+        decoded = buffer.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return _HumanSemanticBytesRejectedV1()
+    if decoded != rendered.text:
+        return _HumanSemanticBytesRejectedV1()
+    if report.outcome == "succeeded":
+        if type(
+            terminal_answer
+        ) is not _HumanTerminalAnswerReadyV1 or not buffer.endswith(
+            terminal_answer.answer_markdown_bytes
+        ):
+            return _HumanSemanticBytesRejectedV1()
+        prefix = buffer[: -len(terminal_answer.answer_markdown_bytes)]
+        if not prefix.endswith(b"\n\n"):
+            return _HumanSemanticBytesRejectedV1()
+    elif terminal_answer is not None:
+        return _HumanSemanticBytesRejectedV1()
+    return _HumanSemanticBytesValidV1(buffer=buffer)
+
+
+def _check_knowledge_ask_human_cap_v1(
+    validated: _HumanSemanticBytesValidV1,
+) -> _HumanSemanticBytesWithinLimitV1 | _HumanSemanticBytesTooLargeV1:
+    if len(validated.buffer) > _ASK_HUMAN_OUTPUT_CAP:
+        return _HumanSemanticBytesTooLargeV1()
+    return _HumanSemanticBytesWithinLimitV1(buffer=validated.buffer)
+
+
 def _knowledge_ask_human_buffer_v1(
     report: KnowledgeAskReportV1,
     *,
     answer_markdown_bytes: bytes | None,
 ) -> bytes:
     validate_knowledge_ask_report_v1(report)
-    if report.outcome == "succeeded":
-        if (
-            type(report.result) is not dict
-            or type(answer_markdown_bytes) is not bytes
-            or answer_markdown_bytes.startswith(b"\xef\xbb\xbf")
-            or b"\r" in answer_markdown_bytes
-            or b"\x00" in answer_markdown_bytes
-            or not answer_markdown_bytes.endswith(b"\n")
-        ):
-            raise ValueError("Knowledge ask committed Markdown is invalid")
-        answer_id = report.result["answer_id"]
-        if type(answer_id) is not str:
-            raise TypeError("Knowledge ask Human Answer ID is invalid")
-        payload = (
-            f"Knowledge ask：完成\nAnswer ID：{answer_id}\n下一步：无需操作\n\n"
-        ).encode() + answer_markdown_bytes
-    else:
-        if answer_markdown_bytes is not None or report.reason not in _ASK_PRIMARY:
-            raise ValueError("Knowledge ask Human diagnostic is invalid")
-        _code, reason, next_step = _ASK_PRIMARY[report.reason]
-        heading = {
-            "blocked": "Knowledge ask：已阻塞",
-            "failed": "Knowledge ask：失败",
-            "interrupted": "Knowledge ask：已中断",
-        }[report.outcome]
-        lines = [heading]
-        if report.result is not None:
-            answer_id = report.result["answer_id"]
-            if type(answer_id) is not str:
-                raise TypeError("Knowledge ask Human Answer ID is invalid")
-            lines.append(f"Answer ID：{answer_id}")
-        lines.append(f"原因：{reason}")
-        hint = _capture_overflow_hint_v1(report.capture_overflow_channels)
-        if hint is not None:
-            lines.append(f"提示：{hint}")
-        lines.append(f"下一步：{next_step}")
-        payload = ("\n".join(lines) + "\n").encode()
-    if len(payload) > _ASK_HUMAN_OUTPUT_CAP:
+    terminal_answer: _HumanTerminalAnswerReadyV1 | None = None
+    if answer_markdown_bytes is not None:
+        terminal_answer = _HumanTerminalAnswerReadyV1(
+            answer_markdown_bytes=answer_markdown_bytes,
+            answer_markdown_text=answer_markdown_bytes.decode("utf-8", errors="strict"),
+        )
+    rendered = _render_knowledge_ask_human_text_v1(
+        report,
+        terminal_answer=terminal_answer,
+    )
+    if type(rendered) is not _HumanSemanticTextReadyV1:
+        raise ValueError("Knowledge ask Human semantic text is invalid")
+    try:
+        payload = rendered.text.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as error:
+        raise ValueError("Knowledge ask Human semantic text is invalid") from error
+    validated = _validate_knowledge_ask_human_bytes_v1(
+        report,
+        rendered,
+        payload,
+        terminal_answer=terminal_answer,
+    )
+    if type(validated) is not _HumanSemanticBytesValidV1:
+        raise ValueError("Knowledge ask Human semantic bytes are invalid")
+    checked = _check_knowledge_ask_human_cap_v1(validated)
+    if type(checked) is not _HumanSemanticBytesWithinLimitV1:
         raise ValueError("Knowledge ask Human output exceeds its byte limit")
-    return payload
+    return checked.buffer
 
 
 @dataclass(frozen=True, slots=True)
@@ -746,10 +1055,12 @@ class _UnboundKnowledgeAskPresentationV1:
     report: KnowledgeAskReportV1
     outcome: str
     result: object
-    diagnostics: _FrozenJsonArrayV1
+    diagnostics: _FrozenJsonArrayV1 | None
     envelope: _FrozenJsonObjectV1 | None
-    buffer: bytes
-    byte_length: int
+    disposition: Literal["ready_bytes", "no_output_presentation_failure"]
+    failure_kind: _PresentationFailureKindV1 | None
+    buffer: bytes | None
+    byte_length: int | None
     json_output: bool
 
 
@@ -760,10 +1071,12 @@ class _PreparedKnowledgeAskPresentationV1:
     report: KnowledgeAskReportV1
     outcome: str
     result: object
-    diagnostics: _FrozenJsonArrayV1
+    diagnostics: _FrozenJsonArrayV1 | None
     envelope: _FrozenJsonObjectV1 | None
-    buffer: bytes
-    byte_length: int
+    disposition: Literal["ready_bytes", "no_output_presentation_failure"]
+    failure_kind: _PresentationFailureKindV1 | None
+    buffer: bytes | None
+    byte_length: int | None
     json_output: bool
 
 
@@ -778,11 +1091,27 @@ def _prepare_knowledge_ask_presentation_v1(
         raise TypeError("Knowledge ask presentation mode is invalid")
     if answer_markdown_bytes is not report.answer_markdown_bytes:
         raise ValueError("Knowledge ask committed Markdown identity differs")
-    diagnostics = _knowledge_ask_diagnostics_v1(report)
+    frozen_result = _freeze_json_value_v1(report.result)
+    projected = _build_knowledge_ask_diagnostics_v1(report)
+    if type(projected) is _DiagnosticProjectionUnrepresentableV1:
+        return _UnboundKnowledgeAskPresentationV1(
+            report=report,
+            outcome=report.outcome,
+            result=frozen_result,
+            diagnostics=None,
+            envelope=None,
+            disposition="no_output_presentation_failure",
+            failure_kind="diagnostic_projection_unrepresentable",
+            buffer=None,
+            byte_length=None,
+            json_output=json_output,
+        )
+    if type(projected) is not _KnowledgeAskDiagnosticsReadyV1:
+        raise RuntimeError("Knowledge ask diagnostic projection verdict is invalid")
+    diagnostics = projected.diagnostics
     frozen_diagnostics = _freeze_json_value_v1(diagnostics)
     if type(frozen_diagnostics) is not _FrozenJsonArrayV1:
         raise RuntimeError("Knowledge ask diagnostics freeze proof differs")
-    frozen_result = _freeze_json_value_v1(report.result)
     envelope: _FrozenJsonObjectV1 | None = None
     buffer: bytes
     if json_output:
@@ -791,24 +1120,142 @@ def _prepare_knowledge_ask_presentation_v1(
         if type(frozen_envelope) is not _FrozenJsonObjectV1:
             raise RuntimeError("Knowledge ask envelope freeze proof differs")
         envelope = frozen_envelope
-        buffer = cli_json_buffer_v1(
-            command="knowledge.ask",
-            outcome=report.outcome,
-            result=report.result,
-            diagnostics=diagnostics,
-            output_cap=_ASK_JSON_OUTPUT_CAP,
-        )
+        try:
+            buffer = (
+                json.dumps(
+                    envelope_value,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8", errors="strict")
+                + b"\n"
+            )
+        except (TypeError, ValueError):
+            return _UnboundKnowledgeAskPresentationV1(
+                report=report,
+                outcome=report.outcome,
+                result=frozen_result,
+                diagnostics=frozen_diagnostics,
+                envelope=envelope,
+                disposition="no_output_presentation_failure",
+                failure_kind="canonical_serialization_failed",
+                buffer=None,
+                byte_length=None,
+                json_output=True,
+            )
+        if len(buffer) > _ASK_JSON_OUTPUT_CAP:
+            return _UnboundKnowledgeAskPresentationV1(
+                report=report,
+                outcome=report.outcome,
+                result=frozen_result,
+                diagnostics=frozen_diagnostics,
+                envelope=envelope,
+                disposition="no_output_presentation_failure",
+                failure_kind="stdout_cap_exceeded",
+                buffer=None,
+                byte_length=None,
+                json_output=True,
+            )
     else:
-        buffer = _knowledge_ask_human_buffer_v1(
+        terminal_answer: _HumanTerminalAnswerReadyV1 | None = None
+        if report.outcome == "succeeded":
+            terminal_answer = _read_committed_answer_for_human_v1(report)
+            if terminal_answer is None:
+                return _UnboundKnowledgeAskPresentationV1(
+                    report=report,
+                    outcome=report.outcome,
+                    result=frozen_result,
+                    diagnostics=frozen_diagnostics,
+                    envelope=None,
+                    disposition="no_output_presentation_failure",
+                    failure_kind="human_terminal_answer_bytes_rejected",
+                    buffer=None,
+                    byte_length=None,
+                    json_output=False,
+                )
+        rendered = _render_knowledge_ask_human_text_v1(
             report,
-            answer_markdown_bytes=answer_markdown_bytes,
+            terminal_answer=terminal_answer,
         )
+        if type(rendered) is _HumanSemanticTextRejectedV1:
+            return _UnboundKnowledgeAskPresentationV1(
+                report=report,
+                outcome=report.outcome,
+                result=frozen_result,
+                diagnostics=frozen_diagnostics,
+                envelope=None,
+                disposition="no_output_presentation_failure",
+                failure_kind="human_semantic_render_rejected",
+                buffer=None,
+                byte_length=None,
+                json_output=False,
+            )
+        if type(rendered) is not _HumanSemanticTextReadyV1:
+            raise RuntimeError("Knowledge ask Human renderer verdict is invalid")
+        try:
+            buffer = rendered.text.encode("utf-8", errors="strict")
+        except UnicodeEncodeError:
+            return _UnboundKnowledgeAskPresentationV1(
+                report=report,
+                outcome=report.outcome,
+                result=frozen_result,
+                diagnostics=frozen_diagnostics,
+                envelope=None,
+                disposition="no_output_presentation_failure",
+                failure_kind="human_utf8_encode_failed",
+                buffer=None,
+                byte_length=None,
+                json_output=False,
+            )
+        validated = _validate_knowledge_ask_human_bytes_v1(
+            report,
+            rendered,
+            buffer,
+            terminal_answer=terminal_answer,
+        )
+        if type(validated) is _HumanSemanticBytesRejectedV1:
+            return _UnboundKnowledgeAskPresentationV1(
+                report=report,
+                outcome=report.outcome,
+                result=frozen_result,
+                diagnostics=frozen_diagnostics,
+                envelope=None,
+                disposition="no_output_presentation_failure",
+                failure_kind="human_semantic_bytes_rejected",
+                buffer=None,
+                byte_length=None,
+                json_output=False,
+            )
+        if type(validated) is not _HumanSemanticBytesValidV1:
+            raise RuntimeError("Knowledge ask Human bytes verdict is invalid")
+        checked = _check_knowledge_ask_human_cap_v1(validated)
+        if type(checked) is _HumanSemanticBytesTooLargeV1:
+            return _UnboundKnowledgeAskPresentationV1(
+                report=report,
+                outcome=report.outcome,
+                result=frozen_result,
+                diagnostics=frozen_diagnostics,
+                envelope=None,
+                disposition="no_output_presentation_failure",
+                failure_kind="human_semantic_bytes_too_large",
+                buffer=None,
+                byte_length=None,
+                json_output=False,
+            )
+        if type(checked) is not _HumanSemanticBytesWithinLimitV1:
+            raise RuntimeError("Knowledge ask Human capacity verdict is invalid")
+        if checked.buffer is not buffer:
+            raise RuntimeError("Knowledge ask Human buffer identity changed")
+        buffer = checked.buffer
     return _UnboundKnowledgeAskPresentationV1(
         report=report,
         outcome=report.outcome,
         result=frozen_result,
         diagnostics=frozen_diagnostics,
         envelope=envelope,
+        disposition="ready_bytes",
+        failure_kind=None,
         buffer=buffer,
         byte_length=len(buffer),
         json_output=json_output,
@@ -838,6 +1285,8 @@ def _bind_knowledge_ask_presentation_v1(
         result=unbound.result,
         diagnostics=unbound.diagnostics,
         envelope=unbound.envelope,
+        disposition=unbound.disposition,
+        failure_kind=unbound.failure_kind,
         buffer=unbound.buffer,
         byte_length=unbound.byte_length,
         json_output=unbound.json_output,
