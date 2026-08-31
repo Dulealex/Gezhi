@@ -89,7 +89,7 @@ doctor --json
 
 结果：两个 launcher 均 exit `0`，stdout 逐字相等，七项检查全部 `ready`，overall `ready`。
 
-限制：当前 Doctor 的 Codex 检查证明锁定 CLI 版本与登录状态，但没有证明 `CODEX_HOME` 可通过 Codex Role Invocation v1 的 no-follow/短别名 capability gate；真实 Reader smoke 暴露了这项诊断缺口。
+合同边界：当前 Doctor 的 `codex_runtime` 严格按 Operations v1 只证明项目锁定 CLI 的身份、版本和只读登录状态，并明确不运行 `codex exec` 或语义请求；它不承诺 Codex Role Invocation v1 的 sealed workspace、`TEMP` 或 `CODEX_HOME` capability。因而这里的 `ready` 与后文 Reader 的 `codex_runtime_unavailable` 不矛盾。T26 必须用独立业务角色 smoke 覆盖后者；扩展 Doctor 将改变冻结的 Operations 合同，不属于本票。
 
 ## 真实 OCR
 
@@ -121,9 +121,11 @@ NO_PROXY=127.0.0.1,localhost
 
 1. 新增真实 public CLI 双 launcher 回归，OCR executable double 只复现 `-0.00002` 的坐标序列化差异。
 2. 修复前：两个 case 均因 `ocr_failed` 失败。
-3. 将 page MediaBox/CropBox 坐标规范到四位小数；其他内容、页数与来源身份检查不变。
-4. 修复后：`2 passed`；原始真实 MinerU 现场离线 replay 由 `REPRO_RED` 变为 `REPRO_GREEN`。
-5. 真实 recovery resume 新提交：
+3. ADR 0125 明确冻结 page MediaBox/CropBox 与既有 Form BBox 相同的提供方重写规则：source/origin 各自规范到四位小数后逐项精确比较，规范后仍有差异即拒绝。
+4. 实现只按该规则规范 page-box 坐标；其他内容、页数与来源身份检查不变。
+5. 新增 `-0.00011` 的边界外反例；两个 launcher 均在 OCR stage 拒绝。接受/拒绝矩阵合计 `4 passed`。
+6. 原始真实 MinerU 现场离线 replay 由 `REPRO_RED` 变为 `REPRO_GREEN`。
+7. 真实 recovery resume 新提交：
    - OCR run：`ocrrun_a163bde5-5e17-4a6b-b6d1-acff1b462d8b`
    - OCR manifest：`8b67b1d57d50d72170a48f4a8e8518dd34d37d77534b75a516125853ed80f1e6`
    - method/status/attempts：`mineru_ocr / succeeded / 1`
@@ -179,14 +181,77 @@ Knowledge Answerer 使用同一 Codex Role Invocation v1 的 `CODEX_HOME` capabi
 
 | 验证 | 结果 |
 |---|---|
-| 新 public CLI 坐标舍入回归 | `2 passed in 10.23s` |
-| `tests/test_literature_ocr_stage.py` | `101 passed in 228.00s` |
-| `tests/test_deterministic_end_to_end_v1.py` | `5 passed in 107.41s` |
-| Windows 边界选择集 | `9 passed in 4.59s` |
-| Ruff check | PASS |
-| Ruff format check | PASS |
+| 新 public CLI 坐标规范化接受/拒绝矩阵 | `4 passed in 13.97s` |
+| `tests/test_literature_ocr_stage.py` | `101 passed in 229.94s` |
+| `tests/test_deterministic_end_to_end_v1.py` | `7 passed in 111.90s` |
+| Windows 边界选择集 | `9 passed in 4.20s` |
+| Ruff check `src tests` | PASS |
+| Ruff format check（3 个变更 Python 文件） | PASS |
 | mypy `src/gezhi` | PASS（38 source files） |
 | `git diff --check` | PASS |
+
+## 可复现命令与 T25 映射
+
+以下命令从仓库或 T26 worktree 根目录执行，不安装、同步或升级任何依赖：
+
+```powershell
+$env:PYTHONPATH = "$PWD\src;$PWD\tests"
+& E:\Gezhi\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider tests/test_deterministic_end_to_end_v1.py -k "coordinate_rounding or outside_four_decimals"
+& E:\Gezhi\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider tests/test_literature_ocr_stage.py
+& E:\Gezhi\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider tests/test_deterministic_end_to_end_v1.py
+& E:\Gezhi\.venv\Scripts\python.exe -m ruff check src tests
+& E:\Gezhi\.venv\Scripts\python.exe -m ruff format --check src/gezhi/_literature_resume.py tests/support/ocr_executable_double_v1.py tests/test_deterministic_end_to_end_v1.py
+& E:\Gezhi\.venv\Scripts\python.exe -m mypy src/gezhi
+```
+
+Windows 边界选择集的精确 selectors：
+
+```powershell
+& E:\Gezhi\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider `
+  tests/test_codex_child_process_v1.py::test_measured_pipe_capacities_prove_bidirectional_backpressure `
+  tests/test_codex_child_process_v1.py::test_root_exit_does_not_complete_before_a_descendant_releases_stdout `
+  tests/test_codex_child_process_v1.py::test_no_console_and_exact_stdio_kinds `
+  tests/test_codex_child_process_v1.py::test_readfile_progress_sequence_reaches_real_broken_pipe_eof `
+  tests/test_knowledge_ask_public_contract.py::test_json_broken_pipe_does_not_roll_back_the_committed_answer `
+  tests/test_knowledge_ask_public_contract.py::test_real_ctrl_c_stops_the_active_codex_job_through_both_launchers `
+  tests/test_windows_writer_ownership.py::test_global_named_mutex_blocks_another_process_without_waiting `
+  tests/test_knowledge_intake_public_contract.py::test_external_sqlite_writer_is_classified_as_registry_busy
+```
+
+真实能力探测使用：
+
+```powershell
+& E:\Gezhi\.venv\Scripts\gezhi.exe doctor --json
+& E:\Gezhi\runtimes\ocr\.venv\Scripts\mineru.exe -p E:\Gezhi\data\t26-real-smoke\input\sciadv-aef8657-page1-raster.pdf -o E:\Gezhi\data\t26-real-smoke\offline-ocr-public-paper -b pipeline -m ocr -l ch
+& E:\Gezhi\tools\codex.ps1 --version
+& E:\Gezhi\tools\codex.ps1 login status
+& E:\Gezhi\tools\codex.ps1 exec --ephemeral --ignore-user-config --ignore-rules --strict-config -m gpt-5.6-sol -s read-only --skip-git-repo-check --json -o E:\gztest\t26-real-smoke-temp\direct-codex-final.txt "This is a Gezhi T26 synthetic connectivity smoke. Return exactly: GEZHI_T26_CODEX_OK"
+```
+
+每项真实边界与 [T25 / PR #52](https://github.com/Dulealex/Gezhi/pull/52) 的确定性证据对应如下：
+
+| T26 真实边界 | T25 确定性 witness |
+|---|---|
+| console launcher / `python -m gezhi` 全链 | `test_scanned_pdf_reaches_a_citable_answer_and_governance_branches` |
+| OCR failure、保留审计 run 与跨 launcher 恢复 | `test_ocr_failed_terminal_recovers_with_the_other_launcher` |
+| pipe 容量、背压、descendant settlement、no-console/stdio、broken-pipe EOF | 上述四个 `test_codex_child_process_v1.py` selectors |
+| committed Answer 的输出端 broken pipe | `test_json_broken_pipe_does_not_roll_back_the_committed_answer` |
+| 两 launcher 的真实 Ctrl+C 与 active Codex Job stop | `test_real_ctrl_c_stops_the_active_codex_job_through_both_launchers` |
+| 跨进程 Work writer 互斥 | `test_global_named_mutex_blocks_another_process_without_waiting` |
+| 外部 SQLite writer contention | `test_external_sqlite_writer_is_classified_as_registry_busy` |
+| 被占用/不可读取 PDF 的 public diagnostic | T26 真实独占句柄 smoke；T25 `test_missing_or_directory_pdf_is_pdf_unavailable` 固定相同无正式 Work 的 public failure contract |
+| Doctor | Operations v1 的双 launcher contract suite；T26 另行运行真实冻结探测，不把 deterministic observation double 解释为真实环境证据 |
+
+全仓 `ruff format --check src tests` 在未变更的 `main` 基线中会报告 37 个既有文件可重排；T26 不批量格式化无关文件。全仓 Ruff lint、mypy 与全部变更 Python 文件的 formatter gate 均通过。
+
+## 独立审查
+
+PR #53 相对 `origin/main@cce159c6c93bfb6257c8025c31d506a0bd75b11e` 由两个隔离 reviewer 并行完成 Standards 与 Spec 审查。首轮发现：
+
+- Standards：1 个 hard finding，page-box 四位规范化尚未被 ADR 0125 授权，且缺少规范化单元外的拒绝 witness。
+- Spec：同一合同问题、Doctor 边界措辞未闭合，以及复现命令/T25 逐项映射不足。
+
+本轮已分别通过 ADR 0125 明确规则、双 launcher 边界外拒绝测试、Operations v1 合同说明和本节复现映射解决。Reader/Answerer 的安全 `CODEX_HOME` 登录仍是诚实的外部授权阻断，不因代码审查而降格为 PASS。
 
 ## 仍需人工动作
 
@@ -203,5 +268,5 @@ TMP=E:\gzrt\temp
 1. 用 production role plan 证明 safe TEMP 与 safe `CODEX_HOME`。
 2. 对现有 synthetic Work 重跑真实 Reader，审核至少一个 Candidate 并导入 Knowledge。
 3. 对该 Candidate 运行真实 Knowledge Answerer，验证引用闭环。
-4. 重跑 doctor，并决定是否让 Doctor 增加 role-capability 级检查，避免继续报告误导性的 `codex_runtime=ready`。
+4. 重跑 Doctor，确认其合同限定的 CLI 身份/版本/登录探测仍与实况一致；Reader/Answerer role capability 继续由独立 smoke 证明，不扩展 Operations v1。
 5. 更新本记录为全部 PASS，再关闭 Issue #27。

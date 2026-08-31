@@ -1506,11 +1506,11 @@ def test_ocr_failed_terminal_recovers_with_the_other_launcher(
     )
 
 
-@pytest.mark.parametrize("launcher_index", (0, 1), ids=("console", "module"))
-def test_real_mineru_coordinate_rounding_is_accepted_through_public_cli(
+def _run_mineru_coordinate_scenario_v1(
     deterministic_e2e_workspace: _E2eWorkspaceV1,
     launcher_index: int,
-) -> None:
+    scenario: str,
+) -> tuple[int, dict[str, object]]:
     workspace = deterministic_e2e_workspace
     added = run_launcher(
         launcher_commands(
@@ -1545,18 +1545,51 @@ def test_real_mineru_coordinate_rounding_is_accepted_through_public_cli(
             "T25_CODEX_DOUBLE_EXE": str(CODEX_DOUBLE),
             "T25_DOUBLE_MODE": "literature",
             "T25_OCR_DOUBLE_EXE": str(OCR_DOUBLE),
-            "T25_OCR_DOUBLE_SCENARIO": "origin-coordinate-rounding",
+            "T25_OCR_DOUBLE_SCENARIO": scenario,
             "TEMP": str(workspace.runtime_root / "temp"),
             "TMP": str(workspace.runtime_root / "temp"),
         },
         timeout=45.0,
     )
 
-    assert resumed.returncode == 2
-    envelope = _json_result(resumed)
+    return resumed.returncode, _json_result(resumed)
+
+
+@pytest.mark.parametrize("launcher_index", (0, 1), ids=("console", "module"))
+def test_real_mineru_coordinate_rounding_is_accepted_through_public_cli(
+    deterministic_e2e_workspace: _E2eWorkspaceV1,
+    launcher_index: int,
+) -> None:
+    returncode, envelope = _run_mineru_coordinate_scenario_v1(
+        deterministic_e2e_workspace,
+        launcher_index,
+        "origin-coordinate-rounding",
+    )
+
+    assert returncode == 2
     assert envelope["outcome"] == "blocked"
     result = envelope["result"]
     assert isinstance(result, dict)
     assert result["advanced_stages"] == ["ocr", "canonicalize", "read"]
     assert result["start_stage"] == "ocr"
     assert result["stop_stage"] == "review"
+
+
+@pytest.mark.parametrize("launcher_index", (0, 1), ids=("console", "module"))
+def test_mineru_coordinate_change_outside_four_decimals_is_rejected(
+    deterministic_e2e_workspace: _E2eWorkspaceV1,
+    launcher_index: int,
+) -> None:
+    returncode, envelope = _run_mineru_coordinate_scenario_v1(
+        deterministic_e2e_workspace,
+        launcher_index,
+        "origin-coordinate-outside-rounding",
+    )
+
+    assert returncode == 1
+    assert envelope["outcome"] == "failed"
+    result = envelope["result"]
+    assert isinstance(result, dict)
+    assert result["advanced_stages"] == []
+    assert result["start_stage"] == "ocr"
+    assert result["stop_stage"] == "ocr"
