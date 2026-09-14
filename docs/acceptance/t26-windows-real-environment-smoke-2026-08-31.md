@@ -2,7 +2,7 @@
 
 ## 结论
 
-当前状态（2026-09-14 更新）：**部分通过，真实 Reader 已通过，业务审核与 Answerer 待完成**。
+当前状态（2026-09-14 更新）：**T26 实现与真实验收通过，进入合并与候选 V1 交付**。父 Spec #1 的最终人工硬审核仍单独保留。
 
 - PASS：冻结核心环境、OCR 环境、项目锁定 Codex CLI 身份与登录探测。
 - PASS：真实 RTX 4090 / CUDA MinerU 离线 OCR。
@@ -11,9 +11,9 @@
 - PASS：项目锁定 Codex CLI 的纯 synthetic 在线连通性。
 - PASS：在用户授权的项目外隔离认证与 TEMP 目录中完成真实 Literature Reader sealed runtime smoke，单次 attempt 成功且 resource ledger 为零。
 - PASS：三条冻结检索停止分支与未证明 release 的 fail-stop 修复；最终全仓分组回归合计 `1,320 passed / 1 skipped`，静态检查与两轴复审通过。唯一 skip 是 Windows symlink creation 权限不足（`1314`），不是依赖缺失或被静默忽略的失败。
-- WAITING：对一个合成 Candidate 的显式人类 Candidate Review、Knowledge import 与真实 Answerer。上述步骤完成前不关闭 Issue #27 或合并 PR #53。
+- PASS：用户明确接受一条合成 Claim，正式 review/Handoff/Knowledge import 成功；真实 Answerer 单次 attempt 成功，回答与来源证据闭环。另三条候选仍 pending，符合单条显式审核合同。
 
-业务审核与真实 Answerer 完成前，本记录不能作为 T26 完成证明，Issue #27 不应关闭。
+本记录冻结验收事实；最终合并提交、Issue #27 关闭及 main 同步结果以 [T26 工单的交付记录](https://github.com/Dulealex/Gezhi/issues/27) 为准。[候选 V1 验收包](./v1-final-acceptance-2026-09-14.md) 汇总全部工单、依赖和最终人工审核入口。
 
 ## 追溯范围
 
@@ -92,7 +92,7 @@ doctor --json
 
 结果：两个 launcher 均 exit `0`，stdout 逐字相等，七项检查全部 `ready`，overall `ready`。2026-09-14 在下文隔离认证与 TEMP 配置下重跑，仍得到同一结果。
 
-合同边界：当前 Doctor 的 `codex_runtime` 严格按 Operations v1 只证明项目锁定 CLI 的身份、版本和只读登录状态，并明确不运行 `codex exec` 或语义请求；它不承诺 Codex Role Invocation v1 的 sealed workspace、`TEMP` 或 `CODEX_HOME` capability。因而这里的 `ready` 与后文历史 Reader 的 `codex_runtime_unavailable` 不矛盾。T26 用独立业务角色 smoke 覆盖后者；2026-09-14 真实 Reader 已通过，Answerer 仍待完成。扩展 Doctor 将改变冻结的 Operations 合同，不属于本票。
+合同边界：当前 Doctor 的 `codex_runtime` 严格按 Operations v1 只证明项目锁定 CLI 的身份、版本和只读登录状态，并明确不运行 `codex exec` 或语义请求；它不承诺 Codex Role Invocation v1 的 sealed workspace、`TEMP` 或 `CODEX_HOME` capability。因而这里的 `ready` 与后文历史 Reader 的 `codex_runtime_unavailable` 不矛盾。T26 用独立业务角色 smoke 覆盖后者；2026-09-14 真实 Reader 与 Answerer 均已通过。扩展 Doctor 将改变冻结的 Operations 合同，不属于本票。
 
 ## 真实 OCR
 
@@ -189,13 +189,44 @@ Production resolver、workspace builder、launch plan 与 child commitment 的�
 
 console 与 module launcher 随后各自重跑同一 `resume`：native exit 均为 `2`，完整 JSON stdout 相同，`advanced_stages=[]`、`start_stage=stop_stage=review`、4 个 pending ID 不变；Reader 成功资产复用，未再次调用模型。PowerShell 外层采用显式 `exit $LASTEXITCODE` 保留 native exit，不把 shell 的成功/失败布尔退出映射当作产品退出码。
 
-请求人类审核的合成 Claim 为 `cand_d9c18a7e7d42179d33817c5c`，payload SHA-256 `d9c18a7e7d42179d33817c5c79ba84d860da01a7f5f5d647cddaab57670174c8`；其 Evidence Pointer 直接指向 `blk_9dfe76c859de41023829f296`，Canonical 内容身份为上文已提交的 `a2fa6b6b1a6ea6533045eb5c53f6dd87e2dbeccdbdb1fe117bdd1adf902bebf2`，风险为 `numeric_claim`。正文只描述三次 synthetic trials，合成 Source 明确不支持真实世界结论。用户明确接受前，不执行 `--accept` 或 import；其他 3 个 Candidate 保持 pending，不默认接受。
+请求人类审核的合成 Claim 为 `cand_d9c18a7e7d42179d33817c5c`，payload SHA-256 `d9c18a7e7d42179d33817c5c79ba84d860da01a7f5f5d647cddaab57670174c8`；其 Evidence Pointer 直接指向 `blk_9dfe76c859de41023829f296`，Canonical 内容身份为上文已提交的 `a2fa6b6b1a6ea6533045eb5c53f6dd87e2dbeccdbdb1fe117bdd1adf902bebf2`，风险为 `numeric_claim`。正文只描述三次 synthetic trials，合成 Source 明确不支持真实世界结论。用户于 2026-09-14 对这一具体候选回复“批准”后，才执行以下审核/import；其他 3 个 Candidate 保持 pending。
+
+### 已批准 Review、Intake 与真实 Answerer
+
+正式 console launcher 执行 `literature review cand_d9c18a7e7d42179d33817c5c --accept --json`，exit `0`、`decision_disposition=created`、`review_revision=1`、`review_status=accepted`、`handoff_status=committed`、`import_status=applied`、`intake_status=active`。两个 launcher 随后重放相同 action，完整 canonical JSON stdout 相同、exit `0`，`decision_disposition=unchanged` 且 revision 仍为 `1`；没有追加决定或重复导入。
+
+| 审核与导入身份 | 值 |
+|---|---|
+| Handoff | `hnd_b9f572a9c6d9a38bd2067787` |
+| Import manifest SHA-256 | `d7ffb30f26a8fb629256e07b83d5e770b35e23f47cd7e545bcbcb610dca1d0a5` |
+| Import candidates SHA-256 | `58f05f08ca521da784d1528aec38425ee26195f2f61d02f0f4316e4d803f64f0` |
+| Governance | `accepted / active / not_promoted` |
+
+module launcher 在同一隔离实机 profile 下执行 `knowledge ask "在 synthetic trials 中，Versioned identifiers 是否保留了 provenance？" --json`，exit `0`、`outcome=succeeded`、`answer_status=answered`。返回一个 Answer Unit，只绑定获批 Claim；语义为三次合成试验中保留了 provenance。模型没有使用工具、文件搜索或其他候选。治理说明由确定性 Markdown renderer 保留为 Candidate-backed、尚未晋升。
+
+| Answerer 证据 | 值 |
+|---|---|
+| Application code | T26 worktree `ee65f0711a5a4225f98c9213efb00ea13cc07944` |
+| 锁定 runtime provenance | 根 checkout `cce159c6c93bfb6257c8025c31d506a0bd75b11e`，clean；与 application code 身份分开记录 |
+| Answer ID | `ans_d6b6fef9-41b1-4f24-9791-2e19cce8e97e` |
+| Manifest SHA-256 | `136ff6d3892da4803f842db4e60b443d14c7d5edacc6df7fdee6976353680475` |
+| Attempt | 1 次；native exit `0`；`failure_class=null`；`53,203 ms` |
+| 领域总耗时 | `53,938 ms` |
+| Tokens：input / cached / output / reasoning | `8,431 / 0 / 84 / 0`，`usage_unavailable=false` |
+| Retrieval View | 1 个 Candidate；4,264 bytes；SHA-256 `fe63d9e3b3585e6eb40bb221bb6ef597d17d3c54e02b480186826e4b5b8a9cb2` |
+| Answer Output | 287 bytes；SHA-256 `97ca450e3aa6561c3cde90329b87649e7ed9b20b3a51ace6fbead675b3e604d1` |
+| Markdown | 528 bytes；SHA-256 `8c5576f8b48db4fd9f7df77b900c7443bb9c94cb8034d8e61739ad39f2d793f7` |
+| Raw events / final bytes | `647 / 286`；四个 event：thread.started、turn.started、agent_message、turn.completed |
+
+11 份正式 Answer 资产逐项大小/SHA-256 复验通过，staging 为空。成功路径必须先通过 `_attempt_from_evidence_v1` 的 resource ledger 为零检查；Answer manifest 本身没有 ledger 字段，因此不把该内部检查伪装为持久字段。双路 FTS 均将获批 Candidate 排为第一；Audit 选择、View identity、Answer Unit 的 candidate_id、Handoff payload、Canonical 内容身份和 Evidence Block `blk_9dfe76c859de41023829f296` 一致。该块直接记载三次 synthetic trials 的合成 Finding；缺少作者、年份、题名的合成源在引用中如实显示未知。
+
+最终 public CLI 双 launcher 复验 `review/resume/search/show/status/doctor`：完整 canonical JSON bytes（含末尾 LF）相同且 stderr 为空。Review 幂等；resume exit `2`、`advanced_stages=[]`，保留其他三个 pending ID；search/show 成功且治理状态不变；status 显示 active Candidate `1`、succeeded Answer `1`、pending review `3`，staging/orphan/quarantine/inconsistent 均 `0`；Doctor 七项 ready、exit `0`。Work 仍在 review 是未审核候选的预期状态，不影响已批准 Candidate 的完整检索回答链。
 
 ### Knowledge 前置状态与受控检索停止
 
-人工审核/import 尚未执行，隔离 Knowledge 根没有 `registry.sqlite3`。两个 launcher 直接 `knowledge ask` 都在约 `1.3 s` 以 native exit `1` 和 `RegistryUnavailableV1` traceback 结束，根仍为空，没有 committed Answer 或 Codex attempt；改为无凭据 profile 仍得到同一错误。该未初始化状态不是合法空 Registry：既有 `test_ask_treats_a_valid_empty_registry_as_insufficient_evidence` 双 launcher 用例 `1 passed in 1.18s`，验证后者正常成功且不调用 Codex。
+本轮业务批准之前，隔离 Knowledge 根没有 `registry.sqlite3`。两个 launcher 直接 `knowledge ask` 都在约 `1.3 s` 以 native exit `1` 和 `RegistryUnavailableV1` traceback 结束，当时根为空，没有 committed Answer 或 Codex attempt；改为无凭据 profile 仍得到同一错误。该未初始化状态不是合法空 Registry：既有 `test_ask_treats_a_valid_empty_registry_as_insufficient_evidence` 双 launcher 用例 `1 passed in 1.18s`，验证后者正常成功且不调用 Codex。上述正常 review/Intake 已初始化真实测试 Registry，当前 Answerer 通过。
 
-**已知合同缺口，不计为 PASS**：Ask 的冻结 15+1 committed primary 和 11/7 no-commit union 没有 Registry opening cause。不得借 `search/show` 的 `registry_unavailable`，也不得把打开之前的缺失数据库误归为已开始 FTS/SQL 的 `retrieval_query_failed`、root trust loss 或四份 retrieval 资产的 `retrieval_materialization_failed`。因此本票不新增 error code/catch-all、不创建空 Registry 或改变合同；真实非零 Answerer 继续等待正常审核→Intake 初始化。若要闭合“首次导入前 Ask”的受控界面，须单独重新决策并演进相应版本化合同，最终人工审核包必须披露这一限制。
+**已知合同缺口，不计为 PASS**：Ask 的冻结 15+1 committed primary 和 11/7 no-commit union 没有 Registry opening cause。不得借 `search/show` 的 `registry_unavailable`，也不得把打开之前的缺失数据库误归为已开始 FTS/SQL 的 `retrieval_query_failed`、root trust loss 或四份 retrieval 资产的 `retrieval_materialization_failed`。因此本票不新增 error code/catch-all、不创建假 Registry 或改变合同；正常审核→Intake 初始化后的真实非零 Answerer 已通过。若要闭合“首次导入前 Ask”的受控界面，须单独重新决策并演进相应版本化合同；该限制已纳入候选 V1 最终人工审核包。
 
 另外三条既有合同已明确授权的检索停止分支缺失 runtime/report/presentation 接线，按 TDD 逐条修复：
 
@@ -353,7 +384,7 @@ PR #53 相对 `origin/main@cce159c6c93bfb6257c8025c31d506a0bd75b11e` 由两个�
 
 上述代码与文档问题已分别通过 ADR 0125 明确规则、双 launcher 边界外拒绝测试、Operations v1 合同说明和本节复现映射解决，修订后的两轴复审未发现阻断。2026-09-14 的隔离登录已解除历史授权阻断，真实 Reader 已通过；业务 Candidate Review 与 Answerer 不因代码审查而自动通过。新增 Knowledge 接线复审随后发现 Standards 1 个 P1（未证明 close completion）与 Spec 2 项（同一 P1、P2 的 canonical bytes/正式资产覆盖不足）；修复与上述 8 个 public case 已通过。两位独立 reviewer 对当前生产修改、公开仓库边界和恢复验收记录再次复核：Standards 0 个 hard finding/无有价值 smell，Spec 0 项 finding。该只读结论不替代最终全仓回归、人工 Candidate Review 或真实 Answerer 验收。
 
-## 隔离部署与剩余验收
+## 隔离部署与交付
 
 推荐在项目外使用短组件、无 reparse 的 E: 路径，例如：
 
@@ -363,10 +394,10 @@ TEMP=E:\gzrt\temp
 TMP=E:\gzrt\temp
 ```
 
-用户已明确批准并完成项目锁定 CLI 的隔离登录。没有复制整个默认 `.codex`；它包含构建平面的配置、插件、rules、skills、历史与大型状态文件。该登录解除 2026-08-31 的授权阻断，不扩大业务审核权限。当前状态与剩余项：
+用户已明确批准并完成项目锁定 CLI 的隔离登录。没有复制整个默认 `.codex`；它包含构建平面的配置、插件、rules、skills、历史与大型状态文件。该登录解除 2026-08-31 的授权阻断；本轮具体 Claim 的业务批准随后独立完成。交付状态：
 
 1. 已通过真实 Reader 的 production role plan 与 child commitment 证明 safe TEMP 和 safe `CODEX_HOME`；保留其不可变审计证据。
-2. 由用户明确审核至少一个已生成的 synthetic Candidate，再用 public review seam 导入 Knowledge。
-3. 对该 Candidate 运行真实 Knowledge Answerer，验证引用闭环。
+2. 已按用户明确批准审核一个 synthetic Claim，并用 public review seam 完成 Handoff 与 Knowledge import；其他三个 pending 保留。
+3. 真实 Knowledge Answerer 已成功，11 份正式资产及候选→Handoff→Canonical→Source 证据闭环复验通过。
 4. 已在隔离配置下重跑双 launcher Doctor，七项 ready 与实况一致；Reader/Answerer role capability 继续由独立 smoke 证明，不扩展 Operations v1。
-5. 当前生产修改已通过最终分组全仓回归、静态检查与两轴复审；业务审核与真实 Answerer 完成后，还须补齐其验收证据与最终复核，才允许合并 PR #53、关闭 Issue #27。唯一平台 skip 与 Registry 未初始化限制仍须披露，不能改写为全部 case 无条件 PASS；父 Spec #1 继续打开，等待最终人工硬审核。
+5. 当前生产修改已通过最终分组全仓回归、静态检查与两轴复审；本轮只新增真实验收和交付文档，合并前独立复核新增证据。通过后按现有 Goal 授权 squash 合并 PR #53、关闭 Issue #27，并同步主工作树、复验受影响 public seams。唯一平台 skip 与 Registry 未初始化限制继续披露；父 Spec #1 保持打开，等待最终人工硬审核。
