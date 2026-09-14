@@ -1,6 +1,8 @@
 # Issue tracker: GitHub
 
-Issues、规格和实施 tickets 位于私有仓库 `Dulealex/Gezhi` 的 GitHub Issues。所有操作使用 `gh` CLI，并从本地 `origin` 推断仓库。
+Issues、规格和实施 tickets 位于仓库 `Dulealex/Gezhi` 的 GitHub Issues。用户于 2026-09-14 确认保持仓库公开；所有操作使用 `gh` CLI，并从本地 `origin` 推断仓库。
+
+公开记录只包含源码、合同、合成测试证据和无敏感信息的验收摘要。不得提交或粘贴凭据、个人配置、认证代码，或 Data Root 中的原始及派生研究资料。
 
 ## Conventions
 
