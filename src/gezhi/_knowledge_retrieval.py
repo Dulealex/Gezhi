@@ -86,6 +86,14 @@ class DataRootIntegrityLostV1(RuntimeError):
     """The validated Knowledge Data Root proof changed during retrieval."""
 
 
+class RetrievalLifecycleUnsettledV1(RuntimeError):
+    """Retrieval release lacks completion proof; no normal receipt is legal."""
+
+    def __init__(self, release_errors: tuple[Exception, ...]) -> None:
+        super().__init__("Candidate Registry release completion is unproved")
+        self.release_errors = release_errors
+
+
 @dataclass(frozen=True, slots=True)
 class MeasuredRetrievalViewV1:
     value: dict[str, object]
@@ -1463,15 +1471,16 @@ def _retrieve_v1(
                 try:
                     connection.rollback()
                 except sqlite3.Error as error:
-                    if transaction_started:
-                        operation_error = RetrievalQueryFailedV1(
-                            "Candidate Registry snapshot cannot be released"
-                        )
-                    else:
-                        operation_error = RegistryUnavailableV1(
-                            "Candidate Registry connection cannot be released"
-                        )
-                    operation_error.__cause__ = error
+                    if not isinstance(operation_error, DataRootIntegrityLostV1):
+                        if transaction_started:
+                            operation_error = RetrievalQueryFailedV1(
+                                "Candidate Registry snapshot cannot be released"
+                            )
+                        else:
+                            operation_error = RegistryUnavailableV1(
+                                "Candidate Registry connection cannot be released"
+                            )
+                        operation_error.__cause__ = error
             try:
                 _seal_root_v1(root, guard)
             except DataRootIntegrityLostV1 as error:
@@ -1484,21 +1493,23 @@ def _retrieve_v1(
             )
         return result
     finally:
+        release_errors: list[Exception] = []
         try:
-            if connection is not None:
-                connection.close()
-        except sqlite3.Error as error:
-            raise RetrievalQueryFailedV1(
-                "Candidate Registry connection cannot close"
-            ) from error
+            try:
+                if connection is not None:
+                    connection.close()
+            except sqlite3.Error as error:
+                release_errors.append(error)
         finally:
             if guard is not None:
                 try:
                     guard.close()
                 except DataRootLifecycleErrorV1 as error:
-                    raise DataRootIntegrityLostV1(
-                        "Candidate Registry guard cannot close"
-                    ) from error
+                    release_errors.append(error)
+        if release_errors:
+            raise RetrievalLifecycleUnsettledV1(tuple(release_errors)) from (
+                operation_error if operation_error is not None else release_errors[0]
+            )
 
 
 class KnowledgeRetrievalV1:

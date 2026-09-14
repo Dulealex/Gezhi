@@ -68,6 +68,7 @@ _OCR_JSON_FILE_LIMIT = 67_108_864
 _OCR_MARKDOWN_FILE_LIMIT = 67_108_864
 _OCR_IMAGE_FILE_LIMIT = 67_108_864
 _OCR_PDF_FILE_LIMIT = 134_217_728
+_PDF_PAGE_BOX_DECIMAL_PLACES = 4
 _PDF_FORM_BBOX_DECIMAL_PLACES = 4
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
 _STAGES = (
@@ -1378,7 +1379,10 @@ def _pdf_rectangle_v1(value: object) -> tuple[float, float, float, float]:
         or coordinates[3] <= coordinates[1]
     ):
         raise _OcrOutputInvalidV1("MinerU PDF page box is invalid")
-    return cast(tuple[float, float, float, float], coordinates)
+    canonical = tuple(round(item, _PDF_PAGE_BOX_DECIMAL_PLACES) for item in coordinates)
+    if canonical[2] <= canonical[0] or canonical[3] <= canonical[1]:
+        raise _OcrOutputInvalidV1("MinerU PDF page box is invalid")
+    return cast(tuple[float, float, float, float], canonical)
 
 
 def _pdf_form_bbox_v1(value: object) -> tuple[float, float, float, float]:
