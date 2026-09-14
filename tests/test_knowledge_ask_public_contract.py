@@ -348,6 +348,64 @@ def _install_codex_launch_guard(site_root: Path) -> Path:
     return marker
 
 
+def _install_fts_query_failure_double(site_root: Path) -> Path:
+    marker = _install_codex_launch_guard(site_root)
+    with (site_root / "sitecustomize.py").open("a", encoding="utf-8") as script:
+        script.write(
+            "import sqlite3\n"
+            "_gezhi_real_connect = sqlite3.connect\n"
+            "class _GezhiQueryFailureConnection(sqlite3.Connection):\n"
+            "    def execute(self, sql, parameters=()):\n"
+            "        if 'bm25(' in sql.casefold():\n"
+            "            raise sqlite3.OperationalError('synthetic FTS execution failure')\n"
+            "        return super().execute(sql, parameters)\n"
+            "def _gezhi_connect(*args, **kwargs):\n"
+            "    kwargs['factory'] = _GezhiQueryFailureConnection\n"
+            "    return _gezhi_real_connect(*args, **kwargs)\n"
+            "sqlite3.connect = _gezhi_connect\n"
+        )
+    return marker
+
+
+def _install_required_tokenizer_failure_double(site_root: Path) -> Path:
+    marker = _install_codex_launch_guard(site_root)
+    with (site_root / "sitecustomize.py").open("a", encoding="utf-8") as script:
+        script.write(
+            "import sqlite3\n"
+            "_gezhi_real_connect = sqlite3.connect\n"
+            "class _GezhiTokenizerFailureConnection(sqlite3.Connection):\n"
+            "    def execute(self, sql, parameters=()):\n"
+            "        if sql.casefold().strip().startswith('select candidate_id from candidate_search_trigram'):\n"
+            "            raise sqlite3.OperationalError('no such tokenizer: trigram')\n"
+            "        return super().execute(sql, parameters)\n"
+            "def _gezhi_connect(*args, **kwargs):\n"
+            "    kwargs['factory'] = _GezhiTokenizerFailureConnection\n"
+            "    return _gezhi_real_connect(*args, **kwargs)\n"
+            "sqlite3.connect = _gezhi_connect\n"
+        )
+    return marker
+
+
+def _install_uncompleted_registry_close_double(site_root: Path) -> Path:
+    marker = _install_codex_launch_guard(site_root)
+    with (site_root / "sitecustomize.py").open("a", encoding="utf-8") as script:
+        script.write(
+            "import sqlite3\n"
+            "_gezhi_real_connect = sqlite3.connect\n"
+            "class _GezhiUncompletedCloseConnection(sqlite3.Connection):\n"
+            "    def close(self):\n"
+            "        with open(os.environ['T26_REGISTRY_CLOSE_MARKER'], 'ab') as target:\n"
+            "            target.write(b'x')\n"
+            "        raise sqlite3.OperationalError('synthetic uncompleted Registry close')\n"
+            "def _gezhi_connect(database, *args, **kwargs):\n"
+            "    if kwargs.get('uri') and 'registry.sqlite3?mode=ro' in os.fspath(database):\n"
+            "        kwargs['factory'] = _GezhiUncompletedCloseConnection\n"
+            "    return _gezhi_real_connect(database, *args, **kwargs)\n"
+            "sqlite3.connect = _gezhi_connect\n"
+        )
+    return marker
+
+
 def _install_answerer_double(site_root: Path) -> None:
     site_root.mkdir()
     (site_root / "sitecustomize.py").write_text(
@@ -1059,17 +1117,18 @@ subprocess.Popen = guarded_popen
     return marker
 
 
-def _assert_zero_candidate_terminal_answer(
+def _assert_terminal_answer_assets(
     knowledge_root: Path,
     answer_id: str,
     *,
-    question: str,
-    answer_output: dict[str, object],
+    status: str,
+    error: dict[str, str] | None,
+    asset_names: set[str],
 ) -> None:
     committed = knowledge_root / "answers" / answer_id
     assert committed.is_dir()
     assert {entry.name for entry in committed.iterdir()} == {
-        *_TERMINAL_ASSETS,
+        *asset_names,
         "manifest.json",
     }
     assert not (knowledge_root / "answers" / "current.json").exists()
@@ -1093,8 +1152,8 @@ def _assert_zero_candidate_terminal_answer(
     }
     assert manifest["schema_version"] == "gezhi.answer_manifest.v1"
     assert manifest["answer_id"] == answer_id
-    assert manifest["status"] == "succeeded"
-    assert manifest["error"] is None
+    assert manifest["status"] == status
+    assert manifest["error"] == error
     assert manifest["attempts"] == []
     assert manifest["usage_totals"] == {
         "cached_input_tokens": 0,
@@ -1124,7 +1183,7 @@ def _assert_zero_candidate_terminal_answer(
         assert re.fullmatch(r"[0-9a-f]{40}", git["revision"]) is not None
 
     assets = manifest["assets"]
-    assert [item["path"] for item in assets] == sorted(_TERMINAL_ASSETS)
+    assert [item["path"] for item in assets] == sorted(asset_names)
     for item in assets:
         path = item["path"]
         payload = (committed / path).read_bytes()
@@ -1133,6 +1192,50 @@ def _assert_zero_candidate_terminal_answer(
         assert item["byte_length"] == len(payload)
         assert item["sha256"] == hashlib.sha256(payload).hexdigest()
         assert item[identity_key] == identity_value
+        if identity_key == "schema_id":
+            value = json.loads(payload)
+            assert payload == _canonical_json_line(value)
+            assert value["schema_version"] == identity_value
+
+
+def _assert_retrieval_stop_terminal_answer(
+    knowledge_root: Path,
+    answer_id: str,
+    *,
+    status: str,
+    error_code: str,
+) -> None:
+    _assert_terminal_answer_assets(
+        knowledge_root,
+        answer_id,
+        status=status,
+        error={"code": error_code, "stage": "retrieval"},
+        asset_names={"effective_config.json", "question.json", "retrieval_query.json"},
+    )
+    committed = knowledge_root / "answers" / answer_id
+    assert (committed / "question.json").read_bytes() == _canonical_json_line(
+        {
+            "question": "Which evidence supports this conclusion?",
+            "schema_version": "gezhi.question.v1",
+        }
+    )
+
+
+def _assert_zero_candidate_terminal_answer(
+    knowledge_root: Path,
+    answer_id: str,
+    *,
+    question: str,
+    answer_output: dict[str, object],
+) -> None:
+    _assert_terminal_answer_assets(
+        knowledge_root,
+        answer_id,
+        status="succeeded",
+        error=None,
+        asset_names=set(_TERMINAL_ASSETS),
+    )
+    committed = knowledge_root / "answers" / answer_id
 
     assert (committed / "effective_config.json").read_bytes() == _canonical_json_line(
         {
@@ -1487,6 +1590,186 @@ def test_ask_treats_a_valid_empty_registry_as_insufficient_evidence(
             question="Which evidence supports this conclusion?",
             answer_output=envelope["result"]["answer_output"],
         )
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("launcher_index", (0, 1), ids=("native", "module"))
+def test_ask_does_not_acknowledge_an_uncompleted_registry_close(
+    empty_registry_knowledge_ask_root: Path,
+    tmp_path: Path,
+    launcher_index: int,
+) -> None:
+    site_root = tmp_path / "site"
+    marker = _install_uncompleted_registry_close_double(site_root)
+    close_marker = tmp_path / "registry-close.marker"
+    completed = run_launcher(
+        launcher_commands(
+            (
+                "--knowledge-data-root",
+                str(empty_registry_knowledge_ask_root),
+                "knowledge",
+                "ask",
+                "Which evidence supports this conclusion?",
+                "--json",
+            )
+        )[launcher_index],
+        pythonpath_roots=(site_root, SOURCE_ROOT),
+        environment_updates={
+            "T20_CODEX_LAUNCH_MARKER": str(marker),
+            "T26_REGISTRY_CLOSE_MARKER": str(close_marker),
+        },
+    )
+    assert completed.returncode != 0
+    assert completed.stdout == b""
+    assert close_marker.read_bytes() == b"x"
+    assert not marker.exists()
+    answers = empty_registry_knowledge_ask_root / "answers"
+    assert list(answers.glob("ans_*")) == []
+    assert list((answers / ".staging").glob("*")) == []
+
+
+@pytest.mark.parametrize("launcher_index", (0, 1), ids=("native", "module"))
+def test_ask_commits_the_frozen_failure_when_candidate_evidence_is_missing(
+    active_knowledge_ask_root: Path,
+    tmp_path: Path,
+    launcher_index: int,
+) -> None:
+    with closing(
+        sqlite3.connect(active_knowledge_ask_root / "registry.sqlite3")
+    ) as registry:
+        registry.execute(
+            "UPDATE candidate_content SET evidence_snapshots_json = ? "
+            "WHERE candidate_id = ?",
+            (b"[]", _ACTIVE_CANDIDATE_ID),
+        )
+        registry.commit()
+    site_root = tmp_path / "site"
+    marker = _install_codex_launch_guard(site_root)
+    completed = run_launcher(
+        launcher_commands(
+            (
+                "--knowledge-data-root",
+                str(active_knowledge_ask_root),
+                "knowledge",
+                "ask",
+                "Which evidence supports this conclusion?",
+                "--json",
+            )
+        )[launcher_index],
+        pythonpath_roots=(site_root, SOURCE_ROOT),
+        environment_updates={"T20_CODEX_LAUNCH_MARKER": str(marker)},
+    )
+    assert completed.returncode == 1
+    assert completed.stderr == b"", completed.stderr.decode(errors="replace")
+    envelope = json.loads(completed.stdout)
+    answer_id = envelope["result"]["answer_id"]
+    assert _ANSWER_ID.fullmatch(answer_id) is not None
+    assert envelope == {
+        "command": "knowledge.ask",
+        "diagnostics": [
+            {"code": "knowledge.ask.retrieval_materialization_failed.v1", "context": {}}
+        ],
+        "outcome": "failed",
+        "result": {"answer_id": answer_id, "answer_output": None},
+        "schema_version": "gezhi.cli_result.v1",
+    }
+    assert completed.stdout == _canonical_json_line(envelope)
+    _assert_retrieval_stop_terminal_answer(
+        active_knowledge_ask_root,
+        answer_id,
+        status="failed",
+        error_code="retrieval_materialization_failed",
+    )
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("launcher_index", (0, 1), ids=("native", "module"))
+def test_ask_commits_the_frozen_failure_when_fts_execution_fails(
+    empty_registry_knowledge_ask_root: Path,
+    tmp_path: Path,
+    launcher_index: int,
+) -> None:
+    site_root = tmp_path / "site"
+    marker = _install_fts_query_failure_double(site_root)
+    completed = run_launcher(
+        launcher_commands(
+            (
+                "--knowledge-data-root",
+                str(empty_registry_knowledge_ask_root),
+                "knowledge",
+                "ask",
+                "Which evidence supports this conclusion?",
+                "--json",
+            )
+        )[launcher_index],
+        pythonpath_roots=(site_root, SOURCE_ROOT),
+        environment_updates={"T20_CODEX_LAUNCH_MARKER": str(marker)},
+    )
+    assert completed.returncode == 1
+    assert completed.stderr == b"", completed.stderr.decode(errors="replace")
+    envelope = json.loads(completed.stdout)
+    answer_id = envelope["result"]["answer_id"]
+    assert _ANSWER_ID.fullmatch(answer_id) is not None
+    assert envelope == {
+        "command": "knowledge.ask",
+        "diagnostics": [
+            {"code": "knowledge.ask.retrieval_query_failed.v1", "context": {}}
+        ],
+        "outcome": "failed",
+        "result": {"answer_id": answer_id, "answer_output": None},
+        "schema_version": "gezhi.cli_result.v1",
+    }
+    assert completed.stdout == _canonical_json_line(envelope)
+    _assert_retrieval_stop_terminal_answer(
+        empty_registry_knowledge_ask_root,
+        answer_id,
+        status="failed",
+        error_code="retrieval_query_failed",
+    )
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("launcher_index", (0, 1), ids=("native", "module"))
+def test_ask_commits_the_frozen_block_when_a_required_tokenizer_is_unavailable(
+    empty_registry_knowledge_ask_root: Path,
+    tmp_path: Path,
+    launcher_index: int,
+) -> None:
+    site_root = tmp_path / "site"
+    marker = _install_required_tokenizer_failure_double(site_root)
+    completed = run_launcher(
+        launcher_commands(
+            (
+                "--knowledge-data-root",
+                str(empty_registry_knowledge_ask_root),
+                "knowledge",
+                "ask",
+                "Which evidence supports this conclusion?",
+                "--json",
+            )
+        )[launcher_index],
+        pythonpath_roots=(site_root, SOURCE_ROOT),
+        environment_updates={"T20_CODEX_LAUNCH_MARKER": str(marker)},
+    )
+    assert completed.returncode == 2
+    assert completed.stderr == b"", completed.stderr.decode(errors="replace")
+    envelope = json.loads(completed.stdout)
+    answer_id = envelope["result"]["answer_id"]
+    assert _ANSWER_ID.fullmatch(answer_id) is not None
+    assert envelope == {
+        "command": "knowledge.ask",
+        "diagnostics": [{"code": "knowledge.ask.fts5_unavailable.v1", "context": {}}],
+        "outcome": "blocked",
+        "result": {"answer_id": answer_id, "answer_output": None},
+        "schema_version": "gezhi.cli_result.v1",
+    }
+    assert completed.stdout == _canonical_json_line(envelope)
+    _assert_retrieval_stop_terminal_answer(
+        empty_registry_knowledge_ask_root,
+        answer_id,
+        status="blocked",
+        error_code="fts5_unavailable",
+    )
     assert not marker.exists()
 
 

@@ -42,8 +42,11 @@ from gezhi._knowledge_retrieval import (
     DataRootIntegrityLostV1 as RetrievalDataRootIntegrityLostV1,
 )
 from gezhi._knowledge_retrieval import (
+    Fts5UnavailableV1,
     KnowledgeRetrievalV1,
     NonZeroCandidatesV1,
+    RetrievalMaterializationFailedV1,
+    RetrievalQueryFailedV1,
     ZeroCandidateRetrievalV1,
 )
 from gezhi._windows_data_root import (
@@ -347,9 +350,12 @@ def validate_knowledge_ask_report_v1(report: KnowledgeAskReportV1) -> None:
     if type(report.reason) is not str:
         raise ValueError("Knowledge ask non-success presence is invalid")
     committed_reasons = {
+        ("blocked", "fts5_unavailable"),
         ("blocked", "retrieval_view_too_large"),
         ("blocked", "codex_runtime_unavailable"),
         ("blocked", "codex_timeout_exhausted"),
+        ("failed", "retrieval_materialization_failed"),
+        ("failed", "retrieval_query_failed"),
         ("failed", "codex_process_failed"),
         ("failed", "answer_output_invalid"),
         ("failed", "answer_rendering_failed"),
@@ -656,6 +662,45 @@ class KnowledgeAsksV1:
                 except RetrievalDataRootIntegrityLostV1:
                     return _failed_report_v1(
                         "data_root_integrity_lost",
+                        staging_scan=staging_scan,
+                    )
+                except (
+                    Fts5UnavailableV1,
+                    RetrievalMaterializationFailedV1,
+                    RetrievalQueryFailedV1,
+                ) as retrieval_error:
+                    retrieval_error_status: Literal["blocked", "failed"]
+                    if isinstance(retrieval_error, Fts5UnavailableV1):
+                        retrieval_error_status = "blocked"
+                        retrieval_error_code = "fts5_unavailable"
+                    else:
+                        retrieval_error_status = "failed"
+                        retrieval_error_code = (
+                            "retrieval_query_failed"
+                            if isinstance(retrieval_error, RetrievalQueryFailedV1)
+                            else "retrieval_materialization_failed"
+                        )
+                    return _publish_answer_report_v1(
+                        root=root,
+                        owner=owner,
+                        request=AnswerPublishRequestV1(
+                            answer_id=answer_id,
+                            started_at=started_at,
+                            started_monotonic_ns=started_monotonic_ns,
+                            provenance=provenance,
+                            effective_config_bytes=effective_config_bytes,
+                            question_bytes=question_bytes,
+                            retrieval_query_bytes=retrieval_query_bytes,
+                            retrieval_audit_bytes=None,
+                            retrieval_view_bytes=None,
+                            status=retrieval_error_status,
+                            error={
+                                "code": retrieval_error_code,
+                                "stage": "retrieval",
+                            },
+                        ),
+                        answer_output=None,
+                        capture_overflow_channels=(),
                         staging_scan=staging_scan,
                     )
                 terminal_status: KnowledgeAskOutcomeV1

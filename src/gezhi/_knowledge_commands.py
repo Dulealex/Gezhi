@@ -93,10 +93,25 @@ _ASK_PRIMARY = {
         "无法建立 Knowledge Answer 单写者协调",
         "运行 gezhi status 观察 Knowledge 状态（status 不会修复），在外部恢复 Windows 单写者协调后重试",
     ),
+    "fts5_unavailable": (
+        "knowledge.ask.fts5_unavailable.v1",
+        "SQLite FTS5 双路检索能力不可用",
+        "在外部恢复项目 Python 的 SQLite FTS5 双路能力后重新提问",
+    ),
     "retrieval_view_too_large": (
         "knowledge.ask.retrieval_view_too_large.v1",
         "检索视图超过 262144 字节上限",
         "使用更具体的问题重新提问；保留 Answer ID 作为本次超限审计",
+    ),
+    "retrieval_materialization_failed": (
+        "knowledge.ask.retrieval_materialization_failed.v1",
+        "检索审计或候选材料未能完整验证",
+        "运行 gezhi status 观察 Knowledge 与 Answer 整体状态（status 不会修复）；保留 Answer ID 且不要手动修补 Answer",
+    ),
+    "retrieval_query_failed": (
+        "knowledge.ask.retrieval_query_failed.v1",
+        "Candidate Registry 检索查询失败",
+        "运行 gezhi status 观察 Knowledge 状态（status 不会修复），保留 Answer ID 并在外部修复后重新提问",
     ),
     "codex_runtime_unavailable": (
         "knowledge.ask.codex_runtime_unavailable.v1",
